@@ -5,16 +5,35 @@
 import { auth, db } from './firebase-config.js'; 
 // Importa as funções de autenticação e do Firestore
 import { onAuthStateChanged, signOut, signInWithEmailAndPassword } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
-import { collection, getDocs, addDoc, doc, setDoc, updateDoc, deleteDoc, writeBatch, query, where, onSnapshot } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+import { collection, getDocs, addDoc, doc, setDoc, updateDoc, deleteDoc, writeBatch, query, where, onSnapshot, runTransaction } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+import {
+    agruparItensPorFornecedor,
+    criarOrcamentoDuplicado,
+    criarSnapshotPedido,
+    obterItensDoPedido,
+    pedidoEstaConfirmado
+} from './order-domain.js';
+import {
+    arredondamentoFinanceiro,
+    calcularDetalhesItem,
+    calcularPrecoFinal,
+    calcularTotaisProposta,
+    normalizarUnidadeMedida,
+    validarParametrosProduto,
+    validarParametrosItem
+} from './pricing-domain.js';
 
 // --- 2. REFERÊNCIAS DO DOM (Elementos da Página) ---
 const loginScreen = document.getElementById('login-screen');
 const appContainer = document.getElementById('app-container');
+const loginForm = document.getElementById('login-form');
 const btnLogin = document.getElementById('btn-login');
 const btnLogout = document.getElementById('btn-logout');
 const loginEmail = document.getElementById('login-email');
 const loginPassword = document.getElementById('login-password');
 const feedbackMessageLogin = document.getElementById('feedbackMessageLogin');
+const syncStatus = document.getElementById('sync-status');
+const appNotification = document.getElementById('app-notification');
 
 // --- VARIÁVEIS GLOBAIS DA APLICAÇÃO ---
 // Estas variáveis irão armazenar os dados carregados do Firestore
@@ -23,6 +42,7 @@ let fornecedores = [];
 let categorias = [];
 let unidadesDeMedida = [];
 let orcamentosSalvos = {};
+let orcamentosPersistidos = {};
 let orcamentoAtualId = null;
 let lastOrcamentoId = 0; // Manter se for usado em alguma lógica legada
 let unsubscribeListeners = []; // Array para armazenar as funções de unsubscribe
@@ -31,6 +51,165 @@ let paginaAtual = 1;
 const itensPorPagina = 10;
 let estadoOrdenacao = { coluna: 'codigo', direcao: 'asc' };
 const dataVersion = "2.0"; // Versão para controle de backup
+const orcamentosComAlteracoesPendentes = new Set();
+let temporizadorNotificacao = null;
+
+function escaparHtml(valor) {
+    return String(valor ?? '')
+        .replaceAll('&', '&amp;')
+        .replaceAll('<', '&lt;')
+        .replaceAll('>', '&gt;')
+        .replaceAll('"', '&quot;')
+        .replaceAll("'", '&#039;');
+}
+
+function atualizarStatusSincronizacao(mensagem = '', tipo = 'ok') {
+    if (!syncStatus) return;
+    syncStatus.textContent = mensagem;
+    syncStatus.className = `sync-status sync-status-${tipo}`;
+    syncStatus.hidden = !mensagem;
+}
+
+function mostrarNotificacao(mensagem, tipo) {
+    if (!appNotification) return;
+
+    const texto = String(mensagem || '');
+    const pareceSucesso = /sucesso|concluíd|gerad|criad|adicionad|atualizad|importad|mesclad/i.test(texto)
+        && !/não|falha|erro/i.test(texto);
+    const tipoFinal = tipo || (pareceSucesso ? 'sucesso' : 'erro');
+
+    window.clearTimeout(temporizadorNotificacao);
+    appNotification.textContent = texto;
+    appNotification.className = `app-notification app-notification-${tipoFinal} visible`;
+    appNotification.setAttribute('role', tipoFinal === 'erro' ? 'alert' : 'status');
+    temporizadorNotificacao = window.setTimeout(() => {
+        appNotification.classList.remove('visible');
+    }, tipoFinal === 'erro' ? 8000 : 5000);
+}
+
+function marcarAlteracaoPendente(id = orcamentoAtualId) {
+    if (!id || pedidoEstaConfirmado(orcamentosSalvos[id])) return;
+    orcamentosComAlteracoesPendentes.add(id);
+    atualizarStatusSincronizacao('Alterações não salvas', 'carregando');
+}
+
+function tratarErroListener(nomeColecao, error) {
+    console.error(`Erro ao sincronizar ${nomeColecao}:`, error);
+    atualizarStatusSincronizacao(`Falha ao sincronizar ${nomeColecao}. Verifique sua conexão.`, 'erro');
+}
+
+function obterOrcamentoAtual() {
+    return orcamentosSalvos[orcamentoAtualId] || null;
+}
+
+function garantirOrcamentoEditavel(acao = 'alterar os itens') {
+    const orcamento = obterOrcamentoAtual();
+    if (!pedidoEstaConfirmado(orcamento)) return true;
+
+    mostrarNotificacao(`Este registro já foi confirmado como pedido. Para ${acao}, duplique-o e crie um novo orçamento.`);
+    return false;
+}
+
+function atualizarInterfacePedido() {
+    const orcamento = obterOrcamentoAtual();
+    const confirmado = pedidoEstaConfirmado(orcamento);
+    const status = document.getElementById('statusDocumento');
+    const botaoConfirmar = document.getElementById('btn-confirmar-pedido');
+    const botaoExcluir = document.getElementById('btn-excluir-orcamento');
+    const botaoFornecedor = document.getElementById('btn-baixar-excel-pedido-ao-fornecedor');
+    const botaoInstalador = document.getElementById('btn-imprimir-instrucoes-ao-instalador');
+    const possuiItens = Boolean(orcamento) && obterItensDoPedido(orcamento).length > 0;
+
+    if (status) {
+        status.textContent = confirmado ? 'Pedido confirmado' : 'Orçamento';
+        status.className = confirmado ? 'document-status document-status-pedido' : 'document-status document-status-orcamento';
+    }
+
+    if (botaoConfirmar) {
+        botaoConfirmar.disabled = confirmado || !orcamento || !possuiItens;
+        botaoConfirmar.textContent = confirmado ? '✓ Pedido confirmado' : '✓ Transformar em Pedido';
+        botaoConfirmar.title = !orcamento
+            ? 'Selecione um orçamento.'
+            : !possuiItens
+                ? 'Adicione pelo menos um item antes de transformar em pedido.'
+                : confirmado
+                    ? 'Este pedido já foi confirmado.'
+                    : '';
+    }
+
+    if (botaoExcluir) {
+        botaoExcluir.disabled = confirmado || !orcamento || Object.keys(orcamentosSalvos).length <= 1;
+        botaoExcluir.title = confirmado
+            ? 'Pedidos confirmados não podem ser excluídos.'
+            : Object.keys(orcamentosSalvos).length <= 1
+                ? 'O único orçamento não pode ser excluído.'
+                : '';
+    }
+
+    [botaoFornecedor, botaoInstalador].forEach(botao => {
+        if (!botao) return;
+        botao.disabled = !confirmado || !possuiItens;
+        botao.title = !confirmado
+            ? 'Transforme o orçamento em pedido para liberar este relatório.'
+            : !possuiItens
+                ? 'O pedido não possui itens para este relatório.'
+                : '';
+    });
+
+    const idsBloqueados = [
+        'btn-criar-produto-acabado',
+        'btn-adicionar-item-avulso',
+        'btn-limpar-itens-do-orcamento',
+        'tipoCliente',
+        'condicaoPagamento',
+        'formaPagamento',
+        'descontoGlobal',
+        'observacoesComerciais'
+    ];
+
+    idsBloqueados.forEach(id => {
+        const elemento = document.getElementById(id);
+        if (elemento) elemento.disabled = confirmado;
+    });
+
+    document.querySelectorAll('.btn-item-action, .btn-produto-action, .btn-add-item-to-produto')
+        .forEach(botao => { botao.disabled = confirmado; });
+}
+
+async function confirmarPedido() {
+    const orcamento = obterOrcamentoAtual();
+    if (!orcamento) return;
+    if (pedidoEstaConfirmado(orcamento)) {
+        mostrarNotificacao('Este orçamento já foi confirmado como pedido.');
+        return;
+    }
+
+    const itens = [...(orcamento.itens || []), ...(orcamento.produtosAcabados || []).flatMap(produto => produto.itens || [])];
+    if (itens.length === 0) {
+        mostrarNotificacao('Adicione pelo menos um item antes de transformar o orçamento em pedido.');
+        return;
+    }
+
+    if (!orcamento.infoGerais?.nomeCliente?.trim()) {
+        mostrarNotificacao('Informe o nome do cliente antes de transformar o orçamento em pedido.');
+        document.getElementById('nomeCliente')?.focus();
+        return;
+    }
+
+    const confirmado = confirm('Ao transformar em pedido, itens, quantidades e custos serão congelados. Deseja continuar?');
+    if (!confirmado) return;
+
+    orcamento.statusDocumento = 'pedido';
+    orcamento.pedido = criarSnapshotPedido(orcamento, {
+        confirmadoEm: new Date().toISOString(),
+        confirmadoPor: auth.currentUser?.uid || null
+    });
+
+    const salvou = await salvarOrcamentoAtual();
+    if (!salvou) return;
+    atualizarInterfacePedido();
+    mostrarNotificacao(`Pedido ${orcamento.id} confirmado com sucesso.`, 'sucesso');
+}
 
 // --- 3. FUNÇÕES DE DADOS (LISTENERS EM TEMPO REAL - FASE 4) ---
 
@@ -40,43 +219,47 @@ const dataVersion = "2.0"; // Versão para controle de backup
  */
 function escutarPrecos() {
     const precosRef = collection(db, 'precos');
-    onSnapshot(precosRef, (snapshot) => {
+    const unsubscribe = onSnapshot(precosRef, (snapshot) => {
         precos = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
         filtrarProdutos(); // Atualiza a tabela de produtos
         console.log("Listener de Preços: Dados atualizados.");
-    });
+    }, (error) => tratarErroListener('preços', error));
+    unsubscribeListeners.push(unsubscribe);
 }
 
 function escutarFornecedores() {
     const fornecedoresRef = collection(db, 'fornecedores');
-    onSnapshot(fornecedoresRef, (snapshot) => {
+    const unsubscribe = onSnapshot(fornecedoresRef, (snapshot) => {
         fornecedores = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
         atualizarSelects(); // Atualiza os dropdowns de filtro e cadastro
         // CORREÇÃO: Renderiza a lista no modal se ele estiver aberto.
         if (document.getElementById('modalGerenciarFornecedores').classList.contains('active')) renderizarListaFornecedores();
         console.log("Listener de Fornecedores: Dados atualizados.");
-    });
+    }, (error) => tratarErroListener('fornecedores', error));
+    unsubscribeListeners.push(unsubscribe);
 }
 
 function escutarCategorias() {
     const categoriasRef = collection(db, 'categorias');
-    onSnapshot(categoriasRef, (snapshot) => {
+    const unsubscribe = onSnapshot(categoriasRef, (snapshot) => {
         categorias = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
         atualizarSelects();
         // CORREÇÃO: Renderiza a lista no modal se ele estiver aberto.
         if (document.getElementById('modalGerenciarCategorias').classList.contains('active')) renderizarListaCategorias();
         console.log("Listener de Categorias: Dados atualizados.");
-    });
+    }, (error) => tratarErroListener('categorias', error));
+    unsubscribeListeners.push(unsubscribe);
 }
 
 function escutarUnidadesDeMedida() {
     const unidadesRef = collection(db, 'unidadesDeMedida');
-    onSnapshot(unidadesRef, (snapshot) => {
+    const unsubscribe = onSnapshot(unidadesRef, (snapshot) => {
         unidadesDeMedida = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
         atualizarSelectsUnidadeMedida();
         renderizarListaUnidadesMedida();
         console.log("Listener de Unidades de Medida: Dados atualizados.");
-    });
+    }, (error) => tratarErroListener('unidades de medida', error));
+    unsubscribeListeners.push(unsubscribe);
 }
 
 /**
@@ -99,19 +282,28 @@ function escutarOrcamentos() {
     const unsubscribe = onSnapshot(orcamentosRef, (snapshot) => {
         // O listener agora apenas sincroniza os dados, sem criar novos orçamentos.
         orcamentosSalvos = {};
+        const novosPersistidos = {};
         const orcamentoIdAnterior = orcamentoAtualId;
-        snapshot.docs.forEach(doc => {
-            const orcamentoData = doc.data();
-            orcamentosSalvos[orcamentoData.id] = { ...orcamentoData, firestoreId: doc.id };
+        snapshot.docs.forEach(documento => {
+            const orcamentoData = documento.data();
+            const orcamentoCompleto = { ...orcamentoData, firestoreId: documento.id };
+            orcamentosSalvos[orcamentoData.id] = orcamentoCompleto;
+            novosPersistidos[orcamentoData.id] = documento.metadata.hasPendingWrites && orcamentosPersistidos[orcamentoData.id]
+                ? orcamentosPersistidos[orcamentoData.id]
+                : structuredClone(orcamentoCompleto);
         });
+        orcamentosPersistidos = novosPersistidos;
 
         const idsOrdenados = Object.keys(orcamentosSalvos).sort();
         orcamentoAtualId = orcamentosSalvos[orcamentoIdAnterior] ? orcamentoIdAnterior : idsOrdenados[0] || null;
         
         atualizarSeletoresOrcamento();
         preencherInfoOrcamento(); // Atualiza a tela de orçamento com os novos dados
+        if (orcamentosComAlteracoesPendentes.size === 0) {
+            atualizarStatusSincronizacao('Dados sincronizados', 'ok');
+        }
         console.log("Listener de Orçamentos: Dados atualizados.");
-    });
+    }, (error) => tratarErroListener('orçamentos', error));
     unsubscribeListeners.push(unsubscribe);
 }
 
@@ -141,11 +333,23 @@ const handleLogin = async () => {
     const email = loginEmail.value.trim();
     const password = loginPassword.value.trim();
 
+    feedbackMessageLogin.style.display = 'none';
+
     if (!email || !password) {
         showLoginFeedback("Por favor, preencha e-mail e senha.");
+        (email ? loginPassword : loginEmail).focus();
         return;
     }
 
+    if (!loginEmail.validity.valid) {
+        showLoginFeedback('Informe um e-mail válido.');
+        loginEmail.focus();
+        return;
+    }
+
+    btnLogin.disabled = true;
+    btnLogin.textContent = 'Entrando…';
+    loginForm.setAttribute('aria-busy', 'true');
     try {
         await signInWithEmailAndPassword(auth, email, password);
         // O onAuthStateChanged cuidará de mostrar o app.
@@ -156,6 +360,10 @@ const handleLogin = async () => {
         } else {
             showLoginFeedback("Ocorreu um erro ao tentar fazer login.");
         }
+    } finally {
+        btnLogin.disabled = false;
+        btnLogin.textContent = 'Entrar';
+        loginForm.removeAttribute('aria-busy');
     }
 };
 
@@ -185,32 +393,50 @@ onAuthStateChanged(auth, async (user) => {
         // --- USUÁRIO AUTENTICADO ---
         console.log("Usuário autenticado:", user.uid);
 
-        // NOVA ABORDAGEM:
-        // 1. Garante que o estado inicial dos orçamentos está correto.
-        await inicializarOrcamentos();
+        try {
+            detachAllListeners();
+            atualizarStatusSincronizacao('Sincronizando dados...', 'carregando');
 
-        // 2. Inicia os listeners para manter tudo sincronizado a partir de agora.
-        escutarPrecos();
-        escutarFornecedores();
-        escutarCategorias();
-        escutarUnidadesDeMedida();
-        escutarOrcamentos();
-        ajustarCamposCadastroPorUnidade(); // Garante que o campo Altura Padrão seja ajustado na inicialização
+            // 1. Garante que o estado inicial dos orçamentos está correto.
+            await inicializarOrcamentos();
 
-        toggleAppVisibility(true);
+            // 2. Inicia os listeners para manter tudo sincronizado a partir de agora.
+            escutarPrecos();
+            escutarFornecedores();
+            escutarCategorias();
+            escutarUnidadesDeMedida();
+            escutarOrcamentos();
+            ajustarCamposCadastroPorUnidade(); // Garante que o campo Altura Padrão seja ajustado na inicialização
+
+            toggleAppVisibility(true);
+        } catch (error) {
+            console.error('Falha ao inicializar os dados do sistema:', error);
+            toggleAppVisibility(true);
+            atualizarStatusSincronizacao('Não foi possível carregar os dados. Verifique sua conexão e tente novamente.', 'erro');
+        }
 
     } else {
         // --- USUÁRIO DESLOGADO ---
         console.log("Nenhum usuário autenticado.");
         // Desanexa os listeners para evitar erros de permissão
         detachAllListeners();
+        atualizarStatusSincronizacao();
         toggleAppVisibility(false);
     }
 });
 
 // Adiciona os listeners aos botões
-btnLogin.addEventListener('click', handleLogin);
+loginForm.addEventListener('submit', (event) => {
+    event.preventDefault();
+    handleLogin();
+});
 btnLogout.addEventListener('click', handleLogout);
+
+window.addEventListener('beforeunload', (event) => {
+    if (orcamentosComAlteracoesPendentes.size === 0) return;
+    event.preventDefault();
+    event.returnValue = '';
+});
 
     // --- 8. INICIALIZAÇÃO DE EVENT LISTENERS ---
     // Adiciona os listeners aos botões e outros elementos interativos
@@ -221,11 +447,26 @@ btnLogout.addEventListener('click', handleLogout);
         document.getElementById('btn-tab-1').addEventListener('click', () => showTab(1));
         document.getElementById('btn-tab-2').addEventListener('click', () => showTab(2));
         document.getElementById('btn-tab-3').addEventListener('click', () => showTab(3));
+        document.getElementById('main-tabs').addEventListener('keydown', (event) => {
+            if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return;
+            event.preventDefault();
+            const tabs = [...document.querySelectorAll('#main-tabs [role="tab"]')];
+            const indiceAtual = tabs.indexOf(document.activeElement);
+            if (indiceAtual < 0) return;
+
+            const novoIndice = event.key === 'Home'
+                ? 0
+                : event.key === 'End'
+                    ? tabs.length - 1
+                    : (indiceAtual + (event.key === 'ArrowRight' ? 1 : -1) + tabs.length) % tabs.length;
+            showTab(novoIndice, true);
+        });
 
         // Aba 2: Controles do Orçamento
         document.getElementById('btn-novo-orcamento').addEventListener('click', criarNovoOrcamento);
         document.getElementById('btn-duplicar-orcamento').addEventListener('click', duplicarOrcamento);
         document.getElementById('btn-excluir-orcamento').addEventListener('click', excluirOrcamento);
+        document.getElementById('btn-confirmar-pedido').addEventListener('click', confirmarPedido);
         document.getElementById('btn-criar-produto-acabado').addEventListener('click', criarProdutoAcabado);
         // Botões movidos para dentro da tabela de orçamento
         document.getElementById('btn-adicionar-item-avulso').addEventListener('click', () => abrirModalAdicionarItem(null));
@@ -303,17 +544,37 @@ btnLogout.addEventListener('click', handleLogout);
         document.getElementById('dataInstalacao').addEventListener('blur', (e) => atualizarInfoOrcamento('dataInstalacao', e.target.value));
         document.getElementById('btn-baixar-excel-pedido-ao-fornecedor').addEventListener('click', exportarExcel);
         document.getElementById('nomeCostureira').addEventListener('blur', (e) => atualizarInfoOrcamento('nomeCostureira', e.target.value));
+        document.getElementById('enderecoCostureira').addEventListener('blur', (e) => atualizarInfoOrcamento('enderecoCostureira', e.target.value));
         document.getElementById('nomeInstalador').addEventListener('blur', (e) => atualizarInfoOrcamento('nomeInstalador', e.target.value));
         document.getElementById('observacoesGerais').addEventListener('blur', (e) => atualizarInfoOrcamento('observacoesGerais', e.target.value));
+
+        [
+            'nomeCliente',
+            'enderecoCliente',
+            'dataOrcamento',
+            'prazoValidade',
+            'prazoEntrega',
+            'dataInstalacao',
+            'nomeCostureira',
+            'enderecoCostureira',
+            'nomeInstalador',
+            'observacoesGerais',
+            'observacoesComerciais',
+            'descontoGlobal'
+        ].forEach(id => {
+            document.getElementById(id)?.addEventListener('input', () => marcarAlteracaoPendente());
+        });
 
 
         // Aba 1: Lista de Preços
         document.getElementById('btn-adicionar-preco').addEventListener('click', adicionarPreco);
+        document.getElementById('categoria').addEventListener('change', ajustarCamposCadastroPorUnidade);
+        document.getElementById('unidadeMedida').addEventListener('change', ajustarCamposCadastroPorUnidade);
         document.querySelectorAll('.coluna-ordenavel').forEach(th => {
-            th.addEventListener('click', () => ordenarTabela(th.dataset.coluna));
+            th.querySelector('.sort-button')?.addEventListener('click', () => ordenarTabela(th.dataset.coluna));
         });
         // Listeners para os filtros da Lista de Produtos
-        document.getElementById('buscaProdutos').addEventListener('keyup', filtrarProdutos);
+        document.getElementById('buscaProdutos').addEventListener('input', filtrarProdutos);
         document.getElementById('filtroFornecedor').addEventListener('change', filtrarProdutos);
         document.getElementById('filtroCategoria').addEventListener('change', filtrarProdutos);
         document.getElementById('filtroStatus').addEventListener('change', filtrarProdutos);
@@ -323,6 +584,7 @@ btnLogout.addEventListener('click', handleLogout);
         document.getElementById('btn-abrir-gerenciador-de-categorias').addEventListener('click', () => gerenciarCategorias());
         document.getElementById('btn-abrir-gerenciador-de-unidades-de-medida').addEventListener('click', () => gerenciarUnidadesMedida());
         document.getElementById('btn-exportar-dados').addEventListener('click', exportarDados);
+        document.getElementById('arquivo-backup').addEventListener('change', importarDados);
         document.getElementById('btn-importar-csv').addEventListener('click', () => importarCSV());
         document.getElementById('btn-baixar-template').addEventListener('click', baixarTemplateCSV);
         // Listeners para o modal de preview do CSV
@@ -338,9 +600,11 @@ btnLogout.addEventListener('click', handleLogout);
         document.getElementById('condicaoPagamento').addEventListener('change', (e) => atualizarInfoComercial('condicaoPagamento', e.target.value));
         document.getElementById('formaPagamento').addEventListener('change', (e) => atualizarInfoComercial('formaPagamento', e.target.value));
         document.getElementById('descontoGlobal').addEventListener('input', atualizarPropostaCliente);
+        document.getElementById('descontoGlobal').addEventListener('blur', (e) => atualizarInfoComercial('descontoGlobal', parseFloat(e.target.value) || 0));
         document.getElementById('observacoesComerciais').addEventListener('blur', (e) => atualizarInfoComercial('observacoesComerciais', e.target.value));
-        document.getElementById('mostrarValoresItens').addEventListener('change', atualizarPropostaCliente);
-        document.getElementById('mostrarDetalhamentoCompleto').addEventListener('change', atualizarPropostaCliente);
+        document.getElementById('modoProposta').addEventListener('change', atualizarConfiguracaoProposta);
+        document.getElementById('mostrarValoresItens').addEventListener('change', atualizarConfiguracaoProposta);
+        document.getElementById('mostrarCustosFornecedor').addEventListener('change', atualizarConfiguracaoProposta);
 
         inicializarSelectInteligente('codigoOrcamento');
         inicializarSelectInteligente('edicaoCodigoItem');
@@ -368,8 +632,8 @@ btnLogout.addEventListener('click', handleLogout);
         document.getElementById('btn-adicionar-unidade-modal').addEventListener('click', adicionarUnidadeMedidaModal);
 
         // Modal Edição Produto Acabado
-        document.getElementById('btn-fechar-edicao-produto-acabado').addEventListener('click', () => document.getElementById('modalEdicaoProdutoAcabado').style.display = 'none');
-        document.getElementById('btn-cancelar-edicao-produto-acabado').addEventListener('click', () => document.getElementById('modalEdicaoProdutoAcabado').style.display = 'none');
+        document.getElementById('btn-fechar-edicao-produto-acabado').addEventListener('click', () => fecharModal('modalEdicaoProdutoAcabado'));
+        document.getElementById('btn-cancelar-edicao-produto-acabado').addEventListener('click', () => fecharModal('modalEdicaoProdutoAcabado'));
         document.getElementById('btn-salvar-edicao-produto-acabado').addEventListener('click', salvarEdicaoProdutoAcabado);
 
         // Modal Edição Item Orçamento
@@ -387,6 +651,9 @@ btnLogout.addEventListener('click', handleLogout);
         document.getElementById('btn-fechar-edicao-produto').addEventListener('click', fecharModalEdicaoProduto);
         document.getElementById('btn-cancelar-edicao-produto').addEventListener('click', fecharModalEdicaoProduto);
         document.getElementById('btn-salvar-edicao-produto').addEventListener('click', salvarEdicaoProduto);
+        document.getElementById('edicaoFornecedorProduto').addEventListener('change', ajustarCamposEdicaoProduto);
+        document.getElementById('edicaoCategoriaProduto').addEventListener('change', ajustarCamposEdicaoProduto);
+        document.getElementById('edicaoUnidadeMedidaProduto').addEventListener('change', ajustarCamposEdicaoProduto);
 
 
 
@@ -395,15 +662,23 @@ btnLogout.addEventListener('click', handleLogout);
 
     // Chama a inicialização dos listeners.
     inicializarEventListeners();
+    prepararAcessibilidadeModais();
+    showTab(0);
 
     // Funções para controle de abas
-    function showTab(index) {
-        const tabs = document.querySelectorAll('.tab');
+    function showTab(index, moverFoco = false) {
+        const tabs = document.querySelectorAll('#main-tabs .tab');
         const contents = document.querySelectorAll('.tab-content');
         tabs.forEach((tab, i) => {
-            tab.classList.toggle('active', i === index);
-            contents[i].classList.toggle('active', i === index);
+            const ativa = i === index;
+            tab.classList.toggle('active', ativa);
+            tab.setAttribute('aria-selected', String(ativa));
+            tab.tabIndex = ativa ? 0 : -1;
+            contents[i].classList.toggle('active', ativa);
+            contents[i].hidden = !ativa;
         });
+
+        if (moverFoco) tabs[index]?.focus();
 
         if (index === 2) { // Proposta Cliente tab
             atualizarPropostaCliente();
@@ -505,7 +780,7 @@ btnLogout.addEventListener('click', handleLogout);
                 // CORREÇÃO: Para Metro Linear, a "largura" salva é na verdade a altura padrão.
                 // Vamos exibi-la na coluna de altura.
                 // A lógica de salvamento foi corrigida para que `item.altura` contenha a altura padrão.
-                if (item.unidadeMedida === 'MetroLinear') {
+                if (normalizarUnidadeMedida(item.unidadeMedida) === 'MetroLinear') {
                     // Agora lemos diretamente de item.altura, que contém o valor correto.
                     alturaDisplay = item.altura ? item.altura.toFixed(2) : '-'; 
                     larguraDisplay = '-'; // A coluna Largura fica vazia
@@ -607,7 +882,7 @@ btnLogout.addEventListener('click', handleLogout);
                 // CORREÇÃO: Para Metro Linear, a "largura" salva é na verdade a altura padrão.
                 // Vamos exibi-la na coluna de altura.
                 // A lógica de salvamento foi corrigida para que `item.altura` contenha a altura padrão.
-                if (item.unidadeMedida === 'MetroLinear') {
+                if (normalizarUnidadeMedida(item.unidadeMedida) === 'MetroLinear') {
                     // Agora lemos diretamente de item.altura, que contém o valor correto.
                     alturaDisplay = item.altura ? item.altura.toFixed(2) : '-';
                     larguraDisplay = '-'; // A coluna Largura fica vazia
@@ -771,6 +1046,10 @@ btnLogout.addEventListener('click', handleLogout);
     }
 
     async function atualizarValorInstalacao(ambiente, inputElement) {
+        if (!garantirOrcamentoEditavel('alterar o valor de instalação')) {
+            preencherInfoOrcamento();
+            return;
+        }
         const orcamento = orcamentosSalvos[orcamentoAtualId];
         if (!orcamento) return;
         
@@ -797,13 +1076,14 @@ btnLogout.addEventListener('click', handleLogout);
 
 
     async function adicionarItemAoOrcamento() {
+        if (!garantirOrcamentoEditavel('adicionar itens')) return;
         const produtoAcabadoId = document.getElementById('addProdutoAcabadoId').value;
         const orcamento = orcamentosSalvos[orcamentoAtualId];
         const codigo = document.getElementById('codigoOrcamento').value.trim().toUpperCase();
         const produtoBase = precos.find(p => p.codigo === codigo);
 
         if (!produtoBase || produtoBase.status !== 'Ativo') {
-            alert("O produto com o código inserido não foi encontrado ou está inativo.");
+            mostrarNotificacao("O produto com o código inserido não foi encontrado ou está inativo.");
             return;
         }
 
@@ -811,13 +1091,9 @@ btnLogout.addEventListener('click', handleLogout);
         const largura = parseFloat(document.getElementById('largura').value) || 0;
         const altura = parseFloat(document.getElementById('altura').value) || 0;
 
-        // Validações
-        if (produtoBase.unidadeMedida !== 'MetroQuadrado' && (isNaN(quantidade) || quantidade <= 0)) {
-            alert("A quantidade deve ser um número maior que zero para esta unidade de medida.");
-            return;
-        }
-        if (produtoBase.unidadeMedida === 'MetroQuadrado' && (isNaN(largura) || largura <= 0 || isNaN(altura) || altura <= 0)) {
-            alert("Largura e Altura são obrigatórias para produtos 'Metro Quadrado'.");
+        const erroValidacao = validarParametrosItem(produtoBase, quantidade, largura, altura);
+        if (erroValidacao) {
+            mostrarNotificacao(erroValidacao);
             return;
         }
 
@@ -833,7 +1109,7 @@ btnLogout.addEventListener('click', handleLogout);
         );
 
         const novoItem = {
-            id: `item-${Date.now()}`,
+            id: `item-${crypto.randomUUID()}`,
             ambiente: document.getElementById('ambiente').value.trim(),
             categoria: produtoBase.categoria || 'Não Especificada',
             codigo,
@@ -852,6 +1128,8 @@ btnLogout.addEventListener('click', handleLogout);
             precoUnitario: detalhesCalculados.precoUnitario,
             precoTotal: detalhesCalculados.precoTotal,
             custoReal: detalhesCalculados.custoReal,
+            quantidadeCompra: detalhesCalculados.quantidadeCompra,
+            precoCompraUnitario: produtoBase.precoCompra,
             margemLiquida: detalhesCalculados.margemLiquida,
             margemPercentual: detalhesCalculados.margemPercentual,
             valorComissao: detalhesCalculados.valorComissao,
@@ -872,9 +1150,10 @@ btnLogout.addEventListener('click', handleLogout);
             orcamento.itens.push(novoItem);
         }
 
-        await salvarOrcamentoAtual();
+        const salvou = await salvarOrcamentoAtual();
+        if (!salvou) return;
         fecharModalAdicionarItem(); // Fecha o modal e limpa o formulário
-        alert("Item adicionado ao orçamento com sucesso!"); // Garante que a confirmação seja exibida
+        mostrarNotificacao("Item adicionado ao orçamento com sucesso!", 'sucesso');
         // A UI será atualizada pelo listener
     }
 
@@ -913,17 +1192,21 @@ btnLogout.addEventListener('click', handleLogout);
             document.getElementById('addProdutoAcabadoId').value = ''; // Garante que está vazio
         }
 
-        modal.classList.add('active');
+        abrirModal(modal.id);
     }
 
     function fecharModalAdicionarItem() {
-        document.getElementById('modalAdicionarItem').classList.remove('active');
+        fecharModal('modalAdicionarItem');
         limparFormularioItem(); // Limpa o formulário ao fechar
     }
 
     // --- FIM: FUNÇÕES DO NOVO FLUXO ---
 
     async function atualizarInfoComercial(campo, valor) {
+        if (!garantirOrcamentoEditavel('alterar as condições comerciais')) {
+            preencherInfoOrcamento();
+            return;
+        }
         const orcamento = orcamentosSalvos[orcamentoAtualId];
         if (orcamento) {
             if (!orcamento.infoComercial) orcamento.infoComercial = {};
@@ -943,6 +1226,7 @@ btnLogout.addEventListener('click', handleLogout);
         }
     } */
     async function removerProdutoAcabado(produtoId) {
+        if (!garantirOrcamentoEditavel('excluir produtos acabados')) return;
         if (!confirm("Tem certeza que deseja excluir este produto acabado e todos os seus itens?")) return;
         const orcamento = orcamentosSalvos[orcamentoAtualId];
         orcamento.produtosAcabados = orcamento.produtosAcabados.filter(p => p.id !== produtoId);
@@ -951,6 +1235,7 @@ btnLogout.addEventListener('click', handleLogout);
     }
 
     async function removerItem(produtoId, itemId) {
+        if (!garantirOrcamentoEditavel('excluir itens')) return;
         if (!confirm("Tem certeza que deseja excluir este item?")) return;
         const orcamento = orcamentosSalvos[orcamentoAtualId];
         
@@ -968,6 +1253,7 @@ btnLogout.addEventListener('click', handleLogout);
     }
 
     async function limparOrcamento() {
+        if (!garantirOrcamentoEditavel('limpar o orçamento')) return;
         const orcamento = orcamentosSalvos[orcamentoAtualId];
         if (confirm("Tem certeza que deseja limpar todos os itens e produtos deste orçamento?")) {
             orcamento.itens = [];
@@ -978,12 +1264,14 @@ btnLogout.addEventListener('click', handleLogout);
     }
 
     async function criarProdutoAcabado() {
+        if (!garantirOrcamentoEditavel('criar produtos acabados')) return;
         const nome = document.getElementById('nomeProdutoAcabado').value.trim();
         const ambiente = document.getElementById('ambienteProdutoAcabado').value.trim();
         const observacoes = document.getElementById('observacoesProdutoAcabado').value.trim();
+        const observacoesCliente = document.getElementById('observacoesClienteProdutoAcabado').value.trim();
 
         if (!nome || !ambiente) {
-            alert("O Nome e o Ambiente do produto acabado são obrigatórios.");
+            mostrarNotificacao("O Nome e o Ambiente do produto acabado são obrigatórios.");
             return;
         }
 
@@ -991,10 +1279,11 @@ btnLogout.addEventListener('click', handleLogout);
         if (!orcamento) return;
         
         const novoProduto = {
-            id: `prod-${Date.now()}`,
+            id: `prod-${crypto.randomUUID()}`,
             nome: nome,
             ambiente: ambiente,
             observacoes: observacoes,
+            observacoesCliente: observacoesCliente,
             itens: [],
             valorTotal: 0,
             margemTotal: 0
@@ -1004,12 +1293,14 @@ btnLogout.addEventListener('click', handleLogout);
             orcamento.produtosAcabados = [];
         }
         orcamento.produtosAcabados.push(novoProduto);
-        await salvarOrcamentoAtual();
+        const salvou = await salvarOrcamentoAtual();
+        if (!salvou) return;
         
         // Limpar campos (a UI será atualizada pelo listener)
         document.getElementById('nomeProdutoAcabado').value = '';
         document.getElementById('ambienteProdutoAcabado').value = '';
         document.getElementById('observacoesProdutoAcabado').value = '';
+        document.getElementById('observacoesClienteProdutoAcabado').value = '';
     }
 
     function abrirModalEdicaoProdutoAcabado(produtoAcabadoId) {
@@ -1023,20 +1314,23 @@ btnLogout.addEventListener('click', handleLogout);
             document.getElementById('edicaoNome').value = produtoAcabado.nome;
             document.getElementById('edicaoAmbiente').value = produtoAcabado.ambiente;
             document.getElementById('edicaoObservacoes').value = produtoAcabado.observacoes || '';
-            document.getElementById('modalEdicaoProdutoAcabado').style.display = 'block';
+            document.getElementById('edicaoObservacoesCliente').value = produtoAcabado.observacoesCliente || '';
+            abrirModal('modalEdicaoProdutoAcabado');
         } else {
-            alert("Produto Acabado não encontrado para edição.");
+            mostrarNotificacao("Produto Acabado não encontrado para edição.");
         }
     }
 
     async function salvarEdicaoProdutoAcabado() {
+        if (!garantirOrcamentoEditavel('editar produtos acabados')) return;
         const id = document.getElementById('edicaoProdutoAcabadoId').value;
         const novoNome = document.getElementById('edicaoNome').value.trim();
         const novoAmbiente = document.getElementById('edicaoAmbiente').value.trim();
         const novaObservacoes = document.getElementById('edicaoObservacoes').value.trim();
+        const novaObservacoesCliente = document.getElementById('edicaoObservacoesCliente').value.trim();
 
         if (!novoNome || !novoAmbiente) {
-            alert("Por favor, preencha o nome e o ambiente.");
+            mostrarNotificacao("Por favor, preencha o nome e o ambiente.");
             return;
         }
 
@@ -1051,6 +1345,7 @@ btnLogout.addEventListener('click', handleLogout);
             produtoAcabado.nome = novoNome;
             produtoAcabado.ambiente = novoAmbiente;
             produtoAcabado.observacoes = novaObservacoes; 
+            produtoAcabado.observacoesCliente = novaObservacoesCliente;
                            
             // Atualiza o ambiente de todos os sub-itens para manter a consistência
             produtoAcabado.itens.forEach(item => {
@@ -1059,19 +1354,46 @@ btnLogout.addEventListener('click', handleLogout);
                 }
             });
             
-            await salvarOrcamentoAtual();
-            document.getElementById('modalEdicaoProdutoAcabado').style.display = 'none';
+            const salvou = await salvarOrcamentoAtual();
+            if (!salvou) return;
+            fecharModal('modalEdicaoProdutoAcabado');
         }
     }
 
+    async function atualizarConfiguracaoProposta() {
+        const orcamento = obterOrcamentoAtual();
+        if (!orcamento) return;
+
+        orcamento.apresentacao = {
+            ...(orcamento.apresentacao || {}),
+            modo: document.getElementById('modoProposta').value,
+            mostrarValoresItens: document.getElementById('mostrarValoresItens').checked,
+            mostrarCustosFornecedor: document.getElementById('mostrarCustosFornecedor').checked
+        };
+
+        atualizarEstadoControlesProposta();
+        await salvarOrcamentoAtual();
+        atualizarPropostaCliente();
+    }
+
+    function atualizarEstadoControlesProposta() {
+        const modoDetalhado = document.getElementById('modoProposta').value === 'detalhada';
+        const mostrarValores = document.getElementById('mostrarValoresItens');
+        mostrarValores.disabled = !modoDetalhado;
+        mostrarValores.title = modoDetalhado
+            ? ''
+            : 'A exibição de valores por item está disponível apenas na proposta detalhada.';
+    }
+
     function atualizarPropostaCliente() {
-        // Obter os estados dos checkboxes no início da função.
+        // Obter os estados dos controles no início da função.
+        const modoProposta = document.getElementById('modoProposta').value === 'detalhada' ? 'detalhada' : 'reduzida';
         const mostrarValoresItens = document.getElementById('mostrarValoresItens').checked;
-        const mostrarDetalhamentoCompleto = document.getElementById('mostrarDetalhamentoCompleto').checked;
+        const mostrarDetalhamentoCompleto = modoProposta === 'detalhada';
 
         const orcamentoFinalDiv = document.getElementById('orcamentoFinal');
         const orcamento = orcamentosSalvos[orcamentoAtualId];
-        const descontoGlobal = parseFloat(document.getElementById('descontoGlobal').value) || 0;
+        const descontoGlobal = Math.min(100, Math.max(0, parseFloat(document.getElementById('descontoGlobal').value) || 0));
         
         if (!orcamento || (!orcamento.itens || orcamento.itens.length === 0) && (!orcamento.produtosAcabados || orcamento.produtosAcabados.length === 0)) {
             orcamentoFinalDiv.innerHTML = '<p style="text-align: center; color: #777;">Adicione itens ao orçamento para visualizar a proposta.</p>';
@@ -1081,26 +1403,24 @@ btnLogout.addEventListener('click', handleLogout);
         
         const subtotal = orcamento.totais?.totalProdutos || 0;
         const totalMargemOriginal = orcamento.totais?.totalMargemProposta || 0;
-        
-        const descontoValor = subtotal * (descontoGlobal / 100);
-        const totalComDesconto = subtotal - descontoValor;
-        const margemComDesconto = totalMargemOriginal - descontoValor;
-
-        let margemComDescontoPercentual;
-        if (totalComDesconto > 0) {
-            margemComDescontoPercentual = (margemComDesconto / totalComDesconto) * 100;
-        } else {
-            // Se o total com desconto for zero ou negativo (desconto de 100% ou mais), a margem é -100% do custo.
-            margemComDescontoPercentual = -100;
-        }
+        const totalInstalacaoGeral = orcamento.totais?.totalInstalacao || 0;
+        const totaisProposta = calcularTotaisProposta({
+            subtotalProdutos: subtotal,
+            margemProdutos: totalMargemOriginal,
+            totalInstalacao: totalInstalacaoGeral,
+            descontoPercentual: descontoGlobal
+        });
+        const descontoValor = totaisProposta.descontoValor;
+        const totalComDesconto = totaisProposta.totalProdutos;
+        const margemComDescontoPercentual = totaisProposta.margemPercentual;
         
         document.getElementById('margemComDesconto').textContent = `${truncarDecimal(margemComDescontoPercentual, 2)}%`;
 
         // LÓGICA DE GERAÇÃO DE HTML RESTAURADA
-        const todosOsItens = [...(orcamento.itens || []), ...orcamento.produtosAcabados.flatMap(p => p.itens)];
+        const todosOsItens = [...(orcamento.itens || []), ...(orcamento.produtosAcabados || []).flatMap(p => p.itens || [])];
 
         let html = `
-            <div class="proposta-wrapper">
+            <div class="proposta-wrapper proposta-${modoProposta}">
                 <div class="proposta-header">
                     <div class="logo">
                         <img src="WhatsApp Image 2025-09-17 at 16.56.26.jpeg" alt="Logo Marcello Machado">
@@ -1116,11 +1436,11 @@ btnLogout.addEventListener('click', handleLogout);
                 </div>
 
                 <div class="proposta-info-grid">
-                    <div><strong>ID da Proposta:</strong><p>${orcamentoAtualId}</p></div>
-                    <div><strong>Cliente:</strong><p>${orcamento.infoGerais.nomeCliente || 'Não informado'}</p></div>
-                    <div><strong>Endereço:</strong><p>${orcamento.infoGerais.enderecoCliente || 'Não informado'}</p></div>
-                    <div><strong>Data do Orçamento:</strong><p>${formatarData(orcamento.infoGerais.dataOrcamento)}</p></div>
-                    <div><strong>Validade do Orçamento:</strong><p>${formatarData(orcamento.infoGerais.prazoValidade)}</p></div>
+                    <div><strong>ID da Proposta:</strong><p>${escaparHtml(orcamentoAtualId)}</p></div>
+                    <div><strong>Cliente:</strong><p>${escaparHtml(orcamento.infoGerais?.nomeCliente || 'Não informado')}</p></div>
+                    <div><strong>Endereço:</strong><p>${escaparHtml(orcamento.infoGerais?.enderecoCliente || 'Não informado')}</p></div>
+                    <div><strong>Data do Orçamento:</strong><p>${escaparHtml(formatarData(orcamento.infoGerais?.dataOrcamento))}</p></div>
+                    <div><strong>Validade do Orçamento:</strong><p>${escaparHtml(formatarData(orcamento.infoGerais?.prazoValidade))}</p></div>
                 </div>
         `;
         
@@ -1129,18 +1449,17 @@ btnLogout.addEventListener('click', handleLogout);
                     <thead><tr><th>Produto</th><th style="text-align: right;">Valor Total</th></tr></thead><tbody>`;
         
         (orcamento.produtosAcabados || []).forEach(produto => {
-            html += `<tr><td>${produto.nome} (${produto.ambiente})</td><td class="item-value">${formatarMoeda(produto.valorTotal)}</td></tr>`;
+            html += `<tr><td><strong>${escaparHtml(produto.nome)} (${escaparHtml(produto.ambiente)})</strong>${produto.observacoesCliente ? `<span class="proposta-observacao-produto">${escaparHtml(produto.observacoesCliente)}</span>` : ''}</td><td class="item-value">${formatarMoeda(produto.valorTotal)}</td></tr>`;
         });
 
         if (orcamento.itens && orcamento.itens.length > 0) {
-             const totalAvulsos = orcamento.itens.reduce((sum, item) => sum + item.precoTotal, 0);
+             const totalAvulsos = orcamento.itens.reduce((sum, item) => sum + Number(item.precoTotal || 0), 0);
              html += `<tr><td>Itens Avulsos</td><td class="item-value">${formatarMoeda(totalAvulsos)}</td></tr>`;
         }
 
         html += `</tbody></table>`;
 
-        const totalInstalacaoGeral = orcamento.totais.totalInstalacao || 0;
-        const totalFinalGeral = totalComDesconto + totalInstalacaoGeral;
+        const totalFinalGeral = totaisProposta.totalGeral;
 
         html += `
             <div class="proposta-summary">
@@ -1168,8 +1487,8 @@ btnLogout.addEventListener('click', handleLogout);
             
             (orcamento.produtosAcabados || []).forEach(produto => {
                 html += `
-                    <h4 style="color: #333; margin-bottom: 10px; border-bottom: 1px solid #eee; padding-bottom: 5px;">${produto.nome} (${produto.ambiente})</h4>
-                    <table class="proposta-ambiente-table">
+                    <h4 style="color: #333; margin-bottom: 10px; border-bottom: 1px solid #eee; padding-bottom: 5px;">${escaparHtml(produto.nome)} (${escaparHtml(produto.ambiente)})</h4>
+                    <table class="proposta-ambiente-table proposta-detalhes-table">
                         <thead>
                             <tr>
                                 <th style="width: 20%;">Componente</th>
@@ -1182,11 +1501,11 @@ btnLogout.addEventListener('click', handleLogout);
                         <tbody>`;
                 produto.itens.forEach(item => {
                     html += `<tr>
-                                <td>${item.codigo || item.item || ''}</td>
-                                <td class="item-description">${item.descricao} ${item.observacoes ? ` - Obs: ${item.observacoes}` : ''}</td>
-                                <td>${(item.cor === 'Não Informada' ? '-' : item.cor) || '-'}</td>
-                                <td>${item.unidadeMedida || ''}</td>
-                                <td style="text-align: center;">${item.quantidade || 0}</td>
+                                <td>${escaparHtml(item.codigo || item.item || '')}</td>
+                                <td class="item-description">${escaparHtml(item.descricao)} ${item.observacoes ? ` - Obs: ${escaparHtml(item.observacoes)}` : ''}</td>
+                                <td>${escaparHtml((item.cor === 'Não Informada' ? '-' : item.cor) || '-')}</td>
+                                <td>${escaparHtml(item.unidadeMedida || '')}</td>
+                                <td style="text-align: center;">${escaparHtml(item.quantidade || 0)}</td>
                                 ${mostrarValoresItens ? `<td class="item-value">${formatarMoeda(item.precoTotal)}</td>` : '<td class="item-value"></td>'}
                             </tr>`;
                 });
@@ -1196,7 +1515,7 @@ btnLogout.addEventListener('click', handleLogout);
             
             if(orcamento.itens && orcamento.itens.length > 0) {
                  html += `<h4 style="color: #333; margin-top: 20px; border-bottom: 1px solid #eee; padding-bottom: 5px;">Itens Avulsos</h4>
-                     <table class="proposta-ambiente-table">
+                     <table class="proposta-ambiente-table proposta-detalhes-table">
                         <thead>
                             <tr>
                                 <th style="width: 20%;">Componente</th>
@@ -1209,11 +1528,11 @@ btnLogout.addEventListener('click', handleLogout);
                         <tbody>`;
                 orcamento.itens.forEach(item => {
                     html += `<tr>
-                                <td>${item.codigo || item.item || ''}</td>
-                                <td class="item-description">${item.descricao} ${item.observacoes ? ` - Obs: ${item.observacoes}` : ''}</td>
-                                <td>${(item.cor === 'Não Informada' ? '-' : item.cor) || '-'}</td>
-                                <td>${item.unidadeMedida || ''}</td>
-                                <td style="text-align: center;">${item.quantidade || 0}</td>
+                                <td>${escaparHtml(item.codigo || item.item || '')}</td>
+                                <td class="item-description">${escaparHtml(item.descricao)} ${item.observacoes ? ` - Obs: ${escaparHtml(item.observacoes)}` : ''}</td>
+                                <td>${escaparHtml((item.cor === 'Não Informada' ? '-' : item.cor) || '-')}</td>
+                                <td>${escaparHtml(item.unidadeMedida || '')}</td>
+                                <td style="text-align: center;">${escaparHtml(item.quantidade || 0)}</td>
                                 ${mostrarValoresItens ? `<td class="item-value">${formatarMoeda(item.precoTotal)}</td>` : '<td class="item-value"></td>'}
                             </tr>`;
                 });
@@ -1225,10 +1544,10 @@ btnLogout.addEventListener('click', handleLogout);
         html += `
             <div class="proposta-footer">
                 <h4>Condições Comerciais</h4>
-                <p><strong>Condição de Pagamento:</strong> ${condComerciais.condicaoPagamento || 'Não informado'}</p>
-                <p><strong>Forma de Pagamento:</strong> ${condComerciais.formaPagamento || 'Não informado'}</p>
-                <p><strong>Prazo de Entrega:</strong> ${orcamento.infoGerais.prazoEntrega || 'Não informado'}</p>
-                <p><strong>Observações:</strong> ${condComerciais.observacoesComerciais || orcamento.infoGerais.observacoesGerais || 'Sem observações.'}</p>
+                <p><strong>Condição de Pagamento:</strong> ${escaparHtml(condComerciais.condicaoPagamento || 'Não informado')}</p>
+                <p><strong>Forma de Pagamento:</strong> ${escaparHtml(condComerciais.formaPagamento || 'Não informado')}</p>
+                <p><strong>Prazo de Entrega:</strong> ${escaparHtml(orcamento.infoGerais?.prazoEntrega || 'Não informado')}</p>
+                <p><strong>Observações:</strong> ${escaparHtml(condComerciais.observacoesComerciais || orcamento.infoGerais?.observacoesGerais || 'Sem observações.')}</p>
             </div>
         </div>`;
         
@@ -1249,7 +1568,7 @@ btnLogout.addEventListener('click', handleLogout);
         }
 
         if (!itemParaEditar) {
-            alert("Item não encontrado para edição.");
+            mostrarNotificacao("Item não encontrado para edição.");
             return;
         }
 
@@ -1274,19 +1593,7 @@ btnLogout.addEventListener('click', handleLogout);
         atualizarPreviewCalculoEdicao();
 
         // Mostra o modal
-        document.getElementById('modalEdicaoItem').classList.add('active');
-    }
-
-    function atualizarDatalistEdicao() {
-        const datalistCodigos = document.getElementById('listaCodigosEdicao');
-        datalistCodigos.innerHTML = '';
-        
-        precos.filter(p => p.status === 'Ativo').forEach(p => {
-            const option = document.createElement('option');
-            option.value = p.codigo;
-            option.textContent = `${p.codigo} - ${p.descricao}`;
-            datalistCodigos.appendChild(option);
-        });
+        abrirModal('modalEdicaoItem');
     }
 
     function ajustarCamposEdicaoItem() {
@@ -1313,7 +1620,7 @@ btnLogout.addEventListener('click', handleLogout);
         if (!produto) return; // Se não houver produto, a UI fica no estado padrão (Unidade)
 
         // Lógica baseada na Unidade de Medida
-        switch (produto.unidadeMedida) {
+        switch (normalizarUnidadeMedida(produto.unidadeMedida)) {
             case 'MetroLinear':
                 labelQtd.textContent = 'Qtd (metros):';
                 inputQtd.step = "0.001";
@@ -1365,13 +1672,14 @@ btnLogout.addEventListener('click', handleLogout);
     }
 
     async function salvarEdicaoItem() {
+        if (!garantirOrcamentoEditavel('editar itens')) return;
         const itemId = document.getElementById('edicaoItemId').value;
         const produtoAcabadoId = document.getElementById('edicaoProdutoAcabadoIdItem').value;
         const codigo = document.getElementById('edicaoCodigoItem').value.trim().toUpperCase();
         const produtoBase = precos.find(p => p.codigo === codigo);
 
         if (!produtoBase || produtoBase.status !== 'Ativo') {
-            alert("O produto com o código inserido não foi encontrado ou está inativo.");
+            mostrarNotificacao("O produto com o código inserido não foi encontrado ou está inativo.");
             return;
         }
 
@@ -1379,12 +1687,9 @@ btnLogout.addEventListener('click', handleLogout);
         const largura = parseFloat(document.getElementById('edicaoLarguraItem').value) || 0;
         const altura = parseFloat(document.getElementById('edicaoAlturaItem').value) || 0;
 
-        if (isNaN(quantidade) || quantidade <= 0) {
-            alert("A quantidade deve ser um número maior que zero para esta unidade de medida.");
-            return;
-        }
-        if (produtoBase.unidadeMedida === 'MetroQuadrado' && (isNaN(largura) || largura <= 0 || isNaN(altura) || altura <= 0)) {
-            alert("Largura e Altura são obrigatórias e devem ser maiores que zero para produtos 'Metro Quadrado'.");
+        const erroValidacao = validarParametrosItem(produtoBase, quantidade, largura, altura);
+        if (erroValidacao) {
+            mostrarNotificacao(erroValidacao);
             return;           
         }
 
@@ -1429,6 +1734,8 @@ btnLogout.addEventListener('click', handleLogout);
             itemParaAtualizar.observacoes = document.getElementById('edicaoObservacoesItem').value.trim();
             
             itemParaAtualizar.custoReal = detalhesCalculados.custoReal;
+            itemParaAtualizar.quantidadeCompra = detalhesCalculados.quantidadeCompra;
+            itemParaAtualizar.precoCompraUnitario = produtoBase.precoCompra;
             itemParaAtualizar.margemLiquida = detalhesCalculados.margemLiquida;
             itemParaAtualizar.margemPercentual = detalhesCalculados.margemPercentual;
             itemParaAtualizar.valorComissao = detalhesCalculados.valorComissao;
@@ -1436,17 +1743,18 @@ btnLogout.addEventListener('click', handleLogout);
             // PONTO DE DEPURAÇÃO 2: O que está sendo atualizado?
             console.log("DEBUG: Objeto 'itemParaAtualizar' antes de salvar:", JSON.stringify(itemParaAtualizar, null, 2));
 
-            await salvarOrcamentoAtual();
+            const salvou = await salvarOrcamentoAtual();
+            if (!salvou) return;
 
             fecharModalEdicaoItem();
-            alert("Item atualizado com sucesso!");
+            mostrarNotificacao("Item atualizado com sucesso!", 'sucesso');
         } else {
-            alert("Erro: Item não encontrado para atualização.");
+            mostrarNotificacao("Erro: Item não encontrado para atualização.");
         }
     }
 
     function fecharModalEdicaoItem() {
-        document.getElementById('modalEdicaoItem').classList.remove('active');
+        fecharModal('modalEdicaoItem');
         
         // Limpar campos
         document.getElementById('edicaoItemId').value = '';
@@ -1469,7 +1777,7 @@ btnLogout.addEventListener('click', handleLogout);
     function imprimirPropostaComNomeDinamico() {
         const orcamento = orcamentosSalvos[orcamentoAtualId];
         if (!orcamento) {
-            alert("Selecione um orçamento para imprimir.");
+            mostrarNotificacao("Selecione um orçamento para imprimir.");
             return;
         }
 
@@ -1492,12 +1800,12 @@ btnLogout.addEventListener('click', handleLogout);
         window.print();
     }
 
-    function imprimirInstrucoesInstalador() {
+    function imprimirInstrucoesInstaladorLegado() {
         const orcamentoFinalDiv = document.getElementById('orcamentoFinal');
         const orcamento = orcamentosSalvos[orcamentoAtualId];
 
         if (!orcamento || ((orcamento.itens || []).length === 0 && (orcamento.produtosAcabados || []).length === 0)) {
-            alert("Não há itens no orçamento para gerar as instruções.");
+            mostrarNotificacao("Não há itens no orçamento para gerar as instruções.");
             return;
         }
 
@@ -1599,88 +1907,82 @@ btnLogout.addEventListener('click', handleLogout);
         window.print();
     }
 
-    /** 
-     * SOLUÇÃO DEFINITIVA: Função de arredondamento financeiro robusta.
-     * Usa um método que evita erros de ponto flutuante do JavaScript.
-     * Ex: 58.095 será corretamente arredondado para 58.10.
-     * @param {number} num O número a ser arredondado.
-     * @param {number} casasDecimais O número de casas decimais.
-     * @returns {number} O número arredondado.
-    */
-    function arredondamentoFinanceiro(num, casasDecimais = 2) {
-        const fator = Math.pow(10, casasDecimais);
-        return Math.round((num + Number.EPSILON) * fator) / fator;
-    }
+    function imprimirInstrucoesInstalador() {
+        const orcamentoFinalDiv = document.getElementById('orcamentoFinal');
+        const orcamento = obterOrcamentoAtual();
 
-
-    /**
-     * NOVA ABORDAGEM: Função Centralizada de Cálculo.
-     * Esta função é a única fonte da verdade para todos os cálculos de um item.
-     * @param {object} produtoBase - O objeto do produto da lista de preços.
-     * @param {number} quantidade - A quantidade de peças/cortes.
-     * @param {number} largura - A largura (para Metro Quadrado).
-     * @param {number} altura - A altura (para Metro Quadrado).
-     * @param {string} tipoCliente - 'cliente' ou 'arquiteto'.
-     * @returns {object} Um objeto com todos os detalhes calculados do item.
-     */
-    function calcularDetalhesItem(produtoBase, quantidade, largura, altura, tipoCliente) {
-        let quantidadeCompra = 0; // Quantidade final para cálculo de preço (ex: metros, m², unidades)
-        let larguraSalva = null;
-        let calculoTexto = ''; // NOVO: Adicionado para consistência
-        let alturaSalva = null;
-
-        switch (produtoBase.unidadeMedida) {
-            case 'MetroLinear':
-                quantidadeCompra = quantidade; // Quantidade é em metros
-                alturaSalva = produtoBase.alturaPadrao || null; // A "largura do material" é salva como altura do item
-                break;
-                calculoTexto = `${quantidade.toFixed(3)} metro(s)`;
-            case 'MetroQuadrado':
-                // Para M², a quantidade de compra é a área. A quantidade de peças é sempre 1.
-                quantidadeCompra = largura * altura * quantidade; // Área (largura x altura) multiplicada pela quantidade de peças.
-                larguraSalva = largura;
-                alturaSalva = altura;
-                calculoTexto = `(${largura}m x ${altura}m) x ${quantidade} pç(s) = ${quantidadeCompra.toFixed(2)}m²`;
-                break;
-            default: // 'Unidade'
-                quantidadeCompra = quantidade;
-                calculoTexto = `${quantidade} unidade(s)`;
-                break; 
+        if (!orcamento || !pedidoEstaConfirmado(orcamento)) {
+            mostrarNotificacao('Transforme o orçamento em pedido antes de gerar o relatório do instalador.');
+            return;
         }
 
-        // PASSO 1: Calcular o preço unitário base com precisão total.
-        const precoUnitarioBase = calcularPrecoFinal(produtoBase.precoCompra, produtoBase.markup);
+        const itens = obterItensDoPedido(orcamento);
+        if (itens.length === 0) {
+            mostrarNotificacao('O pedido confirmado não possui itens para retirada.');
+            return;
+        }
 
-        // PASSO 2: Aplicar comissão (se houver) e neutralizar imprecisões de ponto flutuante.
-        const precoUnitarioComComissao = tipoCliente === 'arquiteto' ? precoUnitarioBase * 1.10 : precoUnitarioBase;
-        
-        // ARREDONDAMENTO CORRIGIDO: Usa a função de arredondamento financeiro robusta.
-        // Isso garante que 58.095 se torne 58.10.
-        const precoUnitarioFinal = arredondamentoFinanceiro(precoUnitarioComComissao, 2);
+        const pedido = orcamento.pedido || {};
+        const cliente = pedido.cliente || {};
+        const conteudoOriginal = orcamentoFinalDiv.innerHTML;
+        const tituloOriginal = document.title;
+        const linhas = itens.map(item => `
+            <tr>
+                <td>${escaparHtml(item.ambiente || '-')}</td>
+                <td>${escaparHtml(item.produtoAcabadoNome || 'Item avulso')}</td>
+                <td>${escaparHtml(item.codigo || '-')}</td>
+                <td>${escaparHtml(item.descricao || '-')}</td>
+                <td>${escaparHtml(item.unidadeMedida || 'Unidade')}</td>
+                <td class="numero">${escaparHtml(Number(item.quantidadeCompra || 0).toLocaleString('pt-BR', { maximumFractionDigits: 3 }))}</td>
+            </tr>
+        `).join('');
 
-        // PASSO 3: Calcular o preço total usando o preço unitário final já com a regra de negócio.
-        // CORREÇÃO: O cálculo do total também deve ser arredondado para evitar imprecisões.
-        const precoTotalBruto = arredondamentoFinanceiro(precoUnitarioFinal * quantidadeCompra, 2); // Ex: 58.10 * 7.5 = 435.75
-        const precoTotal = parseFloat(precoTotalBruto.toFixed(2));
+        orcamentoFinalDiv.innerHTML = `
+            <div class="proposta-wrapper proposta-reduzida relatorio-instalador">
+                <h2>Retirada para instalação</h2>
+                <div class="proposta-info-grid">
+                    <div><strong>Pedido</strong><p>${escaparHtml(orcamento.id || orcamentoAtualId)}</p></div>
+                    <div><strong>Cliente</strong><p>${escaparHtml(cliente.nome || orcamento.infoGerais?.nomeCliente || 'Não informado')}</p></div>
+                    <div class="campo-endereco"><strong>Endereço do cliente</strong><p>${escaparHtml(cliente.endereco || orcamento.infoGerais?.enderecoCliente || 'Não informado')}</p></div>
+                </div>
+                <table class="proposta-ambiente-table">
+                    <thead>
+                        <tr>
+                            <th>Ambiente</th>
+                            <th>Produto</th>
+                            <th>Código</th>
+                            <th>Item a retirar</th>
+                            <th>Unidade</th>
+                            <th>Qtd.</th>
+                        </tr>
+                    </thead>
+                    <tbody>${linhas}</tbody>
+                </table>
+            </div>
+        `;
 
-        // PASSO 4: Calcular custo, comissão e margem.
-        const custoReal = produtoBase.precoCompra * quantidadeCompra;
-        // A comissão é calculada sobre o preço base, antes do arredondamento final, para maior precisão.
-        const valorComissao = tipoCliente === 'arquiteto' ? (precoUnitarioBase * 0.10 * quantidadeCompra) : 0;
-        const margemLiquida = precoTotal - custoReal - valorComissao;
-        const margemPercentual = precoTotal > 0 ? (margemLiquida / precoTotal) * 100 : 0;
-
-        return {
-            quantidadeCompra, larguraSalva, alturaSalva, precoUnitario: precoUnitarioFinal,
-            precoTotal, custoReal, valorComissao, margemLiquida, margemPercentual, calculoTexto
+        document.title = `Retirada_Instalador_${orcamento.id || orcamentoAtualId}`;
+        window.onafterprint = function() {
+            orcamentoFinalDiv.innerHTML = conteudoOriginal;
+            document.title = tituloOriginal;
+            window.onafterprint = null;
         };
+
+        window.print();
     }
 
     async function recalcularComissao() {
         const orcamento = orcamentosSalvos[orcamentoAtualId];
         if (!orcamento) return;
 
+        if (!garantirOrcamentoEditavel('alterar o tipo de cliente')) {
+            document.getElementById('tipoCliente').value = orcamento.infoGerais?.tipoCliente || 'cliente';
+            return;
+        }
+
         const tipoCliente = document.getElementById('tipoCliente').value;
+        if (!orcamento.infoGerais) orcamento.infoGerais = {};
+        orcamento.infoGerais.tipoCliente = tipoCliente;
 
         const recalcularArray = (itensArray) => {
             itensArray.forEach(item => {
@@ -1725,9 +2027,11 @@ btnLogout.addEventListener('click', handleLogout);
     function exportarDados() {
         const data = {
             version: dataVersion,
+            exportadoEm: new Date().toISOString(),
             precos: precos,
             fornecedores: fornecedores,
             categorias: categorias,
+            unidadesDeMedida: unidadesDeMedida,
             orcamentosSalvos: orcamentosSalvos
         };
         const dataStr = JSON.stringify(data, null, 2);
@@ -1740,65 +2044,128 @@ btnLogout.addEventListener('click', handleLogout);
         a.click();
         document.body.removeChild(a);
         URL.revokeObjectURL(url);
-        alert("Backup concluído com sucesso!");
+        mostrarNotificacao("Backup concluído com sucesso!");
     }
 
-    function importarDados(event) {
-        const file = event.target.files[0];
-        if (!file) {
-            return;
+    async function gravarDocumentosEmLotes(documentos) {
+        const tamanhoLote = 400;
+        for (let inicio = 0; inicio < documentos.length; inicio += tamanhoLote) {
+            const batch = writeBatch(db);
+            documentos.slice(inicio, inicio + tamanhoLote).forEach(({ colecao, id, dados }) => {
+                batch.set(doc(db, colecao, id), dados, { merge: true });
+            });
+            await batch.commit();
         }
-        const reader = new FileReader();
-        reader.onload = function(e) {
-            try {
-                const importedData = JSON.parse(e.target.result);
-                if (importedData.version !== dataVersion && importedData.version !== "1.0") {
-                    alert(`Atenção: A versão do arquivo de backup (${importedData.version}) é diferente da versão do sistema (${dataVersion}). A importação pode não funcionar corretamente. Prossiga por sua conta e risco.`);
-                }
-                if (confirm("Importar dados irá substituir todos os dados atuais. Deseja continuar?")) {
-                    precos = importedData.precos || [];
-                    fornecedores = importedData.fornecedores || [];
-                    categorias = importedData.categorias || [];
-                    orcamentosSalvos = importedData.orcamentosSalvos || {};
-                    orcamentoAtualId = Object.keys(orcamentosSalvos)[0] || null;
+    }
 
-                    salvarDados();
-                    carregarDados(); // Recarregar para aplicar migrações se necessário
-                    showTab(0);
-                    alert("Dados importados com sucesso!");
-                }
-            } catch (error) {
-                alert("Erro ao ler o arquivo. Certifique-se de que é um arquivo JSON válido.");
-                console.error("Erro na importação:", error);
+    async function importarDados(event) {
+        const file = event.target.files[0];
+        if (!file) return;
+
+        try {
+            const importedData = JSON.parse(await file.text());
+            const colecoesArray = ['precos', 'fornecedores', 'categorias', 'unidadesDeMedida'];
+            const estruturaValida = importedData
+                && typeof importedData === 'object'
+                && colecoesArray.every(nome => importedData[nome] === undefined || Array.isArray(importedData[nome]))
+                && (importedData.orcamentosSalvos === undefined || typeof importedData.orcamentosSalvos === 'object');
+
+            if (!estruturaValida) {
+                throw new Error('Estrutura de backup inválida.');
             }
-        };
-        reader.readAsText(file);
+
+            if (importedData.version !== dataVersion && importedData.version !== '1.0') {
+                const continuar = confirm(`O backup é da versão ${importedData.version || 'desconhecida'} e o sistema usa ${dataVersion}. Deseja tentar a mesclagem mesmo assim?`);
+                if (!continuar) return;
+            }
+
+            const documentos = [];
+            colecoesArray.forEach(nomeColecao => {
+                (importedData[nomeColecao] || []).forEach((registro, indice) => {
+                    const id = String(registro?.id || `importado-${crypto.randomUUID()}-${indice}`);
+                    const { id: _idIgnorado, ...dados } = registro || {};
+                    documentos.push({ colecao: nomeColecao, id, dados });
+                });
+            });
+            Object.entries(importedData.orcamentosSalvos || {}).forEach(([id, dados]) => {
+                documentos.push({ colecao: 'orcamentos', id, dados: { ...dados, id } });
+            });
+
+            if (documentos.length === 0) {
+                throw new Error('O arquivo não contém registros para restaurar.');
+            }
+
+            const confirmarMesclagem = confirm(`Mesclar ${documentos.length} registro(s) deste backup no Firebase? Registros com o mesmo ID serão atualizados; nenhum registro atual será apagado.`);
+            if (!confirmarMesclagem) return;
+
+            atualizarStatusSincronizacao('Restaurando backup…', 'loading');
+            await gravarDocumentosEmLotes(documentos);
+
+            const maiorNumeroOrcamento = Object.keys(importedData.orcamentosSalvos || {})
+                .map(id => id.match(/^ORC-(\d+)$/))
+                .filter(Boolean)
+                .reduce((maior, match) => Math.max(maior, Number(match[1])), 0);
+            if (maiorNumeroOrcamento > 0) {
+                await runTransaction(db, async transaction => {
+                    const contadorRef = doc(db, 'contadores', 'orcamentos');
+                    const snapshot = await transaction.get(contadorRef);
+                    const atual = snapshot.exists() ? Number(snapshot.data().ultimoNumero || 0) : 0;
+                    transaction.set(contadorRef, {
+                        ultimoNumero: Math.max(atual, maiorNumeroOrcamento),
+                        atualizadoEm: new Date().toISOString()
+                    }, { merge: true });
+                });
+            }
+
+            atualizarStatusSincronizacao('Backup restaurado', 'ok');
+            mostrarNotificacao(`${documentos.length} registro(s) mesclado(s) com sucesso.`);
+        } catch (error) {
+            console.error('Erro na restauração do backup:', error);
+            atualizarStatusSincronizacao('Falha ao restaurar backup', 'error');
+            mostrarNotificacao(`Não foi possível restaurar o backup: ${error.message}`);
+        } finally {
+            event.target.value = '';
+        }
     }
 
     /**
      * Função centralizada para salvar o estado atual do orçamento no Firestore.
      */
-    async function salvarOrcamentoAtual() {
-        const orcamento = orcamentosSalvos[orcamentoAtualId];
-        if (!orcamentoAtualId || !orcamento) {
+    async function salvarOrcamentoAtual(id = orcamentoAtualId) {
+        const orcamento = orcamentosSalvos[id];
+        if (!id || !orcamento) {
             console.warn("Tentativa de salvar um orçamento inválido ou não selecionado.");
-            return;
+            return false;
         }
+
+        atualizarStatusSincronizacao('Salvando alterações…', 'carregando');
         try {
-            const orcamentoRef = doc(db, "orcamentos", orcamentoAtualId);
+            const orcamentoRef = doc(db, "orcamentos", id);
             // Usamos `setDoc` para sobrescrever o documento inteiro com os dados atualizados em memória.
             // O `merge: true` é uma segurança para não destruir o documento se ele for recriado.
-            await updateDoc(orcamentoRef, orcamentosSalvos[orcamentoAtualId]);
+            await updateDoc(orcamentoRef, orcamento);
+            orcamentosPersistidos[id] = structuredClone(orcamento);
+            orcamentosComAlteracoesPendentes.delete(id);
+            atualizarStatusSincronizacao('Alterações salvas', 'ok');
+            return true;
         } catch (error) {
             console.error("Erro ao salvar orçamento no Firestore:", error);
-            alert("Ocorreu um erro ao salvar as alterações no orçamento. Verifique sua conexão e tente novamente.");
+            if (orcamentosPersistidos[id]) {
+                orcamentosSalvos[id] = structuredClone(orcamentosPersistidos[id]);
+                if (id === orcamentoAtualId) preencherInfoOrcamento();
+            }
+            orcamentosComAlteracoesPendentes.delete(id);
+            atualizarStatusSincronizacao('Falha ao salvar. As alterações foram desfeitas.', 'erro');
+            mostrarNotificacao('Não foi possível salvar. As alterações foram desfeitas; verifique sua conexão e tente novamente.', 'erro');
+            return false;
         }
     }
 
     // Função para atualizar campos de texto/data do orçamento e salvar
     async function atualizarInfoOrcamento(campo, valor) {
-        if (!orcamentoAtualId) return;
-        const orcamento = orcamentosSalvos[orcamentoAtualId];
+        const id = orcamentoAtualId;
+        if (!id) return false;
+        const orcamento = orcamentosSalvos[id];
         
         if (!orcamento.infoGerais) {
             orcamento.infoGerais = {};
@@ -1808,7 +2175,7 @@ btnLogout.addEventListener('click', handleLogout);
         if (campo === 'nomeCliente') {
             renderizarOrcamentos(); // Atualiza o texto no seletor de orçamentos
         }
-        await salvarOrcamentoAtual();
+        return salvarOrcamentoAtual(id);
     }
 
     function inicializarSelectInteligente(inputId) {
@@ -1817,26 +2184,75 @@ btnLogout.addEventListener('click', handleLogout);
             console.error(`Elemento #${inputId} não encontrado.`);
             return;
         }
-        
+
         input.removeAttribute('list');
 
         const wrapper = document.createElement('div');
         wrapper.className = 'select-inteligente-wrapper';
-        wrapper.style.position = 'relative';
 
         const dropdown = document.createElement('div');
         dropdown.className = 'select-inteligente-dropdown';
         dropdown.style.display = 'none';
+        dropdown.id = `${inputId}-opcoes`;
+        dropdown.setAttribute('role', 'listbox');
+
+        input.setAttribute('role', 'combobox');
+        input.setAttribute('aria-autocomplete', 'list');
+        input.setAttribute('aria-expanded', 'false');
+        input.setAttribute('aria-controls', dropdown.id);
 
         input.parentNode.insertBefore(wrapper, input);
         wrapper.appendChild(input);
         wrapper.appendChild(dropdown);
 
+        let indiceAtivo = -1;
+
+        const obterItens = () => [...dropdown.querySelectorAll('.select-inteligente-item:not(.sem-resultado)')];
+
+        const fecharDropdown = () => {
+            dropdown.style.display = 'none';
+            input.setAttribute('aria-expanded', 'false');
+            input.removeAttribute('aria-activedescendant');
+            indiceAtivo = -1;
+        };
+
+        const destacarItem = (novoIndice) => {
+            const itens = obterItens();
+            if (itens.length === 0) return;
+
+            indiceAtivo = (novoIndice + itens.length) % itens.length;
+            itens.forEach((item, indice) => {
+                const ativo = indice === indiceAtivo;
+                item.classList.toggle('ativo', ativo);
+                item.setAttribute('aria-selected', String(ativo));
+            });
+            input.setAttribute('aria-activedescendant', itens[indiceAtivo].id);
+            itens[indiceAtivo].scrollIntoView({ block: 'nearest' });
+        };
+
+        const selecionarItem = (item) => {
+            if (!item || item.classList.contains('sem-resultado')) return;
+            const codigo = item.dataset.codigo;
+            input.value = codigo;
+            fecharDropdown();
+
+            const produto = precos.find(p => p.codigo === codigo);
+            if (produto && inputId === 'codigoOrcamento') {
+                document.getElementById('categoriaItemOrcamento').value = produto.categoria || '';
+                document.getElementById('corItemOrcamento').value = produto.cor || '-';
+            } else if (produto && inputId === 'edicaoCodigoItem') {
+                document.getElementById('edicaoCategoriaItem').value = produto.categoria || '';
+                document.getElementById('edicaoCorItem').value = produto.cor || '-';
+            }
+
+            input.dispatchEvent(new Event('input', { bubbles: true }));
+        };
+
         input.addEventListener('input', function() {
             const termoBusca = this.value.toLowerCase().trim();
 
             if (termoBusca.length < 2) {
-                dropdown.style.display = 'none';
+                fecharDropdown();
                 return;
             }
 
@@ -1850,54 +2266,68 @@ btnLogout.addEventListener('click', handleLogout);
                 )
             );
 
+            dropdown.replaceChildren();
+            indiceAtivo = -1;
+
             if (resultados.length > 0) {
-                dropdown.innerHTML = resultados
-                    .slice(0, 10) // Limitar a 10 resultados
-                    .map(p => {
-                        // Cria um array com as informações extras que existem
-                        const infoExtras = [p.cor, p.fornecedor, p.categoria].filter(Boolean); // filter(Boolean) remove itens vazios/nulos
-                        
-                        return `
-                            <div class="select-inteligente-item" data-codigo="${p.codigo}">
-                                <strong>${p.codigo}</strong> - ${p.descricao}
-                                ${infoExtras.length > 0 ? `<br><span class="select-info">${infoExtras.join(' | ')}</span>` : ''}
-                            </div>
-                        `;
-                    })
-                    .join('');
-                dropdown.style.display = 'block';
+                resultados.slice(0, 10).forEach((produto, indice) => {
+                    const item = document.createElement('div');
+                    item.className = 'select-inteligente-item';
+                    item.dataset.codigo = produto.codigo;
+                    item.id = `${inputId}-opcao-${indice}`;
+                    item.setAttribute('role', 'option');
+                    item.setAttribute('aria-selected', 'false');
+
+                    const codigo = document.createElement('strong');
+                    codigo.textContent = produto.codigo;
+                    item.append(codigo, document.createTextNode(` - ${produto.descricao}`));
+
+                    const infoExtras = [produto.cor, produto.fornecedor, produto.categoria].filter(Boolean);
+                    if (infoExtras.length > 0) {
+                        const info = document.createElement('span');
+                        info.className = 'select-info';
+                        info.textContent = infoExtras.join(' | ');
+                        item.append(document.createElement('br'), info);
+                    }
+
+                    dropdown.appendChild(item);
+                });
             } else {
-                dropdown.innerHTML = '<div class="select-inteligente-item sem-resultado">Nenhum produto encontrado</div>';
-                dropdown.style.display = 'block';
+                const semResultado = document.createElement('div');
+                semResultado.className = 'select-inteligente-item sem-resultado';
+                semResultado.textContent = 'Nenhum produto encontrado';
+                dropdown.appendChild(semResultado);
             }
+
+            dropdown.style.display = 'block';
+            input.setAttribute('aria-expanded', 'true');
         });
 
         dropdown.addEventListener('click', function(e) {
             const item = e.target.closest('.select-inteligente-item');
-            if (item && !item.classList.contains('sem-resultado')) {
-                const codigo = item.dataset.codigo;
-                input.value = codigo;
-                dropdown.style.display = 'none';
+            selecionarItem(item);
+        });
 
-                // CORREÇÃO: Preenche os campos de Categoria e Cor ao selecionar.
-                const produto = precos.find(p => p.codigo === codigo);
-                if (produto && inputId === 'codigoOrcamento') {
-                    document.getElementById('categoriaItemOrcamento').value = produto.categoria || '';
-                    document.getElementById('corItemOrcamento').value = produto.cor || '-';
-                } else if (produto && inputId === 'edicaoCodigoItem') {
-                    // Preenche os campos do modal de edição
-                    document.getElementById('edicaoCategoriaItem').value = produto.categoria || '';
-                    document.getElementById('edicaoCorItem').value = produto.cor || '-';
-                }
-
-                const event = new Event('input', { bubbles: true });
-                input.dispatchEvent(event);
+        input.addEventListener('keydown', (event) => {
+            if (event.key === 'Escape') {
+                if (dropdown.style.display !== 'none') event.stopPropagation();
+                fecharDropdown();
+                return;
             }
+
+            if (!['ArrowDown', 'ArrowUp', 'Enter'].includes(event.key) || dropdown.style.display === 'none') return;
+            const itens = obterItens();
+            if (itens.length === 0) return;
+
+            event.preventDefault();
+            if (event.key === 'ArrowDown') destacarItem(indiceAtivo + 1);
+            if (event.key === 'ArrowUp') destacarItem(indiceAtivo <= 0 ? itens.length - 1 : indiceAtivo - 1);
+            if (event.key === 'Enter') selecionarItem(itens[indiceAtivo >= 0 ? indiceAtivo : 0]);
         });
 
         document.addEventListener('click', function(e) {
             if (!wrapper.contains(e.target)) {
-                dropdown.style.display = 'none';
+                fecharDropdown();
             }
         });
     }
@@ -1915,21 +2345,6 @@ btnLogout.addEventListener('click', handleLogout);
             previewDiv.style.display = 'none';
             return;
         }
-        switch (produto.unidadeMedida) {
-            case 'MetroQuadrado':
-                quantidadeCompra = (largura * altura) * quantidade; // Área x Quantidade de peças
-                calculoTexto = `(${largura}m x ${altura}m) x ${quantidade} pç(s) = ${quantidadeCompra.toFixed(2)}m²`;
-                break;
-            case 'MetroLinear':
-                quantidadeCompra = quantidade; // Quantidade já é em metros
-                calculoTexto = `${quantidade.toFixed(3)} metro(s)`;
-                break;
-            default: // 'Unidade' e outros
-                quantidadeCompra = quantidade;
-                calculoTexto = `${quantidade} unidade(s)`;
-                break;
-        }
-
         const quantidade = parseFloat(document.getElementById('quantidade').value) || 0;
         const largura = parseFloat(document.getElementById('largura').value) || 0;
         const altura = parseFloat(document.getElementById('altura').value) || 0;
@@ -1967,7 +2382,7 @@ btnLogout.addEventListener('click', handleLogout);
         document.getElementById('corItemOrcamento').value = produto.cor || '-';
 
         // Lógica de UI baseada na Unidade de Medida
-        switch (produto.unidadeMedida) {
+        switch (normalizarUnidadeMedida(produto.unidadeMedida)) {
             case 'MetroLinear':
                 labelQtd.textContent = 'Qtd (metros):';
                 inputQtd.step = "0.001"; // Permite 3 casas decimais
@@ -2010,11 +2425,6 @@ btnLogout.addEventListener('click', handleLogout);
         return valorTruncado.toFixed(casas);
     }
 
-    // Funções da aba de Preços
-    function calcularPrecoFinal(precoCompra, markup) {
-        return parseFloat(precoCompra) * parseFloat(markup);
-    }
-
     async function adicionarPreco() {
         const codigo = document.getElementById('codigo').value.trim().toUpperCase();
         const descricao = document.getElementById('descricao').value.trim();
@@ -2027,23 +2437,30 @@ btnLogout.addEventListener('click', handleLogout);
         const statusProduto = document.getElementById('statusProduto').value;
 
         if (!codigo || !descricao || isNaN(precoCompra) || isNaN(markup)) {
-            alert("Por favor, preencha todos os campos obrigatórios.");
+            mostrarNotificacao("Por favor, preencha todos os campos obrigatórios.");
             return;
         }
-
-        const precoFinal = calcularPrecoFinal(precoCompra, markup);
         
         // LÓGICA DE VALIDAÇÃO DA ALTURA PADRÃO CORRIGIDA
         const alturaPadraoInput = document.getElementById('alturaPadrao');
         let alturaPadrao = null;
-        if (unidadeMedida === 'MetroLinear') {
+        if (normalizarUnidadeMedida(unidadeMedida) === 'MetroLinear') {
             alturaPadrao = parseFloat(alturaPadraoInput.value);
-            if (isNaN(alturaPadrao) || alturaPadrao <= 0) {
-                alert("Altura Padrão é obrigatória e deve ser maior que zero para produtos com unidade 'Metro Linear'.");
-                alturaPadraoInput.focus();
-                return;
-            }
         }
+
+        const erroValidacaoProduto = validarParametrosProduto({ precoCompra, markup, unidadeMedida, alturaPadrao });
+        if (erroValidacaoProduto) {
+            mostrarNotificacao(erroValidacaoProduto);
+            const campoInvalido = precoCompra <= 0
+                ? document.getElementById('precoCompra')
+                : markup <= 0
+                    ? document.getElementById('markup')
+                    : alturaPadraoInput;
+            campoInvalido.focus();
+            return;
+        }
+
+        const precoFinal = calcularPrecoFinal(precoCompra, markup);
 
         const produtoData = {
             codigo,
@@ -2071,7 +2488,7 @@ btnLogout.addEventListener('click', handleLogout);
                 const index = precos.findIndex(p => p.id === produtoExistente.id);
                 precos[index] = { ...precos[index], ...produtoData };
 
-                alert("Produto atualizado com sucesso!");
+                mostrarNotificacao("Produto atualizado com sucesso!");
             } else {
                 // --- ADICIONAR NOVO PRODUTO (CREATE) ---
                 const docRef = await addDoc(collection(db, "precos"), produtoData);
@@ -2079,14 +2496,14 @@ btnLogout.addEventListener('click', handleLogout);
                 // Adiciona o novo produto com seu ID do Firestore ao array local
                 precos.push({ id: docRef.id, ...produtoData });
 
-                alert("Produto adicionado com sucesso!");
+                mostrarNotificacao("Produto adicionado com sucesso!");
             }
             
             limparFormularioPreco(); // O listener irá atualizar a UI
 
         } catch (error) {
             console.error("Erro ao salvar produto no Firestore: ", error);
-            alert("Ocorreu um erro ao salvar o produto. Tente novamente.");
+            mostrarNotificacao("Ocorreu um erro ao salvar o produto. Tente novamente.");
         }
     }
 
@@ -2105,11 +2522,11 @@ btnLogout.addEventListener('click', handleLogout);
                 precos = precos.filter(p => p.id !== id);
 
                 // O listener irá atualizar a UI
-                alert("Produto excluído com sucesso!");
+                mostrarNotificacao("Produto excluído com sucesso!");
 
             } catch (error) {
                 console.error("Erro ao excluir produto do Firestore: ", error);
-                alert("Ocorreu um erro ao excluir o produto. Tente novamente.");
+                mostrarNotificacao("Ocorreu um erro ao excluir o produto. Tente novamente.");
             }
         }
     }
@@ -2323,15 +2740,16 @@ btnLogout.addEventListener('click', handleLogout);
 
     function atualizarIndicadoresOrdenacao() {
         // 1. Remove classes de todas as colunas
-        document.querySelectorAll('th').forEach(th => {
+        document.querySelectorAll('.coluna-ordenavel').forEach(th => {
             th.classList.remove('sorted-asc', 'sorted-desc');
+            th.setAttribute('aria-sort', 'none');
         });
 
         // 2. Adiciona a classe de ordenação na coluna que foi clicada
-        // Busca o TH que tem o onclick com o nome da coluna atual
-        const th = document.querySelector(`th[onclick*="${estadoOrdenacao.coluna}"]`);
+        const th = document.querySelector(`th[data-coluna="${estadoOrdenacao.coluna}"]`);
         if (th) {
             th.classList.add(`sorted-${estadoOrdenacao.direcao}`);
+            th.setAttribute('aria-sort', estadoOrdenacao.direcao === 'asc' ? 'ascending' : 'descending');
         }
     }
 
@@ -2375,7 +2793,7 @@ btnLogout.addEventListener('click', handleLogout);
         const produto = precos.find(p => p.id === id);
 
         if (!produto) {
-            alert('Erro: Produto não encontrado com o ID: ' + id); 
+            mostrarNotificacao('Erro: Produto não encontrado com o ID: ' + id);
             return;
         }
 
@@ -2422,7 +2840,7 @@ btnLogout.addEventListener('click', handleLogout);
         // NOVO: Chama a função para ajustar a visibilidade dos campos no momento em que o modal é aberto
         ajustarCamposEdicaoProduto();
 
-        document.getElementById('modalEdicaoProduto').classList.add('active');
+        abrirModal('modalEdicaoProduto');
     }
 
     async function salvarEdicaoProduto() {
@@ -2437,20 +2855,26 @@ btnLogout.addEventListener('click', handleLogout);
         const status = document.getElementById('edicaoStatusProduto').value;
 
         const unidadeMedida = document.getElementById('edicaoUnidadeMedidaProduto').value;
-        const categoriaSelecionada = document.getElementById('edicaoCategoriaProduto').value;
         let alturaPadrao = null;
-    if (unidadeMedida === 'Metro Linear' || categoriaSelecionada === 'Tecidos') {
+        if (normalizarUnidadeMedida(unidadeMedida) === 'MetroLinear') {
             const alturaPadraoInput = document.getElementById('edicaoAlturaPadraoProduto');
             alturaPadrao = parseFloat(alturaPadraoInput.value);
-            if (isNaN(alturaPadrao) || alturaPadrao <= 0) {
-                alert("Altura Padrão é obrigatória e deve ser maior que zero para produtos da categoria 'Tecidos' ou com unidade 'Metro Linear'.");
-                alturaPadraoInput.focus();
-                return;
-            }
         }
 
         if (!id || !codigo || !descricao || isNaN(precoCompra) || isNaN(markup)) {
-            alert('Preencha todos os campos obrigatórios corretamente.');
+            mostrarNotificacao('Preencha todos os campos obrigatórios corretamente.');
+            return;
+        }
+
+        const erroValidacaoProduto = validarParametrosProduto({ precoCompra, markup, unidadeMedida, alturaPadrao });
+        if (erroValidacaoProduto) {
+            mostrarNotificacao(erroValidacaoProduto);
+            const campoInvalido = precoCompra <= 0
+                ? document.getElementById('edicaoPrecoCompraProduto')
+                : markup <= 0
+                    ? document.getElementById('edicaoMarkupProduto')
+                    : document.getElementById('edicaoAlturaPadraoProduto');
+            campoInvalido.focus();
             return;
         }
 
@@ -2474,17 +2898,17 @@ btnLogout.addEventListener('click', handleLogout);
             await updateDoc(produtoRef, produtoData);
 
             fecharModalEdicaoProduto(); // O listener irá atualizar a UI
-            alert(`Produto ${codigo} atualizado com sucesso!`);
+            mostrarNotificacao(`Produto ${codigo} atualizado com sucesso!`);
 
         } catch (error) {
             console.error("Erro ao atualizar produto no Firestore: ", error);
-            alert("Ocorreu um erro ao salvar as alterações. Tente novamente.");
+            mostrarNotificacao("Ocorreu um erro ao salvar as alterações. Tente novamente.");
         }
     }
 
     function fecharModalEdicaoProduto() {
         // 1. Remove a classe active para ocultar o modal
-        document.getElementById('modalEdicaoProduto').classList.remove('active');
+        fecharModal('modalEdicaoProduto');
         
         // 2. Limpa os campos do formulário
         document.getElementById('edicaoCodigoProdutoHidden').value = '';
@@ -2503,12 +2927,11 @@ btnLogout.addEventListener('click', handleLogout);
 
     function ajustarCamposCadastroPorUnidade() {
         const unidadeMedida = document.getElementById('unidadeMedida').value;
-        const categoria = document.getElementById('categoria').value;
         const formGroupAlturaPadrao = document.getElementById('formGroupAlturaPadrao');
         const alturaPadraoInput = document.getElementById('alturaPadrao');
 
         // O campo "Altura Padrão" deve aparecer se a unidade for "MetroLinear" OU a categoria for "Tecidos".
-        if (unidadeMedida === 'Metro Linear' || categoria === 'Tecidos') {
+        if (normalizarUnidadeMedida(unidadeMedida) === 'MetroLinear') {
             formGroupAlturaPadrao.style.display = 'flex';
             alturaPadraoInput.required = true; 
         } else {
@@ -2520,12 +2943,11 @@ btnLogout.addEventListener('click', handleLogout);
 
     function ajustarCamposEdicaoProduto() {
         const unidadeMedida = document.getElementById('edicaoUnidadeMedidaProduto').value;
-        const categoria = document.getElementById('edicaoCategoriaProduto').value; // Pega o valor da categoria
         const formGroupAlturaPadrao = document.getElementById('formGroupEdicaoAlturaPadrao');
         const alturaPadraoInput = document.getElementById('edicaoAlturaPadraoProduto');
 
         // O campo "Altura Padrão" deve aparecer se a unidade for "MetroLinear" OU a categoria for "Tecidos".
-        if (unidadeMedida === 'Metro Linear' || categoria === 'Tecidos') {
+        if (normalizarUnidadeMedida(unidadeMedida) === 'MetroLinear') {
             formGroupAlturaPadrao.style.display = 'flex';
         } else {
             formGroupAlturaPadrao.style.display = 'none';
@@ -2539,14 +2961,83 @@ btnLogout.addEventListener('click', handleLogout);
     window.ajustarCamposEdicaoProduto = ajustarCamposEdicaoProduto;
     window.atualizarPreviewCalculoEdicao = atualizarPreviewCalculoEdicao; // CORREÇÃO: Expõe a função para o HTML
     // Funções de Gerenciamento (Modais)
+    const focoAnteriorPorModal = new WeakMap();
+
+    function abrirModal(id) {
+        const modal = document.getElementById(id);
+        if (!modal) return;
+
+        focoAnteriorPorModal.set(modal, document.activeElement);
+        modal.classList.add('active');
+        modal.setAttribute('aria-hidden', 'false');
+
+        window.requestAnimationFrame(() => {
+            const primeiroCampo = modal.querySelector('input:not([type="hidden"]):not(:disabled), select:not(:disabled), textarea:not(:disabled)')
+                || modal.querySelector('button:not(:disabled)');
+            primeiroCampo?.focus();
+        });
+    }
+
     function fecharModal(id) {
-        document.getElementById(id).classList.remove('active');
+        const modal = document.getElementById(id);
+        if (!modal) return;
+
+        modal.classList.remove('active');
+        modal.removeAttribute('style');
+        modal.setAttribute('aria-hidden', 'true');
+
+        const focoAnterior = focoAnteriorPorModal.get(modal);
+        if (focoAnterior instanceof HTMLElement && document.contains(focoAnterior)) focoAnterior.focus();
+        focoAnteriorPorModal.delete(modal);
+    }
+
+    function prepararAcessibilidadeModais() {
+        document.querySelectorAll('.modal').forEach((modal, indice) => {
+            modal.setAttribute('aria-hidden', 'true');
+            const titulo = modal.querySelector('h2');
+            if (titulo) {
+                titulo.id ||= `titulo-modal-${indice + 1}`;
+                modal.setAttribute('aria-labelledby', titulo.id);
+            }
+        });
+
+        document.addEventListener('keydown', (event) => {
+            const modaisAbertos = [...document.querySelectorAll('.modal.active')];
+            const modal = modaisAbertos.at(-1);
+            if (!modal) return;
+
+            if (event.key === 'Escape') {
+                event.preventDefault();
+                modal.querySelector('.close-button')?.click();
+                return;
+            }
+
+            if (event.key !== 'Tab') return;
+            const elementosFocaveis = [...modal.querySelectorAll(
+                'button:not(:disabled), input:not([type="hidden"]):not(:disabled), select:not(:disabled), textarea:not(:disabled), [tabindex]:not([tabindex="-1"])'
+            )].filter(elemento => elemento.offsetParent !== null);
+
+            if (elementosFocaveis.length === 0) {
+                event.preventDefault();
+                return;
+            }
+
+            const primeiro = elementosFocaveis[0];
+            const ultimo = elementosFocaveis.at(-1);
+            if (event.shiftKey && document.activeElement === primeiro) {
+                event.preventDefault();
+                ultimo.focus();
+            } else if (!event.shiftKey && document.activeElement === ultimo) {
+                event.preventDefault();
+                primeiro.focus();
+            }
+        });
     }
 
     // --- INÍCIO: CRUD DE FORNECEDORES (FASE 3.2) ---
 
     function gerenciarFornecedores() {
-        document.getElementById('modalGerenciarFornecedores').classList.add('active');
+        abrirModal('modalGerenciarFornecedores');
         renderizarListaFornecedores();
     }
 
@@ -2560,7 +3051,7 @@ btnLogout.addEventListener('click', handleLogout);
                 // O listener irá atualizar a UI
             } catch (error) {
                 console.error("Erro ao atualizar status do fornecedor:", error);
-                alert("Não foi possível atualizar o status do fornecedor.");
+                mostrarNotificacao("Não foi possível atualizar o status do fornecedor.");
             }
         }
     }
@@ -2575,10 +3066,10 @@ btnLogout.addEventListener('click', handleLogout);
                 // O listener irá atualizar a UI
             } catch (error) {
                 console.error("Erro ao adicionar fornecedor:", error);
-                alert("Não foi possível adicionar o novo fornecedor.");
+                mostrarNotificacao("Não foi possível adicionar o novo fornecedor.");
             }
         } else {
-            alert("O nome do fornecedor não pode ser vazio ou já existe.");
+            mostrarNotificacao("O nome do fornecedor não pode ser vazio ou já existe.");
         }
     }
 
@@ -2586,14 +3077,14 @@ btnLogout.addEventListener('click', handleLogout);
         document.getElementById('edicaoFornecedorNomeAntigo').setAttribute('data-id', id);
         document.getElementById('edicaoFornecedorNomeAntigo').value = nomeAtual;
         document.getElementById('edicaoFornecedorNomeNovo').value = nomeAtual;
-        document.getElementById('modalEdicaoFornecedor').classList.add('active');
+        abrirModal('modalEdicaoFornecedor');
     }
 
     function fecharModalEdicaoFornecedor() {            
         document.getElementById('edicaoFornecedorNomeAntigo').removeAttribute('data-id');
         document.getElementById('edicaoFornecedorNomeAntigo').value = '';
         document.getElementById('edicaoFornecedorNomeNovo').value = '';
-        document.getElementById('modalEdicaoFornecedor').classList.remove('active');
+        fecharModal('modalEdicaoFornecedor');
     }
 
     async function salvarEdicaoFornecedor() {
@@ -2602,7 +3093,7 @@ btnLogout.addEventListener('click', handleLogout);
         const nomeNovo = document.getElementById('edicaoFornecedorNomeNovo').value.trim();
 
         if (!nomeNovo) {
-            alert('O novo nome do fornecedor não pode ser vazio.');
+            mostrarNotificacao('O novo nome do fornecedor não pode ser vazio.');
             return;
         }
         if (nomeAntigo.toLowerCase() === nomeNovo.toLowerCase()) {
@@ -2630,17 +3121,17 @@ btnLogout.addEventListener('click', handleLogout);
             precos.forEach(p => { if (p.fornecedor === nomeAntigo) p.fornecedor = nomeNovo; });
 
             fecharModalEdicaoFornecedor();
-            alert(`Fornecedor "${nomeAntigo}" alterado para "${nomeNovo}" com sucesso!`);
+            mostrarNotificacao(`Fornecedor "${nomeAntigo}" alterado para "${nomeNovo}" com sucesso!`);
         } catch (error) {
             console.error("Erro ao salvar edição do fornecedor:", error);
-            alert("Ocorreu um erro ao salvar as alterações.");
+            mostrarNotificacao("Ocorreu um erro ao salvar as alterações.");
         }
     }
 
     async function removerFornecedorModal(id, nome) {
         const produtosUsando = precos.filter(p => p.fornecedor === nome);
         if (produtosUsando.length > 0) {
-            alert(`Não é possível excluir o fornecedor "${nome}", pois ele está sendo usado em ${produtosUsando.length} produto(s). Por favor, inative-o ou altere os produtos primeiro.`);
+            mostrarNotificacao(`Não é possível excluir o fornecedor "${nome}", pois ele está sendo usado em ${produtosUsando.length} produto(s). Por favor, inative-o ou altere os produtos primeiro.`);
             return;
         }
 
@@ -2650,7 +3141,7 @@ btnLogout.addEventListener('click', handleLogout);
                 // O listener irá atualizar a UI
             } catch (error) {
                 console.error("Erro ao remover fornecedor:", error);
-                alert("Não foi possível remover o fornecedor.");
+                mostrarNotificacao("Não foi possível remover o fornecedor.");
             }
         }
     }
@@ -2691,7 +3182,7 @@ btnLogout.addEventListener('click', handleLogout);
     // --- INÍCIO: CRUD DE CATEGORIAS (FASE 3.2) ---
 
     function gerenciarCategorias() {
-        document.getElementById('modalGerenciarCategorias').classList.add('active');
+        abrirModal('modalGerenciarCategorias');
         renderizarListaCategorias(); 
     }
 
@@ -2704,7 +3195,7 @@ btnLogout.addEventListener('click', handleLogout);
                 // O listener irá atualizar a UI
             } catch (error) {
                 console.error("Erro ao atualizar status da categoria:", error);
-                alert("Não foi possível atualizar o status da categoria.");
+                mostrarNotificacao("Não foi possível atualizar o status da categoria.");
             }
         }
     }
@@ -2719,10 +3210,10 @@ btnLogout.addEventListener('click', handleLogout);
                 // O listener irá atualizar a UI
             } catch (error) {
                 console.error("Erro ao adicionar categoria:", error);
-                alert("Não foi possível adicionar a nova categoria.");
+                mostrarNotificacao("Não foi possível adicionar a nova categoria.");
             }
         } else {
-            alert('O nome da categoria não pode ser vazio ou já existe.');
+            mostrarNotificacao('O nome da categoria não pode ser vazio ou já existe.');
         }
     }
 
@@ -2730,14 +3221,14 @@ btnLogout.addEventListener('click', handleLogout);
         document.getElementById('edicaoCategoriaNomeAntigo').setAttribute('data-id', id);
         document.getElementById('edicaoCategoriaNomeAntigo').value = nomeAtual;
         document.getElementById('edicaoCategoriaNomeNovo').value = nomeAtual;
-        document.getElementById('modalEdicaoCategoria').classList.add('active');
+        abrirModal('modalEdicaoCategoria');
     }
 
     function fecharModalEdicaoCategoria() {            
         document.getElementById('edicaoCategoriaNomeAntigo').removeAttribute('data-id');
         document.getElementById('edicaoCategoriaNomeAntigo').value = '';
         document.getElementById('edicaoCategoriaNomeNovo').value = '';
-        document.getElementById('modalEdicaoCategoria').classList.remove('active');
+        fecharModal('modalEdicaoCategoria');
     }
 
     async function salvarEdicaoCategoria() {
@@ -2746,7 +3237,7 @@ btnLogout.addEventListener('click', handleLogout);
         const nomeNovo = document.getElementById('edicaoCategoriaNomeNovo').value.trim();
 
         if (!nomeNovo) {
-            alert('O novo nome da categoria não pode ser vazio.');
+            mostrarNotificacao('O novo nome da categoria não pode ser vazio.');
             return;
         }
         if (nomeAntigo.toLowerCase() === nomeNovo.toLowerCase()) {
@@ -2771,17 +3262,17 @@ btnLogout.addEventListener('click', handleLogout);
             precos.forEach(p => { if (p.categoria === nomeAntigo) p.categoria = nomeNovo; });
 
             fecharModalEdicaoCategoria();
-            alert(`Categoria "${nomeAntigo}" alterada para "${nomeNovo}" com sucesso!`);
+            mostrarNotificacao(`Categoria "${nomeAntigo}" alterada para "${nomeNovo}" com sucesso!`);
         } catch (error) {
             console.error("Erro ao salvar edição da categoria:", error);
-            alert("Ocorreu um erro ao salvar as alterações.");
+            mostrarNotificacao("Ocorreu um erro ao salvar as alterações.");
         }
     }
 
     async function removerCategoriaModal(id, nome) {
         const produtosUsando = precos.filter(p => p.categoria === nome);
         if (produtosUsando.length > 0) {
-            alert(`Não é possível excluir a categoria "${nome}", pois ela está sendo usada em ${produtosUsando.length} produto(s). Por favor, inative-a ou altere os produtos primeiro.`);
+            mostrarNotificacao(`Não é possível excluir a categoria "${nome}", pois ela está sendo usada em ${produtosUsando.length} produto(s). Por favor, inative-a ou altere os produtos primeiro.`);
             return;
         }
         if (confirm(`Tem certeza que deseja excluir a categoria "${nome}"?`)) {
@@ -2790,7 +3281,7 @@ btnLogout.addEventListener('click', handleLogout);
                 // O listener irá atualizar a UI
             } catch (error) {
                 console.error("Erro ao remover categoria:", error);
-                alert("Não foi possível remover a categoria.");
+                mostrarNotificacao("Não foi possível remover a categoria.");
             }
         }
     }
@@ -2877,7 +3368,7 @@ btnLogout.addEventListener('click', handleLogout);
                 // O listener irá atualizar a UI
             } catch (error) {
                 console.error("Erro ao atualizar status da unidade:", error);
-                alert("Não foi possível atualizar o status da unidade.");
+                mostrarNotificacao("Não foi possível atualizar o status da unidade.");
             }
         }
     }
@@ -2892,17 +3383,17 @@ btnLogout.addEventListener('click', handleLogout);
                 // O listener irá atualizar a UI
             } catch (error) {
                 console.error("Erro ao adicionar unidade:", error);
-                alert("Não foi possível adicionar a nova unidade.");
+                mostrarNotificacao("Não foi possível adicionar a nova unidade.");
             }
         } else {
-            alert("A unidade de medida não pode ser vazia ou já existe.");
+            mostrarNotificacao("A unidade de medida não pode ser vazia ou já existe.");
         }
     }
 
     async function removerUnidadeMedidaModal(id, nome) {
         const produtosUsando = precos.filter(p => p.unidadeMedida === nome);
         if (produtosUsando.length > 0) {
-            alert(`Não é possível excluir a unidade "${nome}", pois ela está sendo usada em ${produtosUsando.length} produto(s). Por favor, inative-a ou altere os produtos primeiro.`);
+            mostrarNotificacao(`Não é possível excluir a unidade "${nome}", pois ela está sendo usada em ${produtosUsando.length} produto(s). Por favor, inative-a ou altere os produtos primeiro.`);
             return;
         }
         if (confirm(`Tem certeza que deseja excluir a unidade "${nome}"?`)) {
@@ -2911,13 +3402,13 @@ btnLogout.addEventListener('click', handleLogout);
                 // O listener irá atualizar a UI
             } catch (error) {
                 console.error("Erro ao remover unidade:", error);
-                alert("Não foi possível remover a unidade.");
+                mostrarNotificacao("Não foi possível remover a unidade.");
             }
         }
     }
 
     function gerenciarUnidadesMedida() {
-        document.getElementById('modalGerenciarUnidadesMedida').classList.add('active');
+        abrirModal('modalGerenciarUnidadesMedida');
         renderizarListaUnidadesMedida();
     }
 
@@ -2925,14 +3416,14 @@ btnLogout.addEventListener('click', handleLogout);
         document.getElementById('edicaoUnidadeMedidaNomeAntigo').setAttribute('data-id', id);
         document.getElementById('edicaoUnidadeMedidaNomeAntigo').value = nomeAntigo;
         document.getElementById('edicaoUnidadeMedidaNomeNovo').value = nomeAntigo;
-        document.getElementById('modalEdicaoUnidadeMedida').classList.add('active');
+        abrirModal('modalEdicaoUnidadeMedida');
     }
 
     function fecharModalEdicaoUnidadeMedida() {
         document.getElementById('edicaoUnidadeMedidaNomeAntigo').removeAttribute('data-id');
         document.getElementById('edicaoUnidadeMedidaNomeAntigo').value = '';
         document.getElementById('edicaoUnidadeMedidaNomeNovo').value = '';
-        document.getElementById('modalEdicaoUnidadeMedida').classList.remove('active');
+        fecharModal('modalEdicaoUnidadeMedida');
     }
 
     async function salvarEdicaoUnidadeMedida() {
@@ -2941,7 +3432,7 @@ btnLogout.addEventListener('click', handleLogout);
         const nomeNovo = document.getElementById('edicaoUnidadeMedidaNomeNovo').value.trim();
 
         if (!nomeNovo) {
-            alert('O novo nome da unidade não pode ser vazio.');
+            mostrarNotificacao('O novo nome da unidade não pode ser vazio.');
             return;
         }
         if (nomeAntigo.toLowerCase() === nomeNovo.toLowerCase()) {
@@ -2966,10 +3457,10 @@ btnLogout.addEventListener('click', handleLogout);
             precos.forEach(p => { if (p.unidadeMedida === nomeAntigo) p.unidadeMedida = nomeNovo; });
 
             fecharModalEdicaoUnidadeMedida();
-            alert(`Unidade "${nomeAntigo}" alterada para "${nomeNovo}" com sucesso!`);
+            mostrarNotificacao(`Unidade "${nomeAntigo}" alterada para "${nomeNovo}" com sucesso!`);
         } catch (error) {
             console.error("Erro ao salvar edição da unidade:", error);
-            alert("Ocorreu um erro ao salvar as alterações.");
+            mostrarNotificacao("Ocorreu um erro ao salvar as alterações.");
         }
     }
     // --- FIM: CRUD DE UNIDADES DE MEDIDA ---
@@ -2989,7 +3480,7 @@ btnLogout.addEventListener('click', handleLogout);
             if (parsedData.length > 0) {
                 abrirModalPreviewCSV(parsedData);
             } else {
-                alert("O arquivo CSV está vazio ou em um formato inválido.");
+                mostrarNotificacao("O arquivo CSV está vazio ou em um formato inválido.");
             }
         };
         reader.readAsText(file, 'UTF-8');
@@ -3018,17 +3509,22 @@ btnLogout.addEventListener('click', handleLogout);
     function validarLinhaCSV(rowData, index, allData, existingCodes) {
         let errors = [];
         const validUnidades = unidadesDeMedida.map(u => u.nome); // Pega unidades do sistema
+        const validUnidadesNormalizadas = new Set(validUnidades.map(normalizarUnidadeMedida));
         const validStatus = ['Ativo', 'Inativo'];
+        const precoCompra = parseFloat(String(rowData.precoCompra || '').replace(',', '.'));
+        const markup = parseFloat(String(rowData.markup || '').replace(',', '.'));
         
         if (!rowData.codigo) errors.push("'codigo' é obrigatório.");
         if (!rowData.descricao) errors.push("'descricao' é obrigatória.");
         if (!rowData.precoCompra) errors.push("'precoCompra' é obrigatório.");
         if (!rowData.markup) errors.push("'markup' é obrigatório.");
-        if (isNaN(parseFloat(rowData.precoCompra.replace(',','.')))) errors.push("'precoCompra' deve ser um número.");
-        if (isNaN(parseFloat(rowData.markup.replace(',','.')))) errors.push("'markup' deve ser um número.");
-        if (rowData.unidadeMedida && !validUnidades.includes(rowData.unidadeMedida)) errors.push(`'unidadeMedida' inválida.`);
+        if (isNaN(precoCompra)) errors.push("'precoCompra' deve ser um número.");
+        else if (precoCompra <= 0) errors.push("'precoCompra' deve ser maior que zero.");
+        if (isNaN(markup)) errors.push("'markup' deve ser um número.");
+        else if (markup <= 0) errors.push("'markup' deve ser maior que zero.");
+        if (rowData.unidadeMedida && !validUnidadesNormalizadas.has(normalizarUnidadeMedida(rowData.unidadeMedida))) errors.push(`'unidadeMedida' inválida.`);
         if (rowData.status && !validStatus.includes(rowData.status)) errors.push(`'status' inválido. Use 'Ativo' ou 'Inativo'.`);
-        if (rowData.unidadeMedida === 'MetroLinear') { // CORREÇÃO: Nome do campo na planilha
+        if (normalizarUnidadeMedida(rowData.unidadeMedida) === 'MetroLinear') {
             if (!rowData.alturaPadrao) {
                 errors.push("'alturaPadrao' é obrigatória para MetroLinear.");
             } else if (isNaN(parseFloat(rowData.alturaPadrao.replace(',', '.'))) || parseFloat(rowData.alturaPadrao.replace(',', '.')) <= 0) {
@@ -3113,11 +3609,11 @@ btnLogout.addEventListener('click', handleLogout);
         summaryDiv.style.display = 'block';
         summaryDiv.innerHTML = `Foram encontradas <strong>${data.length}</strong> linhas.<ul><li style="color: #1b5e20;"><strong>${totalValidos}</strong> linhas válidas.</li><li style="color: #c62828;"><strong>${totalInvalidos}</strong> linhas com erros.</li></ul>`;
         document.getElementById('btnImportarTodos').disabled = totalInvalidos > 0;
-        modal.classList.add('active');
+        abrirModal(modal.id);
     }
 
     function fecharModalPreviewCSV() {
-        document.getElementById('modalCSVPreview').classList.remove('active');
+        fecharModal('modalCSVPreview');
     }
 
     function atualizarLinhaPreview(cell, index, header) {
@@ -3198,12 +3694,12 @@ btnLogout.addEventListener('click', handleLogout);
             : csvDataParaImportar;
 
         if (!importarApenasValidos && dadosParaProcessar.some(d => !d.validation.isValid)) {
-            alert("Ainda existem linhas com erros. Corrija-as ou use 'Importar Apenas Válidos'.");
+            mostrarNotificacao("Ainda existem linhas com erros. Corrija-as ou use 'Importar Apenas Válidos'.");
             return;
         }
 
         if (dadosParaProcessar.length === 0) {
-            alert("Nenhum produto válido para importar.");
+            mostrarNotificacao("Nenhum produto válido para importar.");
             return;
         }
 
@@ -3266,11 +3762,11 @@ btnLogout.addEventListener('click', handleLogout);
             mensagem += `${atualizados} produto(s) atualizado(s) com sucesso!\n`;
             if (novosFornecedores > 0) mensagem += `${novosFornecedores} novo(s) fornecedor(es) cadastrado(s).\n`;
             if (novasCategorias > 0) mensagem += `${novasCategorias} nova(s) categoria(s) cadastrada(s).\n`;
-            alert(mensagem);
+            mostrarNotificacao(mensagem);
             fecharModalPreviewCSV();
         } catch (error) {
             console.error("Erro ao importar dados para o Firestore:", error);
-            alert("Ocorreu um erro durante a importação. Verifique o console para mais detalhes.");
+            mostrarNotificacao("Ocorreu um erro durante a importação. Verifique o console para mais detalhes.");
         }
     }
 
@@ -3282,7 +3778,7 @@ btnLogout.addEventListener('click', handleLogout);
             categorias = [];
             orcamentosSalvos = {};
             orcamentoAtualId = null;
-            alert("Todos os dados do sistema foram apagados.");
+            mostrarNotificacao("Todos os dados do sistema foram apagados.");
             window.location.reload();
         }
     }
@@ -3327,21 +3823,58 @@ btnLogout.addEventListener('click', handleLogout);
         return 'ORC-' + String(proximoNumero).padStart(2, '0');
     }
 
+    async function reservarProximoIdSequencial() {
+        const maiorNumeroLocal = Object.values(orcamentosSalvos)
+            .map(orcamento => String(orcamento?.id || '').match(/^ORC-(\d+)$/))
+            .filter(Boolean)
+            .reduce((maior, match) => Math.max(maior, Number(match[1])), 0);
+        const contadorRef = doc(db, 'contadores', 'orcamentos');
+
+        return runTransaction(db, async transaction => {
+            const snapshot = await transaction.get(contadorRef);
+            const ultimoNumeroPersistido = snapshot.exists()
+                ? Number(snapshot.data().ultimoNumero || 0)
+                : 0;
+            const proximoNumero = Math.max(ultimoNumeroPersistido, maiorNumeroLocal) + 1;
+
+            transaction.set(contadorRef, {
+                ultimoNumero: proximoNumero,
+                atualizadoEm: new Date().toISOString()
+            }, { merge: true });
+
+            return `ORC-${String(proximoNumero).padStart(2, '0')}`;
+        });
+    }
+
     async function criarNovoOrcamento() {
-        // CORREÇÃO: Passa o objeto `orcamentosSalvos` como argumento para garantir que a função use a lista mais atual.
-        const newId = encontrarProximoIdSequencial(orcamentosSalvos); 
+        let newId;
+        try {
+            newId = await reservarProximoIdSequencial();
+        } catch (error) {
+            console.error('Erro ao reservar o número do orçamento:', error);
+            mostrarNotificacao('Não foi possível reservar um número para o orçamento. Verifique a conexão e tente novamente.');
+            return;
+        }
 
         const dataAtual = new Date().toISOString().split('T')[0];
 
         const novoOrcamento = {
             id: newId,
+            statusDocumento: 'orcamento',
+            apresentacao: {
+                modo: 'reduzida',
+                mostrarValoresItens: false,
+                mostrarCustosFornecedor: false
+            },
             infoGerais: {
                 "nome": `Orçamento ${newId}`, 
                 "nomeCliente": "",
                 "enderecoCliente": "",
+                "tipoCliente": "cliente",
                 "dataOrcamento": dataAtual,
                 "dataInstalacao": "", 
                 "nomeCostureira": "",
+                "enderecoCostureira": "",
                 "nomeInstalador": "",
                 "prazoValidade": "",
                 "prazoEntrega": "30 dias úteis",
@@ -3350,6 +3883,7 @@ btnLogout.addEventListener('click', handleLogout);
             infoComercial: {
                 "condicaoPagamento": "À vista",
                 "formaPagamento": "PIX",
+                "descontoGlobal": 0,
                 "observacoesComerciais": ""
             },
             itens: [],
@@ -3361,55 +3895,65 @@ btnLogout.addEventListener('click', handleLogout);
             const orcamentoRef = doc(db, "orcamentos", newId);
             await setDoc(orcamentoRef, novoOrcamento);
 
-            alert(`Novo orçamento criado com ID: ${newId}.`);
+            mostrarNotificacao(`Novo orçamento criado com ID: ${newId}.`);
             // O listener irá atualizar a UI
         } catch (error) {
             console.error("Erro ao criar novo orçamento no Firestore:", error);
-            alert("Falha ao criar novo orçamento. Tente novamente.");
+            mostrarNotificacao("Falha ao criar novo orçamento. Tente novamente.");
         }
     }
 
     async function duplicarOrcamento() {
         if (!orcamentoAtualId) {
-            alert("Não há orçamento selecionado para duplicar.");
+            mostrarNotificacao("Não há orçamento selecionado para duplicar.");
             return;
         }
         
         const orcamentoOriginal = orcamentosSalvos[orcamentoAtualId];
         
         if (orcamentoOriginal) {
-            // CORREÇÃO: Passa o objeto `orcamentosSalvos` como argumento.
-            const newId = encontrarProximoIdSequencial(orcamentosSalvos); 
+            let newId;
+            try {
+                newId = await reservarProximoIdSequencial();
+            } catch (error) {
+                console.error('Erro ao reservar o número da cópia:', error);
+                mostrarNotificacao('Não foi possível reservar um número para a cópia. Verifique a conexão e tente novamente.');
+                return;
+            }
             
-            const novoOrcamento = JSON.parse(JSON.stringify(orcamentoOriginal));
-            
-            novoOrcamento.id = newId;
-            novoOrcamento.infoGerais.nome = `Orçamento ${newId}`; // Define um nome padrão para a cópia
-            novoOrcamento.infoGerais.dataOrcamento = new Date().toISOString().split('T')[0];
-            novoOrcamento.infoGerais.dataInstalacao = "";
+            const novoOrcamento = criarOrcamentoDuplicado(orcamentoOriginal, {
+                novoId: newId,
+                dataOrcamento: new Date().toISOString().split('T')[0]
+            });
             
             try {
                 const orcamentoRef = doc(db, "orcamentos", newId);
                 await setDoc(orcamentoRef, novoOrcamento);
 
                 orcamentosSalvos[newId] = novoOrcamento;
+                orcamentosPersistidos[newId] = structuredClone(novoOrcamento);
                 orcamentoAtualId = newId;
+                atualizarSeletoresOrcamento(newId);
+                preencherInfoOrcamento();
 
-                alert(`Orçamento duplicado com sucesso para o novo ID: ${newId}.`);
-                // O listener irá atualizar a UI
+                mostrarNotificacao(`Orçamento duplicado com sucesso para o novo ID: ${newId}.`);
             } catch (error) {
                 console.error("Erro ao duplicar orçamento no Firestore:", error);
-                alert("Falha ao duplicar o orçamento. Tente novamente.");
+                mostrarNotificacao("Falha ao duplicar o orçamento. Tente novamente.");
             }
         } else {
-            alert("Erro ao encontrar o orçamento original para cópia.");
+            mostrarNotificacao("Erro ao encontrar o orçamento original para cópia.");
         }
     }
 
     async function excluirOrcamento() {
         // LÓGICA DE EXCLUSÃO ESTÁVEL: Impede a exclusão do último orçamento.
         if (!orcamentoAtualId || Object.keys(orcamentosSalvos).length <= 1) {
-            alert("Não é possível excluir o único orçamento existente.");
+            mostrarNotificacao("Não é possível excluir o único orçamento existente.");
+            return;
+        }
+        if (pedidoEstaConfirmado(orcamentosSalvos[orcamentoAtualId])) {
+            mostrarNotificacao('Pedidos confirmados não podem ser excluídos por esta tela. Isso preserva o histórico operacional.');
             return;
         }
         if (confirm("Tem certeza que deseja excluir este orçamento? Esta ação não pode ser desfeita.")) {
@@ -3417,18 +3961,18 @@ btnLogout.addEventListener('click', handleLogout);
                 await deleteDoc(doc(db, "orcamentos", orcamentoAtualId));
                 
                 // O listener irá remover o item do objeto local e atualizar a UI
-                alert("Orçamento excluído com sucesso!");
+                mostrarNotificacao("Orçamento excluído com sucesso!");
             } catch (error) {
                 console.error("Erro ao excluir orçamento do Firestore:", error);
-                alert("Falha ao excluir o orçamento. Tente novamente.");
+                mostrarNotificacao("Falha ao excluir o orçamento. Tente novamente.");
             }
         }
     }
 
-    function exportarExcel() {
+    function exportarExcelLegado() {
         const orcamento = orcamentosSalvos[orcamentoAtualId];
         if (!orcamento || (orcamento.itens.length === 0 && orcamento.produtosAcabados.length === 0)) {
-            alert("Nenhum item no orçamento para exportar.");
+            mostrarNotificacao("Nenhum item no orçamento para exportar.");
             return;
         }
 
@@ -3436,7 +3980,7 @@ btnLogout.addEventListener('click', handleLogout);
         const dadosProcessados = prepararDadosParaExportacao(orcamento);
         
         if (Object.keys(dadosProcessados).length === 0) {
-            alert("Nenhum fornecedor encontrado nos itens do orçamento.");
+            mostrarNotificacao("Nenhum fornecedor encontrado nos itens do orçamento.");
             return;
         }
 
@@ -3462,10 +4006,10 @@ btnLogout.addEventListener('click', handleLogout);
         
         XLSX.writeFile(workbook, nomeArquivo);
         
-        alert(`Planilha Excel com formatação profissional gerada!\n${Object.keys(dadosProcessados).length} fornecedor(es) processado(s).`);
+        mostrarNotificacao(`Planilha Excel com formatação profissional gerada!\n${Object.keys(dadosProcessados).length} fornecedor(es) processado(s).`);
     }
 
-    function prepararDadosParaExportacao(orcamento) {
+    function prepararDadosParaExportacaoLegado(orcamento) {
         const todosOsItens = [];
         
         // Coletar itens dos produtos acabados
@@ -3537,7 +4081,7 @@ btnLogout.addEventListener('click', handleLogout);
         return itensPorFornecedor;
     }
 
-    function criarWorksheetComFormatacaoAvancada(fornecedor, dadosFornecedor, orcamento) {
+    function criarWorksheetComFormatacaoAvancadaLegado(fornecedor, dadosFornecedor, orcamento) {
         // Calcular prazo de entrega para fornecedor
         function calcularPrazoFornecedor(prazoOriginal) {
             if (!prazoOriginal) return "A definir";
@@ -3767,13 +4311,147 @@ btnLogout.addEventListener('click', handleLogout);
         return worksheet;
     }
     
+    function prepararDadosParaExportacao(orcamento) {
+        return agruparItensPorFornecedor(obterItensDoPedido(orcamento));
+    }
+
+    function criarWorksheetPedidoFornecedor(fornecedor, dadosFornecedor, orcamento, incluirCustos) {
+        const pedido = orcamento.pedido || {};
+        const cliente = pedido.cliente || {};
+        const costureira = pedido.costureira || {};
+        const colunas = incluirCustos
+            ? ['CÓDIGO', 'DESCRIÇÃO', 'UNIDADE', 'QTD SOLICITADA', 'CUSTO UNITÁRIO', 'CUSTO TOTAL']
+            : ['CÓDIGO', 'DESCRIÇÃO', 'UNIDADE', 'QTD SOLICITADA'];
+
+        const dados = [
+            ['PEDIDO AO FORNECEDOR'],
+            ['Pedido', orcamento.id || orcamentoAtualId],
+            ['Fornecedor', fornecedor],
+            ['Cliente', cliente.nome || orcamento.infoGerais?.nomeCliente || 'Não informado'],
+            ['Costureira', costureira.nome || orcamento.infoGerais?.nomeCostureira || 'Não informado'],
+            ['Endereço de entrega', costureira.enderecoEntrega || orcamento.infoGerais?.enderecoCostureira || 'Não informado'],
+            [],
+            colunas
+        ];
+
+        Object.values(dadosFornecedor.itens).forEach(item => {
+            const linha = [
+                item.codigo,
+                item.descricao,
+                item.unidadeMedida,
+                Number(item.quantidadeCompra.toFixed(3))
+            ];
+            if (incluirCustos) {
+                linha.push(
+                    Number(item.precoCompraUnitario.toFixed(2)),
+                    Number(item.custoTotal.toFixed(2))
+                );
+            }
+            dados.push(linha);
+        });
+
+        if (incluirCustos) {
+            dados.push([]);
+            dados.push(['', 'TOTAL', '', '', '', Number(dadosFornecedor.totalCusto.toFixed(2))]);
+        }
+
+        const worksheet = XLSX.utils.aoa_to_sheet(dados);
+        worksheet['!cols'] = incluirCustos
+            ? [{ wch: 18 }, { wch: 58 }, { wch: 18 }, { wch: 18 }, { wch: 18 }, { wch: 18 }]
+            : [{ wch: 18 }, { wch: 68 }, { wch: 18 }, { wch: 18 }];
+
+        const cabecalhoTabela = 7;
+        const totalColunas = colunas.length;
+        worksheet['!merges'] = [
+            { s: { r: 0, c: 0 }, e: { r: 0, c: totalColunas - 1 } }
+        ];
+
+        for (let coluna = 0; coluna < totalColunas; coluna++) {
+            const endereco = XLSX.utils.encode_cell({ r: cabecalhoTabela, c: coluna });
+            if (worksheet[endereco]) {
+                worksheet[endereco].s = {
+                    font: { bold: true, color: { rgb: 'FFFFFF' } },
+                    fill: { fgColor: { rgb: '2E7D32' } },
+                    alignment: { horizontal: 'center' }
+                };
+            }
+        }
+
+        if (worksheet.A1) {
+            worksheet.A1.s = {
+                font: { bold: true, size: 15, color: { rgb: '1B5E20' } },
+                alignment: { horizontal: 'center' }
+            };
+        }
+
+        const inicioItens = cabecalhoTabela + 1;
+        const fimItens = inicioItens + Object.keys(dadosFornecedor.itens).length;
+        for (let linha = inicioItens; linha < fimItens; linha++) {
+            const celulaQuantidade = worksheet[XLSX.utils.encode_cell({ r: linha, c: 3 })];
+            if (celulaQuantidade) celulaQuantidade.z = '0.###';
+            if (incluirCustos) {
+                const custoUnitario = worksheet[XLSX.utils.encode_cell({ r: linha, c: 4 })];
+                const custoTotal = worksheet[XLSX.utils.encode_cell({ r: linha, c: 5 })];
+                if (custoUnitario) custoUnitario.z = 'R$ #,##0.00';
+                if (custoTotal) custoTotal.z = 'R$ #,##0.00';
+            }
+        }
+
+        return worksheet;
+    }
+
+    function normalizarNomeAbaExcel(nome) {
+        const nomeSeguro = String(nome || 'Fornecedor')
+            .replace(/[\\/?*\[\]:]/g, '-')
+            .trim() || 'Fornecedor';
+        return nomeSeguro.substring(0, 31);
+    }
+
+    function exportarExcel() {
+        const orcamento = obterOrcamentoAtual();
+        if (!orcamento || !pedidoEstaConfirmado(orcamento)) {
+            mostrarNotificacao('Transforme o orçamento em pedido antes de gerar o relatório para fornecedores.');
+            return;
+        }
+
+        const dadosProcessados = prepararDadosParaExportacao(orcamento);
+        if (Object.keys(dadosProcessados).length === 0) {
+            mostrarNotificacao('O pedido confirmado não possui itens para fornecedores.');
+            return;
+        }
+
+        const incluirCustos = document.getElementById('mostrarCustosFornecedor')?.checked === true;
+        const workbook = XLSX.utils.book_new();
+        const nomesUsados = new Set();
+
+        Object.entries(dadosProcessados).forEach(([fornecedor, dadosFornecedor], indice) => {
+            const worksheet = criarWorksheetPedidoFornecedor(
+                fornecedor,
+                dadosFornecedor,
+                orcamento,
+                incluirCustos
+            );
+            let nomeAba = normalizarNomeAbaExcel(fornecedor);
+            if (nomesUsados.has(nomeAba)) {
+                const sufixo = `-${indice + 1}`;
+                nomeAba = `${nomeAba.substring(0, 31 - sufixo.length)}${sufixo}`;
+            }
+            nomesUsados.add(nomeAba);
+            XLSX.utils.book_append_sheet(workbook, worksheet, nomeAba);
+        });
+
+        const dataAtual = new Date().toLocaleDateString('pt-BR').replace(/\//g, '-');
+        XLSX.writeFile(workbook, `Pedido_${orcamento.id || orcamentoAtualId}_${dataAtual}.xlsx`);
+        mostrarNotificacao(`Relatório gerado para ${Object.keys(dadosProcessados).length} fornecedor(es).`);
+    }
+
     function alternarOrcamento(id) {
         orcamentoAtualId = id;
         // Não precisa salvar, apenas carregar os dados do novo orçamento selecionado
         preencherInfoOrcamento();
     }
 
-    function atualizarSeletoresOrcamento() {
+    function atualizarSeletoresOrcamento(idPreferencial = null) {
         const seletor = document.getElementById('seletorOrcamento');
         const idSalvo = seletor.value;
         seletor.innerHTML = ''; // Limpa as opções existentes
@@ -3788,13 +4466,18 @@ btnLogout.addEventListener('click', handleLogout);
 
             const nomeBase = orcamento.infoGerais?.nome || `Orçamento ${id}`;
             const nomeCliente = orcamento.infoGerais?.nomeCliente ? ` - ${orcamento.infoGerais.nomeCliente.trim()}` : '';
-            option.textContent = `${nomeBase}${nomeCliente}`;
+            const tipoDocumento = pedidoEstaConfirmado(orcamento) ? '[PEDIDO] ' : '';
+            option.textContent = `${tipoDocumento}${nomeBase}${nomeCliente}`;
 
             seletor.appendChild(option);
         });
 
         // Restaura a seleção para o orçamento que estava sendo editado ou o atual
-        seletor.value = idSalvo && orcamentosSalvos[idSalvo] ? idSalvo : orcamentoAtualId;
+        seletor.value = idPreferencial && orcamentosSalvos[idPreferencial]
+            ? idPreferencial
+            : idSalvo && orcamentosSalvos[idSalvo]
+                ? idSalvo
+                : orcamentoAtualId;
     }
 
     // Renomeia a função para manter consistência, já que ela é chamada por atualizarInfoOrcamento
@@ -3820,6 +4503,7 @@ btnLogout.addEventListener('click', handleLogout);
             document.getElementById('orcamentoId').textContent = orcamentoAtualId;
             document.getElementById('nomeCliente').value = infoGerais.nomeCliente || '';
             document.getElementById('enderecoCliente').value = infoGerais.enderecoCliente || ''; // CORREÇÃO: Esta linha estava faltando.
+            document.getElementById('tipoCliente').value = infoGerais.tipoCliente || 'cliente';
             document.getElementById('dataOrcamento').value = infoGerais.dataOrcamento || '';
             document.getElementById('prazoValidade').value = infoGerais.prazoValidade || '';
             document.getElementById('prazoEntrega').value = infoGerais.prazoEntrega || '';
@@ -3829,9 +4513,18 @@ btnLogout.addEventListener('click', handleLogout);
             document.getElementById('observacoesComerciais').value = infoComercial.observacoesComerciais || '';
             document.getElementById('dataInstalacao').value = infoGerais.dataInstalacao || '';
             document.getElementById('nomeCostureira').value = infoGerais.nomeCostureira || '';
+            document.getElementById('enderecoCostureira').value = infoGerais.enderecoCostureira || '';
             document.getElementById('nomeInstalador').value = infoGerais.nomeInstalador || '';
+            document.getElementById('descontoGlobal').value = infoComercial.descontoGlobal || 0;
+
+            const apresentacao = orcamento.apresentacao || {};
+            document.getElementById('modoProposta').value = apresentacao.modo || 'reduzida';
+            document.getElementById('mostrarValoresItens').checked = apresentacao.mostrarValoresItens === true;
+            document.getElementById('mostrarCustosFornecedor').checked = apresentacao.mostrarCustosFornecedor === true;
+            atualizarEstadoControlesProposta();
             
             renderizarItensOrcamento();
             atualizarPropostaCliente();
+            atualizarInterfacePedido();
         }
     }

@@ -1,0 +1,13 @@
+{
+  "name": "filippini-cortinas",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build:hosting": "node scripts/build-hosting.mjs",
+    "test": "node --test tests/*.test.mjs",
+    "test:syntax": "node --check apps.js && node --check order-domain.js && node --check pricing-domain.js"
+  },
+  "devDependencies": {
+    "firebase-tools": "15.30.0"
+  }
+}
