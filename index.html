@@ -212,9 +212,42 @@
         }
         
         input:focus, select:focus, textarea:focus {
-            outline: none;
+            outline: 3px solid rgba(212, 175, 55, 0.35);
+            outline-offset: 2px;
             border-color: #D4AF37;
             box-shadow: 0 0 0 3px rgba(212, 175, 55, 0.1);
+        }
+
+        button:focus-visible, .tab:focus-visible {
+            outline: 3px solid #E8C977;
+            outline-offset: 3px;
+        }
+
+        button:disabled, input:disabled, select:disabled, textarea:disabled {
+            cursor: not-allowed;
+            opacity: 0.62;
+        }
+
+        .document-status {
+            display: inline-flex;
+            align-items: center;
+            min-height: 38px;
+            padding: 8px 12px;
+            border-radius: 999px;
+            font-weight: 700;
+            white-space: nowrap;
+        }
+
+        .document-status-orcamento {
+            color: #5E4A00;
+            background: #FFF3CD;
+            border: 1px solid #E8C977;
+        }
+
+        .document-status-pedido {
+            color: #1B5E20;
+            background: #E8F5E9;
+            border: 1px solid #6B8E6B;
         }
         
         .btn {
@@ -785,7 +818,89 @@
             font-weight: 600;
         }
 
+        .proposta-observacao-produto {
+            display: block;
+            margin-top: 3px;
+            color: #4A4A4A;
+            font-size: 0.9em;
+            font-weight: normal;
+            white-space: pre-wrap;
+        }
+
+        .proposta-reduzida .proposta-header {
+            padding-bottom: 8px;
+            margin-bottom: 8px;
+            border-bottom-width: 2px;
+        }
+
+        .proposta-reduzida .proposta-header .logo img {
+            max-width: 130px;
+        }
+
+        .proposta-reduzida .company-details p:nth-child(n+4) {
+            display: none;
+        }
+
+        .proposta-reduzida .proposta-info-grid {
+            gap: 6px 14px;
+            margin-bottom: 8px;
+            padding: 8px 10px;
+        }
+
+        .proposta-reduzida .proposta-ambiente-title {
+            margin: 8px 0 4px;
+            padding: 6px 10px;
+            font-size: 1.05em;
+        }
+
+        .proposta-reduzida .proposta-ambiente-table th,
+        .proposta-reduzida .proposta-ambiente-table td {
+            padding: 4px 6px;
+        }
+
+        .proposta-reduzida .proposta-summary {
+            margin-top: 8px;
+            padding-top: 6px;
+            border-top-width: 2px;
+        }
+
+        .proposta-reduzida .proposta-summary .summary-line {
+            padding: 3px 0;
+            font-size: 1em;
+        }
+
+        .proposta-reduzida .proposta-summary .total-final-box {
+            padding: 9px 12px;
+            margin-top: 5px;
+            border-width: 2px;
+        }
+
+        .proposta-reduzida .proposta-footer {
+            margin-top: 8px;
+            padding-top: 6px;
+            line-height: 1.25;
+        }
+
+        .relatorio-instalador h2 {
+            margin: 0 0 12px;
+            color: #2C2C2C;
+        }
+
+        .relatorio-instalador .campo-endereco {
+            grid-column: 1 / -1;
+        }
+
+        .relatorio-instalador .numero {
+            text-align: right;
+            white-space: nowrap;
+        }
+
         @media print {
+            @page {
+                size: A4 portrait;
+                margin: 8mm;
+            }
+
             body {
                 background: #fff;
                 -webkit-print-color-adjust: exact;
@@ -823,7 +938,38 @@
 
         /* AJUSTE: Reduz as fontes e espaçamentos apenas para a impressão */
         .proposta-wrapper {
-            font-size: 12px; /* Reduz a fonte base do documento impresso */
+            font-size: 10px;
+        }
+
+        .proposta-header {
+            padding-bottom: 8px;
+            margin-bottom: 8px;
+        }
+
+        .proposta-header .logo img {
+            max-width: 140px;
+        }
+
+        .proposta-info-grid {
+            gap: 6px 12px;
+            margin-bottom: 8px;
+            padding: 8px;
+        }
+
+        .proposta-summary {
+            margin-top: 10px;
+            padding-top: 6px;
+        }
+
+        .proposta-footer {
+            margin-top: 10px;
+            padding-top: 6px;
+        }
+
+        .proposta-ambiente-table,
+        .proposta-ambiente-table tr,
+        .proposta-ambiente-title {
+            break-inside: avoid;
         }
 
         .proposta-ambiente-title {
@@ -1027,6 +1173,28 @@
             font-weight: 600;
         }
 
+        .sync-status {
+            font-size: 0.82em;
+            font-weight: 600;
+            padding: 6px 10px;
+            border-radius: 999px;
+        }
+
+        .sync-status-ok {
+            color: #DFF4E3;
+            background: rgba(46, 125, 50, 0.35);
+        }
+
+        .sync-status-carregando {
+            color: #FFF3CD;
+            background: rgba(212, 175, 55, 0.25);
+        }
+
+        .sync-status-erro {
+            color: #FFE1E1;
+            background: rgba(166, 85, 85, 0.45);
+        }
+
         /* Ajuste de margem para os botões .btn-sm no header */
         /* Se os botões ficarem muito grudados, esta regra pode ajudar */
         #user-controls .btn-sm {
@@ -1134,6 +1302,7 @@
                 </div>
 
                 <div id="user-controls-group">
+                    <span id="sync-status" class="sync-status" role="status" aria-live="polite" hidden></span>
                     <button id="btn-logout" class="btn btn-danger btn-sm" type="button">
                         Sair
                     </button>
@@ -1159,13 +1328,13 @@
                     </div>
                     <div class="form-group">
                         <label for="categoria">Categoria:</label>
-                        <select id="categoria" onchange="ajustarCamposCadastroPorUnidade()"></select>
+                        <select id="categoria"></select>
                     </div>
                 </div>
                 <div class="form-row">
                     <div class="form-group">
                         <label for="unidadeMedida">Unidade de Medida:</label>
-                        <select id="unidadeMedida" onchange="ajustarCamposCadastroPorUnidade()"></select>
+                        <select id="unidadeMedida"></select>
                     </div>
                     <div class="form-group">
                         <label for="cor">Cor:</label>
@@ -1250,6 +1419,8 @@
                 <button id="btn-novo-orcamento" class="btn btn-primary">➕ Novo Orçamento</button>
                 <button id="btn-duplicar-orcamento" class="btn btn-info">📋 Duplicar Orçamento</button>
                 <button id="btn-excluir-orcamento" class="btn btn-danger">🗑️ Excluir Orçamento</button>
+                <span id="statusDocumento" class="document-status document-status-orcamento">Orçamento</span>
+                <button id="btn-confirmar-pedido" class="btn btn-success" type="button">✓ Transformar em Pedido</button>
                 <div style="flex: 1; text-align: right;">
                     <button id="btn-baixar-excel-pedido-ao-fornecedor" class="btn btn-info">⬇️ Exportar Excel Pedido ao Fornecedor </button>
                 </div>
@@ -1264,7 +1435,7 @@
                     </div>
                     <div class="form-group">
                         <label for="tipoCliente">Tipo de Cliente:</label>
-                        <select id="tipoCliente" onchange="recalcularComissao()" class="campo-curto">
+                        <select id="tipoCliente" class="campo-curto">
                             <option value="cliente">Cliente Final</option>
                             <option value="arquiteto">Arquiteto</option>
                         </select>
@@ -1305,6 +1476,11 @@
                         <input type="text" id="nomeCostureira" name="costureira_field" placeholder="Ex: Maria" class="campo-medio" autocomplete="new-password">
                     </div>
 
+                    <div class="form-group" style="flex: 2;">
+                        <label for="enderecoCostureira">Endereço da Costureira / Entrega ao Fornecedor:</label>
+                        <input type="text" id="enderecoCostureira" placeholder="Endereço de entrega do material">
+                    </div>
+
                     <div class="form-group">
                         <label for="nomeInstalador">Nome do Instalador:</label>
                         <input type="text" id="nomeInstalador" name="instalador_field" placeholder="Ex: João" class="campo-medio" autocomplete="new-password">
@@ -1332,6 +1508,10 @@
                     <div class="form-group-full">
                         <label for="observacoesProdutoAcabado">Instruções para o Instalador:</label>
                         <textarea id="observacoesProdutoAcabado" rows="2" placeholder="Descrição completa do produto acabado"></textarea>
+                    </div>
+                    <div class="form-group-full">
+                        <label for="observacoesClienteProdutoAcabado">Observação para o Cliente:</label>
+                        <textarea id="observacoesClienteProdutoAcabado" rows="2" placeholder="Informação que deve aparecer junto deste produto na proposta"></textarea>
                     </div>
                 </div>
                 <button id="btn-criar-produto-acabado" class="btn btn-primary" type="button">Criar Produto Acabado</button>
@@ -1414,6 +1594,13 @@
                 <div class="form-container controles-visibilidade">
                     <div class="section-title">Controles de Visibilidade da Proposta</div>
                     <div class="form-row">
+                        <div class="form-group">
+                            <label for="modoProposta">Formato da Proposta:</label>
+                            <select id="modoProposta">
+                                <option value="reduzida">Reduzida</option>
+                                <option value="detalhada">Detalhada</option>
+                            </select>
+                        </div>
                         <div class="form-group" style="flex: initial;">
                             <label for="mostrarValoresItens" style="display: flex; align-items: center; gap: 8px; cursor: pointer;">
                                 <input type="checkbox" id="mostrarValoresItens" checked>
@@ -1421,9 +1608,9 @@
                             </label>
                         </div>
                         <div class="form-group" style="flex: initial;">
-                            <label for="mostrarDetalhamentoCompleto" style="display: flex; align-items: center; gap: 8px; cursor: pointer;">
-                                <input type="checkbox" id="mostrarDetalhamentoCompleto" checked>
-                                <span>Mostrar detalhamento completo</span>
+                            <label for="mostrarCustosFornecedor" style="display: flex; align-items: center; gap: 8px; cursor: pointer;">
+                                <input type="checkbox" id="mostrarCustosFornecedor">
+                                <span>Mostrar custos no pedido ao fornecedor</span>
                             </label>
                         </div>
                     </div>
@@ -1456,9 +1643,11 @@
             <div class="card-container">
                 <div class="section-title">Backup e Restauração</div>
                 <p>Faça backup de todos os dados do sistema ou restaure a partir de um arquivo de backup local.</p>
-                <div style="display: flex; gap: 10px; margin-top: 15px;">
+                <p><small>A restauração é feita por mesclagem: atualiza os registros do arquivo sem apagar dados que já existem.</small></p>
+                <div style="display: flex; gap: 10px; margin-top: 15px; flex-wrap: wrap; align-items: center;">
                     <button id="btn-exportar-dados" class="btn btn-primary" type="button">⬇️ Exportar Dados</button>
-                    <!-- O botão de Importar Dados foi removido por segurança, pois pode causar perda de dados irreversível no Firebase. -->
+                    <label for="arquivo-backup" class="btn btn-secondary">⬆️ Selecionar Backup</label>
+                    <input id="arquivo-backup" type="file" accept="application/json,.json" style="max-width: 280px;">
                 </div>
             </div>
 
@@ -1542,8 +1731,12 @@
                     
                     <div class="form-row" style="margin-top: 15px;">
                         <div class="form-group" style="flex: 1;">
-                            <label for="edicaoObservacoes">Observações (Opcional):</label>
-                            <textarea id="edicaoObservacoes" rows="3" placeholder="Insira detalhes adicionais sobre o produto acabado, como tipo de prega ou acabamento."></textarea>
+                            <label for="edicaoObservacoes">Instruções para o Instalador:</label>
+                            <textarea id="edicaoObservacoes" rows="3" placeholder="Instruções internas de instalação"></textarea>
+                        </div>
+                        <div class="form-group" style="flex: 1;">
+                            <label for="edicaoObservacoesCliente">Observação para o Cliente:</label>
+                            <textarea id="edicaoObservacoesCliente" rows="3" placeholder="Informação exibida junto ao produto na proposta"></textarea>
                         </div>
                     </div>
                     <div style="text-align: right; margin-top: 20px;">
@@ -1639,7 +1832,7 @@
                     <div class="form-row">
                         <div class="form-group" id="formGroupEdicaoQuantidade">
                             <label for="edicaoQuantidadeItem">Qtd:</label>
-                            <input type="number" id="edicaoQuantidadeItem" value="1" step="0.01" oninput="atualizarPreviewCalculoEdicao()">
+                            <input type="number" id="edicaoQuantidadeItem" value="1" step="0.01">
                         </div>
                         <div class="form-group" id="formGroupEdicaoAlturaPadraoItem" style="display: none;">
                             <label for="edicaoAlturaPadraoItem">Largura do Material (m):</label> 
@@ -1647,11 +1840,11 @@
                         </div>
                         <div class="form-group" id="formGroupEdicaoLargura">
                             <label for="edicaoLarguraItem">Largura (m):</label>
-                            <input type="number" id="edicaoLarguraItem" step="0.01" oninput="atualizarPreviewCalculoEdicao()">
+                            <input type="number" id="edicaoLarguraItem" step="0.01">
                         </div>
                         <div class="form-group" id="formGroupEdicaoAltura">
                             <label for="edicaoAlturaItem">Altura (m):</label>
-                            <input type="number" id="edicaoAlturaItem" step="0.01" oninput="atualizarPreviewCalculoEdicao()">
+                            <input type="number" id="edicaoAlturaItem" step="0.01">
                         </div>
                          <div class="form-group" style="flex: 2;">
                             <label for="edicaoObservacoesItem">Observações por Item:</label>
@@ -1690,15 +1883,15 @@
                     <div class="form-row">
                         <div class="form-group">
                             <label for="edicaoFornecedorProduto">Fornecedor:</label>
-                            <select id="edicaoFornecedorProduto" onchange="ajustarCamposEdicaoProduto()"></select>
+                            <select id="edicaoFornecedorProduto"></select>
                         </div>
                         <div class="form-group">
                             <label for="edicaoCategoriaProduto">Categoria:</label>
-                            <select id="edicaoCategoriaProduto" onchange="ajustarCamposEdicaoProduto()"></select> <!-- CORREÇÃO: Adicionado onchange -->
+                            <select id="edicaoCategoriaProduto"></select>
                         </div>
                         <div class="form-group">
                             <label for="edicaoUnidadeMedidaProduto">Unidade de Medida:</label>
-                            <select id="edicaoUnidadeMedidaProduto" onchange="ajustarCamposEdicaoProduto()"></select>
+                            <select id="edicaoUnidadeMedidaProduto"></select>
                         </div>
                     </div>                  
                     <div class="form-row">

@@ -16,9 +16,11 @@ Lojas de cortinas e persianas lidam com catálogos densos, fornecedores diferent
 - Catálogo de produtos / lista de preços (CRUD)
 - Fornecedores, categorias e unidades de medida
 - Montagem de orçamentos com itens e informações do cliente
+- Conversão explícita de orçamento em pedido, com itens e custos congelados
 - Produtos acabados compostos a partir do catálogo
-- Exportação de pedido ao fornecedor (Excel)
-- Impressão de proposta comercial
+- Exportação compacta de pedido ao fornecedor (Excel)
+- Impressão compacta ou detalhada da proposta comercial
+- Relatório de retirada para o instalador
 - Persistência e sincronização em tempo real via Firestore
 
 ## Stack
@@ -29,6 +31,7 @@ Lojas de cortinas e persianas lidam com catálogos densos, fornecedores diferent
 | Auth / banco | Firebase Authentication + Cloud Firestore |
 | Planilhas | SheetJS (XLSX) no navegador |
 | Hosting (opcional) | Firebase Hosting |
+| Testes | Node Test Runner + Playwright |
 
 Sem build step: abra com um servidor estático local ou publique no Firebase Hosting.
 
@@ -69,7 +72,30 @@ index.html                 # Interface (login, abas, orçamento, proposta)
 apps.js                    # Lógica: auth, CRUD, listeners Firestore, exportações
 firebase-config.example.js # Modelo de configuração (copie para firebase-config.js)
 firebase.json              # Configuração Firebase Hosting
+firestore.rules            # Regras autenticadas do banco
+order-domain.js            # Regras puras de confirmação e congelamento do pedido
+tests/                     # Testes de domínio, integridade e navegador
 404.html                   # Página de erro do hosting
+```
+
+## Testes e publicação
+
+```bash
+# testes automatizados
+npm test
+
+# validação sem publicar
+npx firebase deploy --dry-run --only hosting,firestore
+
+# produção, somente depois das validações
+npx firebase deploy --only hosting,firestore
+```
+
+Para renovar as sessões locais usadas na publicação e no Git:
+
+```bash
+npx firebase login --reauth
+gh auth login -h github.com
 ```
 
 ## Segurança e privacidade

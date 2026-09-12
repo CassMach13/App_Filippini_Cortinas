@@ -52,4 +52,4 @@ A função recalcularComissao() atualiza as margens corretamente?
 
 ✅ UI/UX: As cores indicativas de margem e a formatação de moeda/percentual estão corretas?
 
-Depois de cada alteração que for feita no aplicativo, você deve executar no GitBash dentro da pasta o comando firebase deploy para garantir que as alterações entre em produção.
+Antes de qualquer publicação, execute a checagem sintática, os testes automatizados e o teste de navegador. Publique somente quando todos passarem e a alteração estiver registrada no Git. Use primeiro `firebase deploy --dry-run` e, depois da validação, `firebase deploy --only hosting,firestore`.

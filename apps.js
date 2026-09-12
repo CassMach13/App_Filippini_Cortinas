@@ -5,7 +5,13 @@
 import { auth, db } from './firebase-config.js'; 
 // Importa as funções de autenticação e do Firestore
 import { onAuthStateChanged, signOut, signInWithEmailAndPassword } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
-import { collection, getDocs, addDoc, doc, setDoc, updateDoc, deleteDoc, writeBatch, query, where, onSnapshot } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+import { collection, getDocs, addDoc, doc, setDoc, updateDoc, deleteDoc, writeBatch, query, where, onSnapshot, runTransaction } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+import {
+    agruparItensPorFornecedor,
+    criarSnapshotPedido,
+    obterItensDoPedido,
+    pedidoEstaConfirmado
+} from './order-domain.js';
 
 // --- 2. REFERÊNCIAS DO DOM (Elementos da Página) ---
 const loginScreen = document.getElementById('login-screen');
@@ -15,6 +21,7 @@ const btnLogout = document.getElementById('btn-logout');
 const loginEmail = document.getElementById('login-email');
 const loginPassword = document.getElementById('login-password');
 const feedbackMessageLogin = document.getElementById('feedbackMessageLogin');
+const syncStatus = document.getElementById('sync-status');
 
 // --- VARIÁVEIS GLOBAIS DA APLICAÇÃO ---
 // Estas variáveis irão armazenar os dados carregados do Firestore
@@ -32,6 +39,109 @@ const itensPorPagina = 10;
 let estadoOrdenacao = { coluna: 'codigo', direcao: 'asc' };
 const dataVersion = "2.0"; // Versão para controle de backup
 
+function escaparHtml(valor) {
+    return String(valor ?? '')
+        .replaceAll('&', '&amp;')
+        .replaceAll('<', '&lt;')
+        .replaceAll('>', '&gt;')
+        .replaceAll('"', '&quot;')
+        .replaceAll("'", '&#039;');
+}
+
+function atualizarStatusSincronizacao(mensagem = '', tipo = 'ok') {
+    if (!syncStatus) return;
+    syncStatus.textContent = mensagem;
+    syncStatus.className = `sync-status sync-status-${tipo}`;
+    syncStatus.hidden = !mensagem;
+}
+
+function tratarErroListener(nomeColecao, error) {
+    console.error(`Erro ao sincronizar ${nomeColecao}:`, error);
+    atualizarStatusSincronizacao(`Falha ao sincronizar ${nomeColecao}. Verifique sua conexão.`, 'erro');
+}
+
+function obterOrcamentoAtual() {
+    return orcamentosSalvos[orcamentoAtualId] || null;
+}
+
+function garantirOrcamentoEditavel(acao = 'alterar os itens') {
+    const orcamento = obterOrcamentoAtual();
+    if (!pedidoEstaConfirmado(orcamento)) return true;
+
+    alert(`Este registro já foi confirmado como pedido. Para ${acao}, duplique-o e crie um novo orçamento.`);
+    return false;
+}
+
+function atualizarInterfacePedido() {
+    const orcamento = obterOrcamentoAtual();
+    const confirmado = pedidoEstaConfirmado(orcamento);
+    const status = document.getElementById('statusDocumento');
+    const botaoConfirmar = document.getElementById('btn-confirmar-pedido');
+
+    if (status) {
+        status.textContent = confirmado ? 'Pedido confirmado' : 'Orçamento';
+        status.className = confirmado ? 'document-status document-status-pedido' : 'document-status document-status-orcamento';
+    }
+
+    if (botaoConfirmar) {
+        botaoConfirmar.disabled = confirmado || !orcamento;
+        botaoConfirmar.textContent = confirmado ? '✓ Pedido confirmado' : '✓ Transformar em Pedido';
+    }
+
+    const idsBloqueados = [
+        'btn-criar-produto-acabado',
+        'btn-adicionar-item-avulso',
+        'btn-limpar-itens-do-orcamento',
+        'tipoCliente',
+        'condicaoPagamento',
+        'formaPagamento',
+        'descontoGlobal',
+        'observacoesComerciais'
+    ];
+
+    idsBloqueados.forEach(id => {
+        const elemento = document.getElementById(id);
+        if (elemento) elemento.disabled = confirmado;
+    });
+
+    document.querySelectorAll('.btn-item-action, .btn-produto-action, .btn-add-item-to-produto')
+        .forEach(botao => { botao.disabled = confirmado; });
+}
+
+async function confirmarPedido() {
+    const orcamento = obterOrcamentoAtual();
+    if (!orcamento) return;
+    if (pedidoEstaConfirmado(orcamento)) {
+        alert('Este orçamento já foi confirmado como pedido.');
+        return;
+    }
+
+    const itens = [...(orcamento.itens || []), ...(orcamento.produtosAcabados || []).flatMap(produto => produto.itens || [])];
+    if (itens.length === 0) {
+        alert('Adicione pelo menos um item antes de transformar o orçamento em pedido.');
+        return;
+    }
+
+    if (!orcamento.infoGerais?.nomeCliente?.trim()) {
+        alert('Informe o nome do cliente antes de transformar o orçamento em pedido.');
+        document.getElementById('nomeCliente')?.focus();
+        return;
+    }
+
+    const confirmado = confirm('Ao transformar em pedido, itens, quantidades e custos serão congelados. Deseja continuar?');
+    if (!confirmado) return;
+
+    orcamento.statusDocumento = 'pedido';
+    orcamento.pedido = criarSnapshotPedido(orcamento, {
+        confirmadoEm: new Date().toISOString(),
+        confirmadoPor: auth.currentUser?.uid || null
+    });
+
+    await salvarOrcamentoAtual();
+    atualizarInterfacePedido();
+    alert(`Pedido ${orcamento.id} confirmado com sucesso.`);
+}
+
 // --- 3. FUNÇÕES DE DADOS (LISTENERS EM TEMPO REAL - FASE 4) ---
 
 /**
@@ -40,43 +150,47 @@ const dataVersion = "2.0"; // Versão para controle de backup
  */
 function escutarPrecos() {
     const precosRef = collection(db, 'precos');
-    onSnapshot(precosRef, (snapshot) => {
+    const unsubscribe = onSnapshot(precosRef, (snapshot) => {
         precos = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
         filtrarProdutos(); // Atualiza a tabela de produtos
         console.log("Listener de Preços: Dados atualizados.");
-    });
+    }, (error) => tratarErroListener('preços', error));
+    unsubscribeListeners.push(unsubscribe);
 }
 
 function escutarFornecedores() {
     const fornecedoresRef = collection(db, 'fornecedores');
-    onSnapshot(fornecedoresRef, (snapshot) => {
+    const unsubscribe = onSnapshot(fornecedoresRef, (snapshot) => {
         fornecedores = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
         atualizarSelects(); // Atualiza os dropdowns de filtro e cadastro
         // CORREÇÃO: Renderiza a lista no modal se ele estiver aberto.
         if (document.getElementById('modalGerenciarFornecedores').classList.contains('active')) renderizarListaFornecedores();
         console.log("Listener de Fornecedores: Dados atualizados.");
-    });
+    }, (error) => tratarErroListener('fornecedores', error));
+    unsubscribeListeners.push(unsubscribe);
 }
 
 function escutarCategorias() {
     const categoriasRef = collection(db, 'categorias');
-    onSnapshot(categoriasRef, (snapshot) => {
+    const unsubscribe = onSnapshot(categoriasRef, (snapshot) => {
         categorias = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
         atualizarSelects();
         // CORREÇÃO: Renderiza a lista no modal se ele estiver aberto.
         if (document.getElementById('modalGerenciarCategorias').classList.contains('active')) renderizarListaCategorias();
         console.log("Listener de Categorias: Dados atualizados.");
-    });
+    }, (error) => tratarErroListener('categorias', error));
+    unsubscribeListeners.push(unsubscribe);
 }
 
 function escutarUnidadesDeMedida() {
     const unidadesRef = collection(db, 'unidadesDeMedida');
-    onSnapshot(unidadesRef, (snapshot) => {
+    const unsubscribe = onSnapshot(unidadesRef, (snapshot) => {
         unidadesDeMedida = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
         atualizarSelectsUnidadeMedida();
         renderizarListaUnidadesMedida();
         console.log("Listener de Unidades de Medida: Dados atualizados.");
-    });
+    }, (error) => tratarErroListener('unidades de medida', error));
+    unsubscribeListeners.push(unsubscribe);
 }
 
 /**
@@ -110,8 +224,9 @@ function escutarOrcamentos() {
         
         atualizarSeletoresOrcamento();
         preencherInfoOrcamento(); // Atualiza a tela de orçamento com os novos dados
+        atualizarStatusSincronizacao('Dados sincronizados', 'ok');
         console.log("Listener de Orçamentos: Dados atualizados.");
-    });
+    }, (error) => tratarErroListener('orçamentos', error));
     unsubscribeListeners.push(unsubscribe);
 }
 
@@ -185,25 +300,34 @@ onAuthStateChanged(auth, async (user) => {
         // --- USUÁRIO AUTENTICADO ---
         console.log("Usuário autenticado:", user.uid);
 
-        // NOVA ABORDAGEM:
-        // 1. Garante que o estado inicial dos orçamentos está correto.
-        await inicializarOrcamentos();
+        try {
+            detachAllListeners();
+            atualizarStatusSincronizacao('Sincronizando dados...', 'carregando');
 
-        // 2. Inicia os listeners para manter tudo sincronizado a partir de agora.
-        escutarPrecos();
-        escutarFornecedores();
-        escutarCategorias();
-        escutarUnidadesDeMedida();
-        escutarOrcamentos();
-        ajustarCamposCadastroPorUnidade(); // Garante que o campo Altura Padrão seja ajustado na inicialização
+            // 1. Garante que o estado inicial dos orçamentos está correto.
+            await inicializarOrcamentos();
 
-        toggleAppVisibility(true);
+            // 2. Inicia os listeners para manter tudo sincronizado a partir de agora.
+            escutarPrecos();
+            escutarFornecedores();
+            escutarCategorias();
+            escutarUnidadesDeMedida();
+            escutarOrcamentos();
+            ajustarCamposCadastroPorUnidade(); // Garante que o campo Altura Padrão seja ajustado na inicialização
+
+            toggleAppVisibility(true);
+        } catch (error) {
+            console.error('Falha ao inicializar os dados do sistema:', error);
+            toggleAppVisibility(true);
+            atualizarStatusSincronizacao('Não foi possível carregar os dados. Verifique sua conexão e tente novamente.', 'erro');
+        }
 
     } else {
         // --- USUÁRIO DESLOGADO ---
         console.log("Nenhum usuário autenticado.");
         // Desanexa os listeners para evitar erros de permissão
         detachAllListeners();
+        atualizarStatusSincronizacao();
         toggleAppVisibility(false);
     }
 });
@@ -226,6 +350,7 @@ btnLogout.addEventListener('click', handleLogout);
         document.getElementById('btn-novo-orcamento').addEventListener('click', criarNovoOrcamento);
         document.getElementById('btn-duplicar-orcamento').addEventListener('click', duplicarOrcamento);
         document.getElementById('btn-excluir-orcamento').addEventListener('click', excluirOrcamento);
+        document.getElementById('btn-confirmar-pedido').addEventListener('click', confirmarPedido);
         document.getElementById('btn-criar-produto-acabado').addEventListener('click', criarProdutoAcabado);
         // Botões movidos para dentro da tabela de orçamento
         document.getElementById('btn-adicionar-item-avulso').addEventListener('click', () => abrirModalAdicionarItem(null));
@@ -303,12 +428,15 @@ btnLogout.addEventListener('click', handleLogout);
         document.getElementById('dataInstalacao').addEventListener('blur', (e) => atualizarInfoOrcamento('dataInstalacao', e.target.value));
         document.getElementById('btn-baixar-excel-pedido-ao-fornecedor').addEventListener('click', exportarExcel);
         document.getElementById('nomeCostureira').addEventListener('blur', (e) => atualizarInfoOrcamento('nomeCostureira', e.target.value));
+        document.getElementById('enderecoCostureira').addEventListener('blur', (e) => atualizarInfoOrcamento('enderecoCostureira', e.target.value));
         document.getElementById('nomeInstalador').addEventListener('blur', (e) => atualizarInfoOrcamento('nomeInstalador', e.target.value));
         document.getElementById('observacoesGerais').addEventListener('blur', (e) => atualizarInfoOrcamento('observacoesGerais', e.target.value));
 
 
         // Aba 1: Lista de Preços
         document.getElementById('btn-adicionar-preco').addEventListener('click', adicionarPreco);
+        document.getElementById('categoria').addEventListener('change', ajustarCamposCadastroPorUnidade);
+        document.getElementById('unidadeMedida').addEventListener('change', ajustarCamposCadastroPorUnidade);
         document.querySelectorAll('.coluna-ordenavel').forEach(th => {
             th.addEventListener('click', () => ordenarTabela(th.dataset.coluna));
         });
@@ -323,6 +451,7 @@ btnLogout.addEventListener('click', handleLogout);
         document.getElementById('btn-abrir-gerenciador-de-categorias').addEventListener('click', () => gerenciarCategorias());
         document.getElementById('btn-abrir-gerenciador-de-unidades-de-medida').addEventListener('click', () => gerenciarUnidadesMedida());
         document.getElementById('btn-exportar-dados').addEventListener('click', exportarDados);
+        document.getElementById('arquivo-backup').addEventListener('change', importarDados);
         document.getElementById('btn-importar-csv').addEventListener('click', () => importarCSV());
         document.getElementById('btn-baixar-template').addEventListener('click', baixarTemplateCSV);
         // Listeners para o modal de preview do CSV
@@ -338,9 +467,11 @@ btnLogout.addEventListener('click', handleLogout);
         document.getElementById('condicaoPagamento').addEventListener('change', (e) => atualizarInfoComercial('condicaoPagamento', e.target.value));
         document.getElementById('formaPagamento').addEventListener('change', (e) => atualizarInfoComercial('formaPagamento', e.target.value));
         document.getElementById('descontoGlobal').addEventListener('input', atualizarPropostaCliente);
+        document.getElementById('descontoGlobal').addEventListener('blur', (e) => atualizarInfoComercial('descontoGlobal', parseFloat(e.target.value) || 0));
         document.getElementById('observacoesComerciais').addEventListener('blur', (e) => atualizarInfoComercial('observacoesComerciais', e.target.value));
-        document.getElementById('mostrarValoresItens').addEventListener('change', atualizarPropostaCliente);
-        document.getElementById('mostrarDetalhamentoCompleto').addEventListener('change', atualizarPropostaCliente);
+        document.getElementById('modoProposta').addEventListener('change', atualizarConfiguracaoProposta);
+        document.getElementById('mostrarValoresItens').addEventListener('change', atualizarConfiguracaoProposta);
+        document.getElementById('mostrarCustosFornecedor').addEventListener('change', atualizarConfiguracaoProposta);
 
         inicializarSelectInteligente('codigoOrcamento');
         inicializarSelectInteligente('edicaoCodigoItem');
@@ -387,6 +518,9 @@ btnLogout.addEventListener('click', handleLogout);
         document.getElementById('btn-fechar-edicao-produto').addEventListener('click', fecharModalEdicaoProduto);
         document.getElementById('btn-cancelar-edicao-produto').addEventListener('click', fecharModalEdicaoProduto);
         document.getElementById('btn-salvar-edicao-produto').addEventListener('click', salvarEdicaoProduto);
+        document.getElementById('edicaoFornecedorProduto').addEventListener('change', ajustarCamposEdicaoProduto);
+        document.getElementById('edicaoCategoriaProduto').addEventListener('change', ajustarCamposEdicaoProduto);
+        document.getElementById('edicaoUnidadeMedidaProduto').addEventListener('change', ajustarCamposEdicaoProduto);
 
 
 
@@ -771,6 +905,10 @@ btnLogout.addEventListener('click', handleLogout);
     }
 
     async function atualizarValorInstalacao(ambiente, inputElement) {
+        if (!garantirOrcamentoEditavel('alterar o valor de instalação')) {
+            preencherInfoOrcamento();
+            return;
+        }
         const orcamento = orcamentosSalvos[orcamentoAtualId];
         if (!orcamento) return;
         
@@ -797,6 +935,7 @@ btnLogout.addEventListener('click', handleLogout);
 
 
     async function adicionarItemAoOrcamento() {
+        if (!garantirOrcamentoEditavel('adicionar itens')) return;
         const produtoAcabadoId = document.getElementById('addProdutoAcabadoId').value;
         const orcamento = orcamentosSalvos[orcamentoAtualId];
         const codigo = document.getElementById('codigoOrcamento').value.trim().toUpperCase();
@@ -833,7 +972,7 @@ btnLogout.addEventListener('click', handleLogout);
         );
 
         const novoItem = {
-            id: `item-${Date.now()}`,
+            id: `item-${crypto.randomUUID()}`,
             ambiente: document.getElementById('ambiente').value.trim(),
             categoria: produtoBase.categoria || 'Não Especificada',
             codigo,
@@ -852,6 +991,8 @@ btnLogout.addEventListener('click', handleLogout);
             precoUnitario: detalhesCalculados.precoUnitario,
             precoTotal: detalhesCalculados.precoTotal,
             custoReal: detalhesCalculados.custoReal,
+            quantidadeCompra: detalhesCalculados.quantidadeCompra,
+            precoCompraUnitario: produtoBase.precoCompra,
             margemLiquida: detalhesCalculados.margemLiquida,
             margemPercentual: detalhesCalculados.margemPercentual,
             valorComissao: detalhesCalculados.valorComissao,
@@ -924,6 +1065,10 @@ btnLogout.addEventListener('click', handleLogout);
     // --- FIM: FUNÇÕES DO NOVO FLUXO ---
 
     async function atualizarInfoComercial(campo, valor) {
+        if (!garantirOrcamentoEditavel('alterar as condições comerciais')) {
+            preencherInfoOrcamento();
+            return;
+        }
         const orcamento = orcamentosSalvos[orcamentoAtualId];
         if (orcamento) {
             if (!orcamento.infoComercial) orcamento.infoComercial = {};
@@ -943,6 +1088,7 @@ btnLogout.addEventListener('click', handleLogout);
         }
     } */
     async function removerProdutoAcabado(produtoId) {
+        if (!garantirOrcamentoEditavel('excluir produtos acabados')) return;
         if (!confirm("Tem certeza que deseja excluir este produto acabado e todos os seus itens?")) return;
         const orcamento = orcamentosSalvos[orcamentoAtualId];
         orcamento.produtosAcabados = orcamento.produtosAcabados.filter(p => p.id !== produtoId);
@@ -951,6 +1097,7 @@ btnLogout.addEventListener('click', handleLogout);
     }
 
     async function removerItem(produtoId, itemId) {
+        if (!garantirOrcamentoEditavel('excluir itens')) return;
         if (!confirm("Tem certeza que deseja excluir este item?")) return;
         const orcamento = orcamentosSalvos[orcamentoAtualId];
         
@@ -968,6 +1115,7 @@ btnLogout.addEventListener('click', handleLogout);
     }
 
     async function limparOrcamento() {
+        if (!garantirOrcamentoEditavel('limpar o orçamento')) return;
         const orcamento = orcamentosSalvos[orcamentoAtualId];
         if (confirm("Tem certeza que deseja limpar todos os itens e produtos deste orçamento?")) {
             orcamento.itens = [];
@@ -978,9 +1126,11 @@ btnLogout.addEventListener('click', handleLogout);
     }
 
     async function criarProdutoAcabado() {
+        if (!garantirOrcamentoEditavel('criar produtos acabados')) return;
         const nome = document.getElementById('nomeProdutoAcabado').value.trim();
         const ambiente = document.getElementById('ambienteProdutoAcabado').value.trim();
         const observacoes = document.getElementById('observacoesProdutoAcabado').value.trim();
+        const observacoesCliente = document.getElementById('observacoesClienteProdutoAcabado').value.trim();
 
         if (!nome || !ambiente) {
             alert("O Nome e o Ambiente do produto acabado são obrigatórios.");
@@ -991,10 +1141,11 @@ btnLogout.addEventListener('click', handleLogout);
         if (!orcamento) return;
         
         const novoProduto = {
-            id: `prod-${Date.now()}`,
+            id: `prod-${crypto.randomUUID()}`,
             nome: nome,
             ambiente: ambiente,
             observacoes: observacoes,
+            observacoesCliente: observacoesCliente,
             itens: [],
             valorTotal: 0,
             margemTotal: 0
@@ -1010,6 +1161,7 @@ btnLogout.addEventListener('click', handleLogout);
         document.getElementById('nomeProdutoAcabado').value = '';
         document.getElementById('ambienteProdutoAcabado').value = '';
         document.getElementById('observacoesProdutoAcabado').value = '';
+        document.getElementById('observacoesClienteProdutoAcabado').value = '';
     }
 
     function abrirModalEdicaoProdutoAcabado(produtoAcabadoId) {
@@ -1023,6 +1175,7 @@ btnLogout.addEventListener('click', handleLogout);
             document.getElementById('edicaoNome').value = produtoAcabado.nome;
             document.getElementById('edicaoAmbiente').value = produtoAcabado.ambiente;
             document.getElementById('edicaoObservacoes').value = produtoAcabado.observacoes || '';
+            document.getElementById('edicaoObservacoesCliente').value = produtoAcabado.observacoesCliente || '';
             document.getElementById('modalEdicaoProdutoAcabado').style.display = 'block';
         } else {
             alert("Produto Acabado não encontrado para edição.");
@@ -1030,10 +1183,12 @@ btnLogout.addEventListener('click', handleLogout);
     }
 
     async function salvarEdicaoProdutoAcabado() {
+        if (!garantirOrcamentoEditavel('editar produtos acabados')) return;
         const id = document.getElementById('edicaoProdutoAcabadoId').value;
         const novoNome = document.getElementById('edicaoNome').value.trim();
         const novoAmbiente = document.getElementById('edicaoAmbiente').value.trim();
         const novaObservacoes = document.getElementById('edicaoObservacoes').value.trim();
+        const novaObservacoesCliente = document.getElementById('edicaoObservacoesCliente').value.trim();
 
         if (!novoNome || !novoAmbiente) {
             alert("Por favor, preencha o nome e o ambiente.");
@@ -1051,6 +1206,7 @@ btnLogout.addEventListener('click', handleLogout);
             produtoAcabado.nome = novoNome;
             produtoAcabado.ambiente = novoAmbiente;
             produtoAcabado.observacoes = novaObservacoes; 
+            produtoAcabado.observacoesCliente = novaObservacoesCliente;
                            
             // Atualiza o ambiente de todos os sub-itens para manter a consistência
             produtoAcabado.itens.forEach(item => {
@@ -1064,14 +1220,30 @@ btnLogout.addEventListener('click', handleLogout);
         }
     }
 
+    async function atualizarConfiguracaoProposta() {
+        const orcamento = obterOrcamentoAtual();
+        if (!orcamento) return;
+
+        orcamento.apresentacao = {
+            ...(orcamento.apresentacao || {}),
+            modo: document.getElementById('modoProposta').value,
+            mostrarValoresItens: document.getElementById('mostrarValoresItens').checked,
+            mostrarCustosFornecedor: document.getElementById('mostrarCustosFornecedor').checked
+        };
+
+        await salvarOrcamentoAtual();
+        atualizarPropostaCliente();
+    }
+
     function atualizarPropostaCliente() {
-        // Obter os estados dos checkboxes no início da função.
+        // Obter os estados dos controles no início da função.
+        const modoProposta = document.getElementById('modoProposta').value === 'detalhada' ? 'detalhada' : 'reduzida';
         const mostrarValoresItens = document.getElementById('mostrarValoresItens').checked;
-        const mostrarDetalhamentoCompleto = document.getElementById('mostrarDetalhamentoCompleto').checked;
+        const mostrarDetalhamentoCompleto = modoProposta === 'detalhada';
 
         const orcamentoFinalDiv = document.getElementById('orcamentoFinal');
         const orcamento = orcamentosSalvos[orcamentoAtualId];
-        const descontoGlobal = parseFloat(document.getElementById('descontoGlobal').value) || 0;
+        const descontoGlobal = Math.min(100, Math.max(0, parseFloat(document.getElementById('descontoGlobal').value) || 0));
         
         if (!orcamento || (!orcamento.itens || orcamento.itens.length === 0) && (!orcamento.produtosAcabados || orcamento.produtosAcabados.length === 0)) {
             orcamentoFinalDiv.innerHTML = '<p style="text-align: center; color: #777;">Adicione itens ao orçamento para visualizar a proposta.</p>';
@@ -1097,10 +1269,10 @@ btnLogout.addEventListener('click', handleLogout);
         document.getElementById('margemComDesconto').textContent = `${truncarDecimal(margemComDescontoPercentual, 2)}%`;
 
         // LÓGICA DE GERAÇÃO DE HTML RESTAURADA
-        const todosOsItens = [...(orcamento.itens || []), ...orcamento.produtosAcabados.flatMap(p => p.itens)];
+        const todosOsItens = [...(orcamento.itens || []), ...(orcamento.produtosAcabados || []).flatMap(p => p.itens || [])];
 
         let html = `
-            <div class="proposta-wrapper">
+            <div class="proposta-wrapper proposta-${modoProposta}">
                 <div class="proposta-header">
                     <div class="logo">
                         <img src="WhatsApp Image 2025-09-17 at 16.56.26.jpeg" alt="Logo Marcello Machado">
@@ -1116,11 +1288,11 @@ btnLogout.addEventListener('click', handleLogout);
                 </div>
 
                 <div class="proposta-info-grid">
-                    <div><strong>ID da Proposta:</strong><p>${orcamentoAtualId}</p></div>
-                    <div><strong>Cliente:</strong><p>${orcamento.infoGerais.nomeCliente || 'Não informado'}</p></div>
-                    <div><strong>Endereço:</strong><p>${orcamento.infoGerais.enderecoCliente || 'Não informado'}</p></div>
-                    <div><strong>Data do Orçamento:</strong><p>${formatarData(orcamento.infoGerais.dataOrcamento)}</p></div>
-                    <div><strong>Validade do Orçamento:</strong><p>${formatarData(orcamento.infoGerais.prazoValidade)}</p></div>
+                    <div><strong>ID da Proposta:</strong><p>${escaparHtml(orcamentoAtualId)}</p></div>
+                    <div><strong>Cliente:</strong><p>${escaparHtml(orcamento.infoGerais?.nomeCliente || 'Não informado')}</p></div>
+                    <div><strong>Endereço:</strong><p>${escaparHtml(orcamento.infoGerais?.enderecoCliente || 'Não informado')}</p></div>
+                    <div><strong>Data do Orçamento:</strong><p>${escaparHtml(formatarData(orcamento.infoGerais?.dataOrcamento))}</p></div>
+                    <div><strong>Validade do Orçamento:</strong><p>${escaparHtml(formatarData(orcamento.infoGerais?.prazoValidade))}</p></div>
                 </div>
         `;
         
@@ -1129,17 +1301,17 @@ btnLogout.addEventListener('click', handleLogout);
                     <thead><tr><th>Produto</th><th style="text-align: right;">Valor Total</th></tr></thead><tbody>`;
         
         (orcamento.produtosAcabados || []).forEach(produto => {
-            html += `<tr><td>${produto.nome} (${produto.ambiente})</td><td class="item-value">${formatarMoeda(produto.valorTotal)}</td></tr>`;
+            html += `<tr><td><strong>${escaparHtml(produto.nome)} (${escaparHtml(produto.ambiente)})</strong>${produto.observacoesCliente ? `<span class="proposta-observacao-produto">${escaparHtml(produto.observacoesCliente)}</span>` : ''}</td><td class="item-value">${formatarMoeda(produto.valorTotal)}</td></tr>`;
         });
 
         if (orcamento.itens && orcamento.itens.length > 0) {
-             const totalAvulsos = orcamento.itens.reduce((sum, item) => sum + item.precoTotal, 0);
+             const totalAvulsos = orcamento.itens.reduce((sum, item) => sum + Number(item.precoTotal || 0), 0);
              html += `<tr><td>Itens Avulsos</td><td class="item-value">${formatarMoeda(totalAvulsos)}</td></tr>`;
         }
 
         html += `</tbody></table>`;
 
-        const totalInstalacaoGeral = orcamento.totais.totalInstalacao || 0;
+        const totalInstalacaoGeral = orcamento.totais?.totalInstalacao || 0;
         const totalFinalGeral = totalComDesconto + totalInstalacaoGeral;
 
         html += `
@@ -1168,7 +1340,7 @@ btnLogout.addEventListener('click', handleLogout);
             
             (orcamento.produtosAcabados || []).forEach(produto => {
                 html += `
-                    <h4 style="color: #333; margin-bottom: 10px; border-bottom: 1px solid #eee; padding-bottom: 5px;">${produto.nome} (${produto.ambiente})</h4>
+                    <h4 style="color: #333; margin-bottom: 10px; border-bottom: 1px solid #eee; padding-bottom: 5px;">${escaparHtml(produto.nome)} (${escaparHtml(produto.ambiente)})</h4>
                     <table class="proposta-ambiente-table">
                         <thead>
                             <tr>
@@ -1182,11 +1354,11 @@ btnLogout.addEventListener('click', handleLogout);
                         <tbody>`;
                 produto.itens.forEach(item => {
                     html += `<tr>
-                                <td>${item.codigo || item.item || ''}</td>
-                                <td class="item-description">${item.descricao} ${item.observacoes ? ` - Obs: ${item.observacoes}` : ''}</td>
-                                <td>${(item.cor === 'Não Informada' ? '-' : item.cor) || '-'}</td>
-                                <td>${item.unidadeMedida || ''}</td>
-                                <td style="text-align: center;">${item.quantidade || 0}</td>
+                                <td>${escaparHtml(item.codigo || item.item || '')}</td>
+                                <td class="item-description">${escaparHtml(item.descricao)} ${item.observacoes ? ` - Obs: ${escaparHtml(item.observacoes)}` : ''}</td>
+                                <td>${escaparHtml((item.cor === 'Não Informada' ? '-' : item.cor) || '-')}</td>
+                                <td>${escaparHtml(item.unidadeMedida || '')}</td>
+                                <td style="text-align: center;">${escaparHtml(item.quantidade || 0)}</td>
                                 ${mostrarValoresItens ? `<td class="item-value">${formatarMoeda(item.precoTotal)}</td>` : '<td class="item-value"></td>'}
                             </tr>`;
                 });
@@ -1209,11 +1381,11 @@ btnLogout.addEventListener('click', handleLogout);
                         <tbody>`;
                 orcamento.itens.forEach(item => {
                     html += `<tr>
-                                <td>${item.codigo || item.item || ''}</td>
-                                <td class="item-description">${item.descricao} ${item.observacoes ? ` - Obs: ${item.observacoes}` : ''}</td>
-                                <td>${(item.cor === 'Não Informada' ? '-' : item.cor) || '-'}</td>
-                                <td>${item.unidadeMedida || ''}</td>
-                                <td style="text-align: center;">${item.quantidade || 0}</td>
+                                <td>${escaparHtml(item.codigo || item.item || '')}</td>
+                                <td class="item-description">${escaparHtml(item.descricao)} ${item.observacoes ? ` - Obs: ${escaparHtml(item.observacoes)}` : ''}</td>
+                                <td>${escaparHtml((item.cor === 'Não Informada' ? '-' : item.cor) || '-')}</td>
+                                <td>${escaparHtml(item.unidadeMedida || '')}</td>
+                                <td style="text-align: center;">${escaparHtml(item.quantidade || 0)}</td>
                                 ${mostrarValoresItens ? `<td class="item-value">${formatarMoeda(item.precoTotal)}</td>` : '<td class="item-value"></td>'}
                             </tr>`;
                 });
@@ -1225,10 +1397,10 @@ btnLogout.addEventListener('click', handleLogout);
         html += `
             <div class="proposta-footer">
                 <h4>Condições Comerciais</h4>
-                <p><strong>Condição de Pagamento:</strong> ${condComerciais.condicaoPagamento || 'Não informado'}</p>
-                <p><strong>Forma de Pagamento:</strong> ${condComerciais.formaPagamento || 'Não informado'}</p>
-                <p><strong>Prazo de Entrega:</strong> ${orcamento.infoGerais.prazoEntrega || 'Não informado'}</p>
-                <p><strong>Observações:</strong> ${condComerciais.observacoesComerciais || orcamento.infoGerais.observacoesGerais || 'Sem observações.'}</p>
+                <p><strong>Condição de Pagamento:</strong> ${escaparHtml(condComerciais.condicaoPagamento || 'Não informado')}</p>
+                <p><strong>Forma de Pagamento:</strong> ${escaparHtml(condComerciais.formaPagamento || 'Não informado')}</p>
+                <p><strong>Prazo de Entrega:</strong> ${escaparHtml(orcamento.infoGerais?.prazoEntrega || 'Não informado')}</p>
+                <p><strong>Observações:</strong> ${escaparHtml(condComerciais.observacoesComerciais || orcamento.infoGerais?.observacoesGerais || 'Sem observações.')}</p>
             </div>
         </div>`;
         
@@ -1275,18 +1447,6 @@ btnLogout.addEventListener('click', handleLogout);
 
         // Mostra o modal
         document.getElementById('modalEdicaoItem').classList.add('active');
-    }
-
-    function atualizarDatalistEdicao() {
-        const datalistCodigos = document.getElementById('listaCodigosEdicao');
-        datalistCodigos.innerHTML = '';
-        
-        precos.filter(p => p.status === 'Ativo').forEach(p => {
-            const option = document.createElement('option');
-            option.value = p.codigo;
-            option.textContent = `${p.codigo} - ${p.descricao}`;
-            datalistCodigos.appendChild(option);
-        });
     }
 
     function ajustarCamposEdicaoItem() {
@@ -1365,6 +1525,7 @@ btnLogout.addEventListener('click', handleLogout);
     }
 
     async function salvarEdicaoItem() {
+        if (!garantirOrcamentoEditavel('editar itens')) return;
         const itemId = document.getElementById('edicaoItemId').value;
         const produtoAcabadoId = document.getElementById('edicaoProdutoAcabadoIdItem').value;
         const codigo = document.getElementById('edicaoCodigoItem').value.trim().toUpperCase();
@@ -1429,6 +1590,8 @@ btnLogout.addEventListener('click', handleLogout);
             itemParaAtualizar.observacoes = document.getElementById('edicaoObservacoesItem').value.trim();
             
             itemParaAtualizar.custoReal = detalhesCalculados.custoReal;
+            itemParaAtualizar.quantidadeCompra = detalhesCalculados.quantidadeCompra;
+            itemParaAtualizar.precoCompraUnitario = produtoBase.precoCompra;
             itemParaAtualizar.margemLiquida = detalhesCalculados.margemLiquida;
             itemParaAtualizar.margemPercentual = detalhesCalculados.margemPercentual;
             itemParaAtualizar.valorComissao = detalhesCalculados.valorComissao;
@@ -1492,7 +1655,7 @@ btnLogout.addEventListener('click', handleLogout);
         window.print();
     }
 
-    function imprimirInstrucoesInstalador() {
+    function imprimirInstrucoesInstaladorLegado() {
         const orcamentoFinalDiv = document.getElementById('orcamentoFinal');
         const orcamento = orcamentosSalvos[orcamentoAtualId];
 
@@ -1599,6 +1762,70 @@ btnLogout.addEventListener('click', handleLogout);
         window.print();
     }
 
+    function imprimirInstrucoesInstalador() {
+        const orcamentoFinalDiv = document.getElementById('orcamentoFinal');
+        const orcamento = obterOrcamentoAtual();
+
+        if (!orcamento || !pedidoEstaConfirmado(orcamento)) {
+            alert('Transforme o orçamento em pedido antes de gerar o relatório do instalador.');
+            return;
+        }
+
+        const itens = obterItensDoPedido(orcamento);
+        if (itens.length === 0) {
+            alert('O pedido confirmado não possui itens para retirada.');
+            return;
+        }
+
+        const pedido = orcamento.pedido || {};
+        const cliente = pedido.cliente || {};
+        const conteudoOriginal = orcamentoFinalDiv.innerHTML;
+        const tituloOriginal = document.title;
+        const linhas = itens.map(item => `
+            <tr>
+                <td>${escaparHtml(item.ambiente || '-')}</td>
+                <td>${escaparHtml(item.produtoAcabadoNome || 'Item avulso')}</td>
+                <td>${escaparHtml(item.codigo || '-')}</td>
+                <td>${escaparHtml(item.descricao || '-')}</td>
+                <td>${escaparHtml(item.unidadeMedida || 'Unidade')}</td>
+                <td class="numero">${escaparHtml(Number(item.quantidadeCompra || 0).toLocaleString('pt-BR', { maximumFractionDigits: 3 }))}</td>
+            </tr>
+        `).join('');
+
+        orcamentoFinalDiv.innerHTML = `
+            <div class="proposta-wrapper proposta-reduzida relatorio-instalador">
+                <h2>Retirada para instalação</h2>
+                <div class="proposta-info-grid">
+                    <div><strong>Pedido</strong><p>${escaparHtml(orcamento.id || orcamentoAtualId)}</p></div>
+                    <div><strong>Cliente</strong><p>${escaparHtml(cliente.nome || orcamento.infoGerais?.nomeCliente || 'Não informado')}</p></div>
+                    <div class="campo-endereco"><strong>Endereço do cliente</strong><p>${escaparHtml(cliente.endereco || orcamento.infoGerais?.enderecoCliente || 'Não informado')}</p></div>
+                </div>
+                <table class="proposta-ambiente-table">
+                    <thead>
+                        <tr>
+                            <th>Ambiente</th>
+                            <th>Produto</th>
+                            <th>Código</th>
+                            <th>Item a retirar</th>
+                            <th>Unidade</th>
+                            <th>Qtd.</th>
+                        </tr>
+                    </thead>
+                    <tbody>${linhas}</tbody>
+                </table>
+            </div>
+        `;
+
+        document.title = `Retirada_Instalador_${orcamento.id || orcamentoAtualId}`;
+        window.onafterprint = function() {
+            orcamentoFinalDiv.innerHTML = conteudoOriginal;
+            document.title = tituloOriginal;
+            window.onafterprint = null;
+        };
+
+        window.print();
+    }
+
     /** 
      * SOLUÇÃO DEFINITIVA: Função de arredondamento financeiro robusta.
      * Usa um método que evita erros de ponto flutuante do JavaScript.
@@ -1633,8 +1860,8 @@ btnLogout.addEventListener('click', handleLogout);
             case 'MetroLinear':
                 quantidadeCompra = quantidade; // Quantidade é em metros
                 alturaSalva = produtoBase.alturaPadrao || null; // A "largura do material" é salva como altura do item
-                break;
                 calculoTexto = `${quantidade.toFixed(3)} metro(s)`;
+                break;
             case 'MetroQuadrado':
                 // Para M², a quantidade de compra é a área. A quantidade de peças é sempre 1.
                 quantidadeCompra = largura * altura * quantidade; // Área (largura x altura) multiplicada pela quantidade de peças.
@@ -1680,7 +1907,14 @@ btnLogout.addEventListener('click', handleLogout);
         const orcamento = orcamentosSalvos[orcamentoAtualId];
         if (!orcamento) return;
 
+        if (!garantirOrcamentoEditavel('alterar o tipo de cliente')) {
+            document.getElementById('tipoCliente').value = orcamento.infoGerais?.tipoCliente || 'cliente';
+            return;
+        }
+
         const tipoCliente = document.getElementById('tipoCliente').value;
+        if (!orcamento.infoGerais) orcamento.infoGerais = {};
+        orcamento.infoGerais.tipoCliente = tipoCliente;
 
         const recalcularArray = (itensArray) => {
             itensArray.forEach(item => {
@@ -1725,9 +1959,11 @@ btnLogout.addEventListener('click', handleLogout);
     function exportarDados() {
         const data = {
             version: dataVersion,
+            exportadoEm: new Date().toISOString(),
             precos: precos,
             fornecedores: fornecedores,
             categorias: categorias,
+            unidadesDeMedida: unidadesDeMedida,
             orcamentosSalvos: orcamentosSalvos
         };
         const dataStr = JSON.stringify(data, null, 2);
@@ -1743,36 +1979,85 @@ btnLogout.addEventListener('click', handleLogout);
         alert("Backup concluído com sucesso!");
     }
 
-    function importarDados(event) {
-        const file = event.target.files[0];
-        if (!file) {
-            return;
+    async function gravarDocumentosEmLotes(documentos) {
+        const tamanhoLote = 400;
+        for (let inicio = 0; inicio < documentos.length; inicio += tamanhoLote) {
+            const batch = writeBatch(db);
+            documentos.slice(inicio, inicio + tamanhoLote).forEach(({ colecao, id, dados }) => {
+                batch.set(doc(db, colecao, id), dados, { merge: true });
+            });
+            await batch.commit();
         }
-        const reader = new FileReader();
-        reader.onload = function(e) {
-            try {
-                const importedData = JSON.parse(e.target.result);
-                if (importedData.version !== dataVersion && importedData.version !== "1.0") {
-                    alert(`Atenção: A versão do arquivo de backup (${importedData.version}) é diferente da versão do sistema (${dataVersion}). A importação pode não funcionar corretamente. Prossiga por sua conta e risco.`);
-                }
-                if (confirm("Importar dados irá substituir todos os dados atuais. Deseja continuar?")) {
-                    precos = importedData.precos || [];
-                    fornecedores = importedData.fornecedores || [];
-                    categorias = importedData.categorias || [];
-                    orcamentosSalvos = importedData.orcamentosSalvos || {};
-                    orcamentoAtualId = Object.keys(orcamentosSalvos)[0] || null;
+    }
 
-                    salvarDados();
-                    carregarDados(); // Recarregar para aplicar migrações se necessário
-                    showTab(0);
-                    alert("Dados importados com sucesso!");
-                }
-            } catch (error) {
-                alert("Erro ao ler o arquivo. Certifique-se de que é um arquivo JSON válido.");
-                console.error("Erro na importação:", error);
+    async function importarDados(event) {
+        const file = event.target.files[0];
+        if (!file) return;
+
+        try {
+            const importedData = JSON.parse(await file.text());
+            const colecoesArray = ['precos', 'fornecedores', 'categorias', 'unidadesDeMedida'];
+            const estruturaValida = importedData
+                && typeof importedData === 'object'
+                && colecoesArray.every(nome => importedData[nome] === undefined || Array.isArray(importedData[nome]))
+                && (importedData.orcamentosSalvos === undefined || typeof importedData.orcamentosSalvos === 'object');
+
+            if (!estruturaValida) {
+                throw new Error('Estrutura de backup inválida.');
             }
-        };
-        reader.readAsText(file);
+
+            if (importedData.version !== dataVersion && importedData.version !== '1.0') {
+                const continuar = confirm(`O backup é da versão ${importedData.version || 'desconhecida'} e o sistema usa ${dataVersion}. Deseja tentar a mesclagem mesmo assim?`);
+                if (!continuar) return;
+            }
+
+            const documentos = [];
+            colecoesArray.forEach(nomeColecao => {
+                (importedData[nomeColecao] || []).forEach((registro, indice) => {
+                    const id = String(registro?.id || `importado-${crypto.randomUUID()}-${indice}`);
+                    const { id: _idIgnorado, ...dados } = registro || {};
+                    documentos.push({ colecao: nomeColecao, id, dados });
+                });
+            });
+            Object.entries(importedData.orcamentosSalvos || {}).forEach(([id, dados]) => {
+                documentos.push({ colecao: 'orcamentos', id, dados: { ...dados, id } });
+            });
+
+            if (documentos.length === 0) {
+                throw new Error('O arquivo não contém registros para restaurar.');
+            }
+
+            const confirmarMesclagem = confirm(`Mesclar ${documentos.length} registro(s) deste backup no Firebase? Registros com o mesmo ID serão atualizados; nenhum registro atual será apagado.`);
+            if (!confirmarMesclagem) return;
+
+            atualizarStatusSincronizacao('Restaurando backup…', 'loading');
+            await gravarDocumentosEmLotes(documentos);
+
+            const maiorNumeroOrcamento = Object.keys(importedData.orcamentosSalvos || {})
+                .map(id => id.match(/^ORC-(\d+)$/))
+                .filter(Boolean)
+                .reduce((maior, match) => Math.max(maior, Number(match[1])), 0);
+            if (maiorNumeroOrcamento > 0) {
+                await runTransaction(db, async transaction => {
+                    const contadorRef = doc(db, 'contadores', 'orcamentos');
+                    const snapshot = await transaction.get(contadorRef);
+                    const atual = snapshot.exists() ? Number(snapshot.data().ultimoNumero || 0) : 0;
+                    transaction.set(contadorRef, {
+                        ultimoNumero: Math.max(atual, maiorNumeroOrcamento),
+                        atualizadoEm: new Date().toISOString()
+                    }, { merge: true });
+                });
+            }
+
+            atualizarStatusSincronizacao('Backup restaurado', 'ok');
+            alert(`${documentos.length} registro(s) mesclado(s) com sucesso.`);
+        } catch (error) {
+            console.error('Erro na restauração do backup:', error);
+            atualizarStatusSincronizacao('Falha ao restaurar backup', 'error');
+            alert(`Não foi possível restaurar o backup: ${error.message}`);
+        } finally {
+            event.target.value = '';
+        }
     }
 
     /**
@@ -3327,21 +3612,58 @@ btnLogout.addEventListener('click', handleLogout);
         return 'ORC-' + String(proximoNumero).padStart(2, '0');
     }
 
+    async function reservarProximoIdSequencial() {
+        const maiorNumeroLocal = Object.values(orcamentosSalvos)
+            .map(orcamento => String(orcamento?.id || '').match(/^ORC-(\d+)$/))
+            .filter(Boolean)
+            .reduce((maior, match) => Math.max(maior, Number(match[1])), 0);
+        const contadorRef = doc(db, 'contadores', 'orcamentos');
+
+        return runTransaction(db, async transaction => {
+            const snapshot = await transaction.get(contadorRef);
+            const ultimoNumeroPersistido = snapshot.exists()
+                ? Number(snapshot.data().ultimoNumero || 0)
+                : 0;
+            const proximoNumero = Math.max(ultimoNumeroPersistido, maiorNumeroLocal) + 1;
+
+            transaction.set(contadorRef, {
+                ultimoNumero: proximoNumero,
+                atualizadoEm: new Date().toISOString()
+            }, { merge: true });
+
+            return `ORC-${String(proximoNumero).padStart(2, '0')}`;
+        });
+    }
+
     async function criarNovoOrcamento() {
-        // CORREÇÃO: Passa o objeto `orcamentosSalvos` como argumento para garantir que a função use a lista mais atual.
-        const newId = encontrarProximoIdSequencial(orcamentosSalvos); 
+        let newId;
+        try {
+            newId = await reservarProximoIdSequencial();
+        } catch (error) {
+            console.error('Erro ao reservar o número do orçamento:', error);
+            alert('Não foi possível reservar um número para o orçamento. Verifique a conexão e tente novamente.');
+            return;
+        }
 
         const dataAtual = new Date().toISOString().split('T')[0];
 
         const novoOrcamento = {
             id: newId,
+            statusDocumento: 'orcamento',
+            apresentacao: {
+                modo: 'reduzida',
+                mostrarValoresItens: false,
+                mostrarCustosFornecedor: false
+            },
             infoGerais: {
                 "nome": `Orçamento ${newId}`, 
                 "nomeCliente": "",
                 "enderecoCliente": "",
+                "tipoCliente": "cliente",
                 "dataOrcamento": dataAtual,
                 "dataInstalacao": "", 
                 "nomeCostureira": "",
+                "enderecoCostureira": "",
                 "nomeInstalador": "",
                 "prazoValidade": "",
                 "prazoEntrega": "30 dias úteis",
@@ -3350,6 +3672,7 @@ btnLogout.addEventListener('click', handleLogout);
             infoComercial: {
                 "condicaoPagamento": "À vista",
                 "formaPagamento": "PIX",
+                "descontoGlobal": 0,
                 "observacoesComerciais": ""
             },
             itens: [],
@@ -3378,8 +3701,14 @@ btnLogout.addEventListener('click', handleLogout);
         const orcamentoOriginal = orcamentosSalvos[orcamentoAtualId];
         
         if (orcamentoOriginal) {
-            // CORREÇÃO: Passa o objeto `orcamentosSalvos` como argumento.
-            const newId = encontrarProximoIdSequencial(orcamentosSalvos); 
+            let newId;
+            try {
+                newId = await reservarProximoIdSequencial();
+            } catch (error) {
+                console.error('Erro ao reservar o número da cópia:', error);
+                alert('Não foi possível reservar um número para a cópia. Verifique a conexão e tente novamente.');
+                return;
+            }
             
             const novoOrcamento = JSON.parse(JSON.stringify(orcamentoOriginal));
             
@@ -3387,6 +3716,8 @@ btnLogout.addEventListener('click', handleLogout);
             novoOrcamento.infoGerais.nome = `Orçamento ${newId}`; // Define um nome padrão para a cópia
             novoOrcamento.infoGerais.dataOrcamento = new Date().toISOString().split('T')[0];
             novoOrcamento.infoGerais.dataInstalacao = "";
+            novoOrcamento.statusDocumento = 'orcamento';
+            delete novoOrcamento.pedido;
             
             try {
                 const orcamentoRef = doc(db, "orcamentos", newId);
@@ -3412,6 +3743,10 @@ btnLogout.addEventListener('click', handleLogout);
             alert("Não é possível excluir o único orçamento existente.");
             return;
         }
+        if (pedidoEstaConfirmado(orcamentosSalvos[orcamentoAtualId])) {
+            alert('Pedidos confirmados não podem ser excluídos por esta tela. Isso preserva o histórico operacional.');
+            return;
+        }
         if (confirm("Tem certeza que deseja excluir este orçamento? Esta ação não pode ser desfeita.")) {
             try {
                 await deleteDoc(doc(db, "orcamentos", orcamentoAtualId));
@@ -3425,7 +3760,7 @@ btnLogout.addEventListener('click', handleLogout);
         }
     }
 
-    function exportarExcel() {
+    function exportarExcelLegado() {
         const orcamento = orcamentosSalvos[orcamentoAtualId];
         if (!orcamento || (orcamento.itens.length === 0 && orcamento.produtosAcabados.length === 0)) {
             alert("Nenhum item no orçamento para exportar.");
@@ -3465,7 +3800,7 @@ btnLogout.addEventListener('click', handleLogout);
         alert(`Planilha Excel com formatação profissional gerada!\n${Object.keys(dadosProcessados).length} fornecedor(es) processado(s).`);
     }
 
-    function prepararDadosParaExportacao(orcamento) {
+    function prepararDadosParaExportacaoLegado(orcamento) {
         const todosOsItens = [];
         
         // Coletar itens dos produtos acabados
@@ -3537,7 +3872,7 @@ btnLogout.addEventListener('click', handleLogout);
         return itensPorFornecedor;
     }
 
-    function criarWorksheetComFormatacaoAvancada(fornecedor, dadosFornecedor, orcamento) {
+    function criarWorksheetComFormatacaoAvancadaLegado(fornecedor, dadosFornecedor, orcamento) {
         // Calcular prazo de entrega para fornecedor
         function calcularPrazoFornecedor(prazoOriginal) {
             if (!prazoOriginal) return "A definir";
@@ -3767,6 +4102,140 @@ btnLogout.addEventListener('click', handleLogout);
         return worksheet;
     }
     
+    function prepararDadosParaExportacao(orcamento) {
+        return agruparItensPorFornecedor(obterItensDoPedido(orcamento));
+    }
+
+    function criarWorksheetPedidoFornecedor(fornecedor, dadosFornecedor, orcamento, incluirCustos) {
+        const pedido = orcamento.pedido || {};
+        const cliente = pedido.cliente || {};
+        const costureira = pedido.costureira || {};
+        const colunas = incluirCustos
+            ? ['CÓDIGO', 'DESCRIÇÃO', 'UNIDADE', 'QTD SOLICITADA', 'CUSTO UNITÁRIO', 'CUSTO TOTAL']
+            : ['CÓDIGO', 'DESCRIÇÃO', 'UNIDADE', 'QTD SOLICITADA'];
+
+        const dados = [
+            ['PEDIDO AO FORNECEDOR'],
+            ['Pedido', orcamento.id || orcamentoAtualId],
+            ['Fornecedor', fornecedor],
+            ['Cliente', cliente.nome || orcamento.infoGerais?.nomeCliente || 'Não informado'],
+            ['Costureira', costureira.nome || orcamento.infoGerais?.nomeCostureira || 'Não informado'],
+            ['Endereço de entrega', costureira.enderecoEntrega || orcamento.infoGerais?.enderecoCostureira || 'Não informado'],
+            [],
+            colunas
+        ];
+
+        Object.values(dadosFornecedor.itens).forEach(item => {
+            const linha = [
+                item.codigo,
+                item.descricao,
+                item.unidadeMedida,
+                Number(item.quantidadeCompra.toFixed(3))
+            ];
+            if (incluirCustos) {
+                linha.push(
+                    Number(item.precoCompraUnitario.toFixed(2)),
+                    Number(item.custoTotal.toFixed(2))
+                );
+            }
+            dados.push(linha);
+        });
+
+        if (incluirCustos) {
+            dados.push([]);
+            dados.push(['', 'TOTAL', '', '', '', Number(dadosFornecedor.totalCusto.toFixed(2))]);
+        }
+
+        const worksheet = XLSX.utils.aoa_to_sheet(dados);
+        worksheet['!cols'] = incluirCustos
+            ? [{ wch: 18 }, { wch: 58 }, { wch: 18 }, { wch: 18 }, { wch: 18 }, { wch: 18 }]
+            : [{ wch: 18 }, { wch: 68 }, { wch: 18 }, { wch: 18 }];
+
+        const cabecalhoTabela = 7;
+        const totalColunas = colunas.length;
+        worksheet['!merges'] = [
+            { s: { r: 0, c: 0 }, e: { r: 0, c: totalColunas - 1 } }
+        ];
+
+        for (let coluna = 0; coluna < totalColunas; coluna++) {
+            const endereco = XLSX.utils.encode_cell({ r: cabecalhoTabela, c: coluna });
+            if (worksheet[endereco]) {
+                worksheet[endereco].s = {
+                    font: { bold: true, color: { rgb: 'FFFFFF' } },
+                    fill: { fgColor: { rgb: '2E7D32' } },
+                    alignment: { horizontal: 'center' }
+                };
+            }
+        }
+
+        if (worksheet.A1) {
+            worksheet.A1.s = {
+                font: { bold: true, size: 15, color: { rgb: '1B5E20' } },
+                alignment: { horizontal: 'center' }
+            };
+        }
+
+        const inicioItens = cabecalhoTabela + 1;
+        const fimItens = inicioItens + Object.keys(dadosFornecedor.itens).length;
+        for (let linha = inicioItens; linha < fimItens; linha++) {
+            const celulaQuantidade = worksheet[XLSX.utils.encode_cell({ r: linha, c: 3 })];
+            if (celulaQuantidade) celulaQuantidade.z = '0.###';
+            if (incluirCustos) {
+                const custoUnitario = worksheet[XLSX.utils.encode_cell({ r: linha, c: 4 })];
+                const custoTotal = worksheet[XLSX.utils.encode_cell({ r: linha, c: 5 })];
+                if (custoUnitario) custoUnitario.z = 'R$ #,##0.00';
+                if (custoTotal) custoTotal.z = 'R$ #,##0.00';
+            }
+        }
+
+        return worksheet;
+    }
+
+    function normalizarNomeAbaExcel(nome) {
+        const nomeSeguro = String(nome || 'Fornecedor')
+            .replace(/[\\/?*\[\]:]/g, '-')
+            .trim() || 'Fornecedor';
+        return nomeSeguro.substring(0, 31);
+    }
+
+    function exportarExcel() {
+        const orcamento = obterOrcamentoAtual();
+        if (!orcamento || !pedidoEstaConfirmado(orcamento)) {
+            alert('Transforme o orçamento em pedido antes de gerar o relatório para fornecedores.');
+            return;
+        }
+
+        const dadosProcessados = prepararDadosParaExportacao(orcamento);
+        if (Object.keys(dadosProcessados).length === 0) {
+            alert('O pedido confirmado não possui itens para fornecedores.');
+            return;
+        }
+
+        const incluirCustos = document.getElementById('mostrarCustosFornecedor')?.checked === true;
+        const workbook = XLSX.utils.book_new();
+        const nomesUsados = new Set();
+
+        Object.entries(dadosProcessados).forEach(([fornecedor, dadosFornecedor], indice) => {
+            const worksheet = criarWorksheetPedidoFornecedor(
+                fornecedor,
+                dadosFornecedor,
+                orcamento,
+                incluirCustos
+            );
+            let nomeAba = normalizarNomeAbaExcel(fornecedor);
+            if (nomesUsados.has(nomeAba)) {
+                const sufixo = `-${indice + 1}`;
+                nomeAba = `${nomeAba.substring(0, 31 - sufixo.length)}${sufixo}`;
+            }
+            nomesUsados.add(nomeAba);
+            XLSX.utils.book_append_sheet(workbook, worksheet, nomeAba);
+        });
+
+        const dataAtual = new Date().toLocaleDateString('pt-BR').replace(/\//g, '-');
+        XLSX.writeFile(workbook, `Pedido_${orcamento.id || orcamentoAtualId}_${dataAtual}.xlsx`);
+        alert(`Relatório gerado para ${Object.keys(dadosProcessados).length} fornecedor(es).`);
+    }
+
     function alternarOrcamento(id) {
         orcamentoAtualId = id;
         // Não precisa salvar, apenas carregar os dados do novo orçamento selecionado
@@ -3788,7 +4257,8 @@ btnLogout.addEventListener('click', handleLogout);
 
             const nomeBase = orcamento.infoGerais?.nome || `Orçamento ${id}`;
             const nomeCliente = orcamento.infoGerais?.nomeCliente ? ` - ${orcamento.infoGerais.nomeCliente.trim()}` : '';
-            option.textContent = `${nomeBase}${nomeCliente}`;
+            const tipoDocumento = pedidoEstaConfirmado(orcamento) ? '[PEDIDO] ' : '';
+            option.textContent = `${tipoDocumento}${nomeBase}${nomeCliente}`;
 
             seletor.appendChild(option);
         });
@@ -3820,6 +4290,7 @@ btnLogout.addEventListener('click', handleLogout);
             document.getElementById('orcamentoId').textContent = orcamentoAtualId;
             document.getElementById('nomeCliente').value = infoGerais.nomeCliente || '';
             document.getElementById('enderecoCliente').value = infoGerais.enderecoCliente || ''; // CORREÇÃO: Esta linha estava faltando.
+            document.getElementById('tipoCliente').value = infoGerais.tipoCliente || 'cliente';
             document.getElementById('dataOrcamento').value = infoGerais.dataOrcamento || '';
             document.getElementById('prazoValidade').value = infoGerais.prazoValidade || '';
             document.getElementById('prazoEntrega').value = infoGerais.prazoEntrega || '';
@@ -3829,9 +4300,17 @@ btnLogout.addEventListener('click', handleLogout);
             document.getElementById('observacoesComerciais').value = infoComercial.observacoesComerciais || '';
             document.getElementById('dataInstalacao').value = infoGerais.dataInstalacao || '';
             document.getElementById('nomeCostureira').value = infoGerais.nomeCostureira || '';
+            document.getElementById('enderecoCostureira').value = infoGerais.enderecoCostureira || '';
             document.getElementById('nomeInstalador').value = infoGerais.nomeInstalador || '';
+            document.getElementById('descontoGlobal').value = infoComercial.descontoGlobal || 0;
+
+            const apresentacao = orcamento.apresentacao || {};
+            document.getElementById('modoProposta').value = apresentacao.modo || 'reduzida';
+            document.getElementById('mostrarValoresItens').checked = apresentacao.mostrarValoresItens === true;
+            document.getElementById('mostrarCustosFornecedor').checked = apresentacao.mostrarCustosFornecedor === true;
             
             renderizarItensOrcamento();
             atualizarPropostaCliente();
+            atualizarInterfacePedido();
         }
     }
