@@ -38,3 +38,4 @@ node_modules/
 .testdeps/
 tests/artifacts/
 .firebase-cli-config/
+public/

@@ -3,7 +3,7 @@ import { stat } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import { extname, join, normalize } from 'node:path';
 
-const root = process.cwd();
+const root = normalize(join(process.cwd(), process.argv[2] || '.'));
 const port = Number(process.env.TEST_PORT || 4178);
 const contentTypes = {
     '.html': 'text/html; charset=utf-8',

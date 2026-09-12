@@ -36,6 +36,7 @@ test('HTML não mantém manipuladores inline', () => {
 
 test('publicação ignora documentação, testes e arquivos de configuração local', () => {
     const ignorados = firebaseConfig.hosting?.ignore || [];
+    assert.equal(firebaseConfig.hosting?.public, 'public');
     assert.ok(ignorados.includes('docs/**'));
     assert.ok(ignorados.includes('tests/**'));
     assert.ok(ignorados.includes('firebase-config.example.js'));
