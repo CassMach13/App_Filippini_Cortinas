@@ -58,10 +58,21 @@ Critério de aceite: os fluxos principais devem ser executáveis somente com tec
 
 ## Resultado automatizado
 
-- 23 testes unitários e estáticos aprovados.
+- 26 testes unitários e estáticos aprovados.
 - Sintaxe dos módulos JavaScript aprovada.
 - Pacote de Firebase Hosting gerado com 7 arquivos.
 - Smoke test aprovado sobre o pacote final em desktop e celular.
 - Fluxos verificados: login por Enter, mensagens de validação, navegação de abas por teclado, foco e Escape nos modais, busca inteligente, ordenação e ausência de rolagem horizontal da página móvel.
 
-Pendente: validação manual do responsável pelo projeto com uma conta autenticada antes de publicar em produção.
+## Registro da publicação em produção
+
+- Deploy realizado em 12/09/2026 no Firebase Hosting.
+- Versão publicada: `aae1ab2c2c0b1855a1d072108b92d5ce6cca303f`.
+- Integração realizada pelo PR #1.
+- Entrega contemplada: correções de cálculo, duplicação de orçamento, validade da cópia e responsividade da proposta detalhada.
+- 26/26 testes automatizados aprovados.
+- Teste E2E aprovado.
+- Smoke test de produção aprovado, incluindo cálculo, salvamento, duplicação, validade, responsividade, relatórios, congelamento e persistência.
+- Registros fictícios `ORC-11` e `ORC-12`, usados exclusivamente no smoke test, removidos após a validação.
+- Branch `codex/estabilizacao-calculos` removida localmente e do remoto após a integração.
+- O problema local de instalação/caminho do `npm` permanece registrado como questão de ambiente e não afetou esta entrega.
