@@ -5,6 +5,8 @@ import {
     calcularDetalhesItem,
     calcularPrecoFinal,
     calcularTotaisProposta,
+    normalizarUnidadeMedida,
+    validarParametrosProduto,
     validarParametrosItem
 } from '../pricing-domain.js';
 
@@ -60,6 +62,44 @@ test('calcula metro linear e preserva a largura padrão do material', () => {
     assert.equal(resultado.precoUnitario, 18.75);
     assert.equal(resultado.precoTotal, 140.63);
     assert.equal(resultado.calculoTexto, '7.500 metro(s)');
+});
+
+test('normaliza variações legadas de unidades de medida', () => {
+    assert.equal(normalizarUnidadeMedida('MetroLinear'), 'MetroLinear');
+    assert.equal(normalizarUnidadeMedida('Metro Linear'), 'MetroLinear');
+    assert.equal(normalizarUnidadeMedida('metro-linear'), 'MetroLinear');
+    assert.equal(normalizarUnidadeMedida('MetroQuadrado'), 'MetroQuadrado');
+    assert.equal(normalizarUnidadeMedida('Metro Quadrado'), 'MetroQuadrado');
+    assert.equal(normalizarUnidadeMedida('m²'), 'MetroQuadrado');
+});
+
+test('calcula corretamente unidades legadas com espaços', () => {
+    const linear = calcularDetalhesItem(
+        { unidadeMedida: 'Metro Linear', precoCompra: 12, markup: 2, alturaPadrao: 2.8 },
+        2.5,
+        0,
+        0
+    );
+    const quadrado = calcularDetalhesItem(
+        { unidadeMedida: 'Metro Quadrado', precoCompra: 10, markup: 2 },
+        2,
+        3,
+        2
+    );
+
+    assert.equal(linear.quantidadeCompra, 2.5);
+    assert.equal(linear.precoTotal, 60);
+    assert.equal(quadrado.quantidadeCompra, 12);
+    assert.equal(quadrado.precoTotal, 240);
+});
+
+test('rejeita valores financeiros não positivos no cadastro de produto', () => {
+    assert.match(validarParametrosProduto({ precoCompra: 0, markup: 2, unidadeMedida: 'Unidade' }), /preço de compra/i);
+    assert.match(validarParametrosProduto({ precoCompra: -10, markup: 2, unidadeMedida: 'Unidade' }), /preço de compra/i);
+    assert.match(validarParametrosProduto({ precoCompra: 10, markup: 0, unidadeMedida: 'Unidade' }), /markup/i);
+    assert.match(validarParametrosProduto({ precoCompra: 10, markup: -2, unidadeMedida: 'Unidade' }), /markup/i);
+    assert.match(validarParametrosProduto({ precoCompra: 10, markup: 2, unidadeMedida: 'Metro Linear', alturaPadrao: 0 }), /altura padrão/i);
+    assert.equal(validarParametrosProduto({ precoCompra: 10, markup: 2, unidadeMedida: 'Metro Linear', alturaPadrao: 2.8 }), null);
 });
 
 test('calcula metro quadrado multiplicando medidas e peças', () => {

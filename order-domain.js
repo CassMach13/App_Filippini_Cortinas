@@ -7,6 +7,31 @@ export function pedidoEstaConfirmado(orcamento) {
     return orcamento?.statusDocumento === 'pedido' && Boolean(orcamento?.pedido?.confirmadoEm);
 }
 
+export function criarOrcamentoDuplicado(orcamentoOriginal, { novoId, dataOrcamento } = {}) {
+    if (!orcamentoOriginal || typeof orcamentoOriginal !== 'object') {
+        throw new TypeError('O orçamento original é obrigatório para criar uma cópia.');
+    }
+    if (!novoId || !dataOrcamento) {
+        throw new TypeError('O novo ID e a data do orçamento são obrigatórios.');
+    }
+
+    const novoOrcamento = structuredClone(orcamentoOriginal);
+    novoOrcamento.id = novoId;
+    novoOrcamento.infoGerais = {
+        ...(novoOrcamento.infoGerais || {}),
+        nome: `Orçamento ${novoId}`,
+        dataOrcamento,
+        dataInstalacao: '',
+        // A criação normal deixa a validade em branco; a cópia segue a mesma regra
+        // em vez de herdar uma data absoluta que pode já estar vencida.
+        prazoValidade: ''
+    };
+    novoOrcamento.statusDocumento = 'orcamento';
+    delete novoOrcamento.pedido;
+
+    return novoOrcamento;
+}
+
 export function calcularQuantidadeCompraDoItem(item) {
     if (Number.isFinite(Number(item?.quantidadeCompra))) {
         return numeroFinito(item.quantidadeCompra);

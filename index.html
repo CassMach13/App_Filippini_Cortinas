@@ -3,6 +3,12 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="theme-color" content="#2C2C2C">
+    <link rel="icon" href="data:,">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link rel="preconnect" href="https://www.gstatic.com">
+    <link rel="preconnect" href="https://cdnjs.cloudflare.com">
     <title>Sistema de Orçamento - Filippini Cortinas</title>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
     <style>
@@ -21,6 +27,7 @@
             /* AJUSTE 2: Reduz ainda mais o tamanho da fonte base para máxima densidade */
             font-size: 13px;
             padding: 10px;
+            touch-action: manipulation;
         }
 
         #app-container {
@@ -84,6 +91,11 @@
             margin-bottom: 25px;
         }
 
+        .login-box .form-group {
+            margin-bottom: 16px;
+            text-align: left;
+        }
+
         .error-message {
             color: #D32F2F;
             font-size: 14px;
@@ -127,7 +139,12 @@
             cursor: pointer;
             color: #FFFEF7;
             font-weight: bold;
-            transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+            font-family: inherit;
+            font-size: inherit;
+            background: transparent;
+            border: 0;
+            white-space: nowrap;
+            transition: color 0.3s ease, background-color 0.3s ease, transform 0.3s ease;
         }
         
         .tab:hover {
@@ -203,7 +220,7 @@
             border-radius: 8px;
             font-size: 1em;
             background-color: #FFFEF7;
-            transition: all 0.2s ease;
+            transition: border-color 0.2s ease, box-shadow 0.2s ease, background-color 0.2s ease;
             color: #2C2C2C;
         }
         
@@ -256,7 +273,7 @@
             border-radius: 8px;
             cursor: pointer;
             font-weight: 700;
-            transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+            transition: transform 0.3s ease, box-shadow 0.3s ease, background-color 0.3s ease;
             margin-right: 10px;
             font-size: 1em;
             color: #2C2C2C;
@@ -356,6 +373,22 @@
         th:hover {
             background-color: rgba(232, 201, 119, 0.1);
         }
+
+        .sort-button {
+            width: 100%;
+            padding: 0;
+            border: 0;
+            color: inherit;
+            background: transparent;
+            font: inherit;
+            text-align: inherit;
+            cursor: pointer;
+        }
+
+        .sort-button:focus-visible {
+            outline: 3px solid #E8C977;
+            outline-offset: 4px;
+        }
         
         tr:nth-child(even) {
             background-color: #FFFEF7;
@@ -441,6 +474,7 @@
             backdrop-filter: blur(8px);
             padding-top: 60px;
             animation: fadeIn 0.3s;
+            overscroll-behavior: contain;
         }
         
         .modal.active {
@@ -474,6 +508,12 @@
             font-size: 32px;
             font-weight: bold;
             cursor: pointer;
+            width: 44px;
+            height: 44px;
+            border: 0;
+            border-radius: 50%;
+            background: transparent;
+            line-height: 1;
         }
         
         .close-button:hover, .close-button:focus {
@@ -503,6 +543,28 @@
             display: flex;
             gap: 5px;
             justify-content: center;
+        }
+
+        .table-toolbar,
+        .budget-report-actions {
+            display: flex;
+            align-items: center;
+            justify-content: flex-end;
+            gap: 10px;
+            flex-wrap: wrap;
+            margin-bottom: 12px;
+        }
+
+        .checkbox-inline {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            margin: 0;
+            cursor: pointer;
+        }
+
+        .checkbox-inline input {
+            width: auto;
         }
         
         .btn-sm {
@@ -1080,6 +1142,13 @@
             background: rgba(212, 175, 55, 0.1);
         }
 
+        .select-inteligente-item.ativo {
+            color: #2C2C2C;
+            background: rgba(212, 175, 55, 0.22);
+            outline: 2px solid #D4AF37;
+            outline-offset: -2px;
+        }
+
         .select-inteligente-item strong {
             color: #D4AF37;
             font-weight: 700;
@@ -1195,6 +1264,48 @@
             background: rgba(166, 85, 85, 0.45);
         }
 
+        .app-notification {
+            position: fixed;
+            right: 20px;
+            bottom: 20px;
+            z-index: 2000;
+            width: min(420px, calc(100vw - 32px));
+            padding: 14px 18px;
+            border-radius: 10px;
+            border: 1px solid transparent;
+            box-shadow: 0 10px 30px rgba(44, 44, 44, 0.22);
+            color: #2C2C2C;
+            background: #FFFEF7;
+            opacity: 0;
+            transform: translateY(12px);
+            pointer-events: none;
+            transition: opacity 0.2s ease, transform 0.2s ease;
+        }
+
+        .app-notification.visible {
+            opacity: 1;
+            transform: translateY(0);
+            pointer-events: auto;
+        }
+
+        .app-notification-sucesso {
+            color: #1B5E20;
+            background: #E8F5E9;
+            border-color: #6B8E6B;
+        }
+
+        .app-notification-erro {
+            color: #721C24;
+            background: #F8D7DA;
+            border-color: #F5C6CB;
+        }
+
+        .app-notification-info {
+            color: #5E4A00;
+            background: #FFF3CD;
+            border-color: #E8C977;
+        }
+
         /* Ajuste de margem para os botões .btn-sm no header */
         /* Se os botões ficarem muito grudados, esta regra pode ajudar */
         #user-controls .btn-sm {
@@ -1259,33 +1370,221 @@
             margin: 0; /* Remove margem extra se houver */
         }
 
+        @media (max-width: 900px) {
+            body {
+                padding: 0;
+            }
+
+            #app-container {
+                max-width: none;
+            }
+
+            #unified-app-header {
+                padding: 12px;
+            }
+
+            #top-bar-title h1 {
+                font-size: 1.45em;
+                text-wrap: balance;
+            }
+
+            #secondary-nav-bar {
+                align-items: stretch;
+                flex-direction: column;
+                gap: 10px;
+            }
+
+            #main-tabs {
+                width: 100%;
+                overflow-x: auto;
+                overscroll-behavior-x: contain;
+                scrollbar-width: thin;
+            }
+
+            #main-tabs .tab {
+                flex: 0 0 auto;
+                padding: 12px 14px;
+            }
+
+            #user-controls-group {
+                justify-content: space-between;
+                flex-wrap: wrap;
+            }
+
+            .tab-content {
+                padding: 12px;
+            }
+
+            .form-container,
+            .table-container,
+            .card-container {
+                padding: 16px;
+                border-radius: 10px;
+            }
+
+            .budget-control {
+                align-items: stretch;
+                flex-direction: column;
+            }
+
+            .budget-control .btn,
+            .budget-control .form-group,
+            .budget-report-actions {
+                width: 100%;
+                margin-right: 0;
+            }
+
+            .budget-report-actions {
+                align-items: stretch;
+                flex-direction: column;
+            }
+
+            .modal {
+                padding: 12px;
+            }
+
+            .modal-content {
+                width: 100%;
+                max-height: calc(100vh - 24px);
+                padding: 24px 18px;
+                border-radius: 12px;
+            }
+        }
+
+        @media (max-width: 560px) {
+            .login-box {
+                margin: 16px;
+                padding: 28px 20px;
+            }
+
+            .form-group,
+            .form-group-full {
+                flex-basis: 100%;
+                min-width: 0;
+            }
+
+            .form-group .campo-curto,
+            .form-group .campo-medio {
+                max-width: none;
+            }
+
+            .btn {
+                min-height: 44px;
+            }
+
+            .section-title {
+                font-size: 1.45em;
+            }
+
+            .app-notification {
+                right: 16px;
+                bottom: 16px;
+            }
+        }
+
+        @media screen and (max-width: 560px) {
+            .proposta-detalhada,
+            .proposta-detalhada .proposta-info-grid,
+            .proposta-detalhada .proposta-summary,
+            .proposta-detalhada .proposta-footer {
+                max-width: 100%;
+                min-width: 0;
+                overflow-wrap: anywhere;
+            }
+
+            .proposta-detalhada .proposta-info-grid {
+                grid-template-columns: 1fr;
+            }
+
+            .proposta-detalhada .proposta-detalhes-table,
+            .proposta-detalhada .proposta-detalhes-table tbody,
+            .proposta-detalhada .proposta-detalhes-table tr,
+            .proposta-detalhada .proposta-detalhes-table td {
+                display: block;
+                box-sizing: border-box;
+                width: 100% !important;
+                max-width: 100%;
+                min-width: 0;
+            }
+
+            .proposta-detalhada .proposta-detalhes-table thead {
+                display: none;
+            }
+
+            .proposta-detalhada .proposta-detalhes-table tr {
+                padding: 8px 0;
+                border-bottom: 1px solid #E5E5E5;
+            }
+
+            .proposta-detalhada .proposta-detalhes-table td {
+                padding: 3px 0;
+                border: 0;
+                white-space: normal;
+                overflow-wrap: anywhere;
+                text-align: left;
+            }
+
+            .proposta-detalhada .proposta-detalhes-table td::before {
+                display: block;
+                margin-bottom: 1px;
+                color: #666;
+                font-size: 0.78em;
+                font-weight: 600;
+            }
+
+            .proposta-detalhada .proposta-detalhes-table td:nth-child(1)::before { content: 'Componente'; }
+            .proposta-detalhada .proposta-detalhes-table td:nth-child(2)::before { content: 'Descrição'; }
+            .proposta-detalhada .proposta-detalhes-table td:nth-child(3)::before { content: 'Cor'; }
+            .proposta-detalhada .proposta-detalhes-table td:nth-child(4)::before { content: 'U.M.'; }
+            .proposta-detalhada .proposta-detalhes-table td:nth-child(5)::before { content: 'Qtd.'; }
+            .proposta-detalhada .proposta-detalhes-table td:nth-child(6)::before { content: 'Total'; }
+
+            .proposta-detalhada .proposta-detalhes-table .item-value,
+            .proposta-detalhada .proposta-subtotal {
+                text-align: left;
+            }
+        }
+
+        @media (prefers-reduced-motion: reduce) {
+            *,
+            *::before,
+            *::after {
+                scroll-behavior: auto !important;
+                animation-duration: 0.01ms !important;
+                animation-iteration-count: 1 !important;
+                transition-duration: 0.01ms !important;
+            }
+        }
+
     </style>
 </head>
 <body>
 
+    <div id="app-notification" class="app-notification" role="status" aria-live="polite" aria-atomic="true"></div>
+
     <!-- TELA DE LOGIN ATUALIZADA COM NOVAS CLASSES -->
     <div id="login-screen" class="hidden">
-        <div class="login-box">
+        <form id="login-form" class="login-box" novalidate>
             <h1 class="login-title">Filippini Cortinas</h1>
             <p class="login-subtitle">Acesso ao Sistema de Orçamento</p>
             
             <div class="form-group">
                 <label for="login-email">E-mail/Usuário:</label>
-                <input type="email" id="login-email" required placeholder="Insira seu e-mail">
+                <input type="email" id="login-email" name="email" required autocomplete="username" spellcheck="false" placeholder="Insira seu e-mail…">
             </div>
 
             <div class="form-group">
                 <label for="login-password">Senha:</label>
-                <input type="password" id="login-password" required placeholder="Insira sua senha">
+                <input type="password" id="login-password" name="password" required autocomplete="current-password" placeholder="Insira sua senha…">
             </div>
 
             <!-- ID feedbackMessageLogin recebe a classe .error-message para alinhamento -->
-            <div id="feedbackMessageLogin" class="error-message" style="display: none;"></div>
+            <div id="feedbackMessageLogin" class="error-message" role="alert" aria-live="polite" aria-atomic="true" style="display: none;"></div>
 
-            <button id="btn-login" class="btn btn-primary w-full mt-4">
+            <button id="btn-login" class="btn btn-primary w-full mt-4" type="submit">
                 Entrar
             </button>
-        </div>
+        </form>
     </div>
     <div id="app-container"> 
         <header id="unified-app-header">
@@ -1294,11 +1593,11 @@
                 </div>
             
             <nav id="secondary-nav-bar">
-                <div id="main-tabs">
-                    <div id="btn-tab-0" class="tab active">📋 Lista de Preços</div>
-                    <div id="btn-tab-1" class="tab">💰 Lançamento de Orçamento</div>
-                    <div id="btn-tab-2" class="tab">📄 Proposta Cliente</div>
-                    <div id="btn-tab-3" class="tab">⚙️ Configurações</div>
+                <div id="main-tabs" role="tablist" aria-label="Seções do sistema">
+                    <button id="btn-tab-0" class="tab active" type="button" role="tab" aria-selected="true" aria-controls="tab1" tabindex="0"><span aria-hidden="true">📋</span> Lista de Preços</button>
+                    <button id="btn-tab-1" class="tab" type="button" role="tab" aria-selected="false" aria-controls="tab2" tabindex="-1"><span aria-hidden="true">💰</span> Lançamento de Orçamento</button>
+                    <button id="btn-tab-2" class="tab" type="button" role="tab" aria-selected="false" aria-controls="tab3" tabindex="-1"><span aria-hidden="true">📄</span> Proposta Cliente</button>
+                    <button id="btn-tab-3" class="tab" type="button" role="tab" aria-selected="false" aria-controls="tab4" tabindex="-1"><span aria-hidden="true">⚙️</span> Configurações</button>
                 </div>
 
                 <div id="user-controls-group">
@@ -1310,13 +1609,13 @@
             </nav>
         </header>
         
-        <div id="tab1" class="tab-content active">
+        <div id="tab1" class="tab-content active" role="tabpanel" aria-labelledby="btn-tab-0" tabindex="0">
             <div class="form-container">
                 <div class="section-title">Adicionar Produto</div>
                 <div class="form-row">
                     <div class="form-group">
                         <label for="codigo">Código:</label>
-                        <input type="text" id="codigo" name="codigo_produto_field" placeholder="Ex: VOIL-01" required autocomplete="new-password">
+                        <input type="text" id="codigo" name="codigo_produto_field" placeholder="Ex: VOIL-01" required autocomplete="off">
                     </div>
                     <div class="form-group" style="flex: 2;">
                         <label for="descricao">Descrição:</label>
@@ -1346,11 +1645,11 @@
                     </div>
                     <div class="form-group">
                         <label for="precoCompra">Preço de Compra:</label>
-                        <input type="number" id="precoCompra" step="0.01" placeholder="Ex: 28.50" required autocomplete="off">
+                        <input type="number" id="precoCompra" step="0.01" min="0.01" placeholder="Ex: 28.50" required autocomplete="off">
                     </div>
                     <div class="form-group">
                         <label for="markup">Markup:</label>
-                        <input type="number" id="markup" step="0.1" value="2.5" placeholder="Ex: 2.5">
+                        <input type="number" id="markup" step="0.1" min="0.1" value="2.5" placeholder="Ex: 2.5">
                     </div>
                     <div class="form-group">
                         <label for="statusProduto">Status:</label>
@@ -1390,16 +1689,16 @@
                 <table>
                     <thead>
                         <tr>
-                            <th class="coluna-ordenavel" data-coluna="codigo" style="cursor: pointer;">Código</th>
-                            <th class="coluna-ordenavel" data-coluna="descricao" style="cursor: pointer;">Descrição</th>
-                            <th class="coluna-ordenavel" data-coluna="cor" style="cursor: pointer;">Cor</th> 
-                            <th class="coluna-ordenavel" data-coluna="fornecedor" style="cursor: pointer;">Fornecedor</th>
-                            <th class="coluna-ordenavel" data-coluna="categoria" style="cursor: pointer;">Categoria</th>
-                            <th class="coluna-ordenavel" data-coluna="unidadeMedida" style="cursor: pointer;">Unidade de Medida</th>
-                            <th class="coluna-ordenavel" data-coluna="precoCompra" style="cursor: pointer;">Preço Custo</th>
-                            <th class="coluna-ordenavel" data-coluna="markup" style="cursor: pointer;">Margem (%)</th>
-                            <th class="coluna-ordenavel" data-coluna="precoFinal" style="cursor: pointer;">Preço Venda</th>
-                            <th class="coluna-ordenavel" data-coluna="status" style="cursor: pointer;">Status</th>
+                            <th class="coluna-ordenavel" data-coluna="codigo" aria-sort="ascending"><button class="sort-button" type="button">Código</button></th>
+                            <th class="coluna-ordenavel" data-coluna="descricao" aria-sort="none"><button class="sort-button" type="button">Descrição</button></th>
+                            <th class="coluna-ordenavel" data-coluna="cor" aria-sort="none"><button class="sort-button" type="button">Cor</button></th>
+                            <th class="coluna-ordenavel" data-coluna="fornecedor" aria-sort="none"><button class="sort-button" type="button">Fornecedor</button></th>
+                            <th class="coluna-ordenavel" data-coluna="categoria" aria-sort="none"><button class="sort-button" type="button">Categoria</button></th>
+                            <th class="coluna-ordenavel" data-coluna="unidadeMedida" aria-sort="none"><button class="sort-button" type="button">Unidade de Medida</button></th>
+                            <th class="coluna-ordenavel" data-coluna="precoCompra" aria-sort="none"><button class="sort-button" type="button">Preço Custo</button></th>
+                            <th class="coluna-ordenavel" data-coluna="markup" aria-sort="none"><button class="sort-button" type="button">Margem (%)</button></th>
+                            <th class="coluna-ordenavel" data-coluna="precoFinal" aria-sort="none"><button class="sort-button" type="button">Preço Venda</button></th>
+                            <th class="coluna-ordenavel" data-coluna="status" aria-sort="none"><button class="sort-button" type="button">Status</button></th>
                             <th style="width: 100px;">Ações</th>
                         </tr>
                     </thead>
@@ -1410,7 +1709,7 @@
         </div>
 
 
-        <div id="tab2" class="tab-content">
+        <div id="tab2" class="tab-content" role="tabpanel" aria-labelledby="btn-tab-1" tabindex="0">
             <div class="budget-control">
                 <div class="form-group" style="flex: 1;">
                     <label for="seletorOrcamento">Orçamento Atual:</label>
@@ -1421,8 +1720,12 @@
                 <button id="btn-excluir-orcamento" class="btn btn-danger">🗑️ Excluir Orçamento</button>
                 <span id="statusDocumento" class="document-status document-status-orcamento">Orçamento</span>
                 <button id="btn-confirmar-pedido" class="btn btn-success" type="button">✓ Transformar em Pedido</button>
-                <div style="flex: 1; text-align: right;">
-                    <button id="btn-baixar-excel-pedido-ao-fornecedor" class="btn btn-info">⬇️ Exportar Excel Pedido ao Fornecedor </button>
+                <div class="budget-report-actions" style="flex: 1;">
+                    <label for="mostrarCustosFornecedor" class="checkbox-inline">
+                        <input type="checkbox" id="mostrarCustosFornecedor">
+                        <span>Incluir custos no relatório ao fornecedor</span>
+                    </label>
+                    <button id="btn-baixar-excel-pedido-ao-fornecedor" class="btn btn-info" type="button"><span aria-hidden="true">⬇️</span> Exportar Excel Pedido ao Fornecedor</button>
                 </div>
             </div>
 
@@ -1448,7 +1751,7 @@
                 <div class="form-row">
                     <div class="form-group-full">
                         <label for="enderecoCliente">Endereço Cliente:</label>
-                        <input type="text" id="enderecoCliente" name="endereco_cliente_field" placeholder="Endereço Completo" autocomplete="new-password">
+                        <input type="text" id="enderecoCliente" name="endereco_cliente_field" placeholder="Endereço Completo" autocomplete="off">
                     </div>
                 </div>
                 <div class="form-row">
@@ -1473,7 +1776,7 @@
 
                     <div class="form-group">
                         <label for="nomeCostureira">Nome da Costureira:</label>
-                        <input type="text" id="nomeCostureira" name="costureira_field" placeholder="Ex: Maria" class="campo-medio" autocomplete="new-password">
+                        <input type="text" id="nomeCostureira" name="costureira_field" placeholder="Ex: Maria" class="campo-medio" autocomplete="off">
                     </div>
 
                     <div class="form-group" style="flex: 2;">
@@ -1483,7 +1786,7 @@
 
                     <div class="form-group">
                         <label for="nomeInstalador">Nome do Instalador:</label>
-                        <input type="text" id="nomeInstalador" name="instalador_field" placeholder="Ex: João" class="campo-medio" autocomplete="new-password">
+                        <input type="text" id="nomeInstalador" name="instalador_field" placeholder="Ex: João" class="campo-medio" autocomplete="off">
                     </div>
                     <div class="form-group-full">
                         <label for="observacoesGerais">Observações Gerais:</label>
@@ -1497,7 +1800,7 @@
                 <div class="form-row">
                     <div class="form-group" style="flex: 2;">
                         <label for="nomeProdutoAcabado">Nome do Produto Acabado:</label>
-                        <input type="text" id="nomeProdutoAcabado" name="prod_acabado_field" placeholder="Ex: Cortina Sala Completa" autocomplete="new-password">
+                        <input type="text" id="nomeProdutoAcabado" name="prod_acabado_field" placeholder="Ex: Cortina Sala Completa" autocomplete="off">
                     </div>
                     <div class="form-group">
                         <label for="ambienteProdutoAcabado">Ambiente:</label>
@@ -1519,6 +1822,10 @@
             
             <div class="table-container">
                 <div class="section-title">Itens do Orçamento</div>
+                <div class="table-toolbar">
+                    <button id="btn-adicionar-item-avulso" class="btn btn-secondary" type="button"><span aria-hidden="true">➕</span> Adicionar Item Avulso</button>
+                    <button id="btn-limpar-itens-do-orcamento" class="btn btn-danger" type="button">Limpar Itens do Orçamento</button>
+                </div>
                 <table>
                     <thead>
                         <tr>
@@ -1534,11 +1841,7 @@
                             <th>Ações</th>
                         </tr>
                     </thead>
-                    <tbody id="tabelaOrcamento">
-                        <!-- Botão para adicionar item avulso -->
-                        <button id="btn-adicionar-item-avulso" class="btn btn-secondary" style="margin: 10px 0;">➕ Adicionar Item Avulso</button>
-                        <button id="btn-limpar-itens-do-orcamento" class="btn btn-danger" style="margin: 10px 0;" type="button">Limpar Itens do Orçamento</button>
-                    </tbody>
+                    <tbody id="tabelaOrcamento"></tbody>
                 </table>
             </div>
             <div class="card-container">
@@ -1548,7 +1851,7 @@
             </div>
         </div>
         
-        <div id="tab3" class="tab-content">
+        <div id="tab3" class="tab-content" role="tabpanel" aria-labelledby="btn-tab-2" tabindex="0">
             <div class="card-container">
                 <div class="section-title">Proposta Final para o Cliente</div>
 
@@ -1607,12 +1910,6 @@
                                 <span>Mostrar valores por item</span>
                             </label>
                         </div>
-                        <div class="form-group" style="flex: initial;">
-                            <label for="mostrarCustosFornecedor" style="display: flex; align-items: center; gap: 8px; cursor: pointer;">
-                                <input type="checkbox" id="mostrarCustosFornecedor">
-                                <span>Mostrar custos no pedido ao fornecedor</span>
-                            </label>
-                        </div>
                     </div>
                 </div>
                 
@@ -1621,7 +1918,7 @@
             </div>
         </div>
         
-        <div id="tab4" class="tab-content">
+        <div id="tab4" class="tab-content" role="tabpanel" aria-labelledby="btn-tab-3" tabindex="0">
             <div class="card-container">
                 <div class="section-title">Gerenciar Fornecedores</div>
                 <p>Gerencie a lista de fornecedores. Os fornecedores aqui listados aparecerão na aba "Lista de Preços".</p>
@@ -1659,13 +1956,13 @@
                 <!-- A funcionalidade de Limpeza do Sistema foi removida por segurança, pois apaga todos os dados do Firebase permanentemente. -->
             </div>
     </div>
-            <div id="modalGerenciarFornecedores" class="modal">
+            <div id="modalGerenciarFornecedores" class="modal" role="dialog" aria-modal="true">
                 <div class="modal-content">
-                    <span id="btn-fechar-gerenciar-fornecedores" class="close-button">&times;</span>
+                    <button id="btn-fechar-gerenciar-fornecedores" class="close-button" type="button" aria-label="Fechar janela">&times;</button>
                     <h2>Gerenciar Fornecedores</h2>
                     <div class="form-row">
                         <div class="form-group" style="flex: 2;">
-                            <input type="text" id="novoFornecedorModal" placeholder="Novo Fornecedor">
+                            <input type="text" id="novoFornecedorModal" aria-label="Novo fornecedor" placeholder="Novo fornecedor…">
                         </div>
                         <div class="form-group">
                             <button id="btn-adicionar-fornecedor-modal" class="btn btn-primary" type="button">Adicionar</button>
@@ -1674,13 +1971,13 @@
                     <ul id="listaFornecedoresModal" style="list-style: none;"></ul>
                 </div>
             </div>   
-            <div id="modalGerenciarCategorias" class="modal">
+            <div id="modalGerenciarCategorias" class="modal" role="dialog" aria-modal="true">
                 <div class="modal-content">
-                    <span id="btn-fechar-gerenciar-categorias" class="close-button">&times;</span>
+                    <button id="btn-fechar-gerenciar-categorias" class="close-button" type="button" aria-label="Fechar janela">&times;</button>
                     <h2>Gerenciar Categorias</h2>
                     <div class="form-row">
                         <div class="form-group" style="flex: 2;">
-                            <input type="text" id="novaCategoriaModal" placeholder="Nova Categoria">
+                            <input type="text" id="novaCategoriaModal" aria-label="Nova categoria" placeholder="Nova categoria…">
                         </div>
                         <div class="form-group">
                             <button id="btn-adicionar-categoria-modal" class="btn btn-primary" type="button">Adicionar</button>
@@ -1689,9 +1986,9 @@
                     <ul id="listaCategoriasModal" style="list-style: none;"></ul>
                 </div>
             </div>
-            <div id="modalCSVPreview" class="modal">
+            <div id="modalCSVPreview" class="modal" role="dialog" aria-modal="true">
                 <div class="modal-content" style="max-width: 1200px;">
-                    <span id="btn-fechar-preview-csv" class="close-button">&times;</span>
+                    <button id="btn-fechar-preview-csv" class="close-button" type="button" aria-label="Fechar janela">&times;</button>
                     <h2>Preview da Importação CSV</h2>
                     <p>Verifique os dados abaixo. Linhas com erros estão marcadas em vermelho. Você pode editar os campos diretamente na tabela para corrigi-los antes de importar.</p>
                     <div id="csvValidationSummary" class="import-status" style="margin-bottom: 15px; text-align: left; display: none;"></div>
@@ -1708,9 +2005,9 @@
                     </div>
                 </div>
             </div>
-            <div id="modalEdicaoProdutoAcabado" class="modal" style="display: none;">
+            <div id="modalEdicaoProdutoAcabado" class="modal" role="dialog" aria-modal="true">
                 <div class="modal-content" style="max-width: 600px;">
-                    <span id="btn-fechar-edicao-produto-acabado" class="close-button">&times;</span>
+                    <button id="btn-fechar-edicao-produto-acabado" class="close-button" type="button" aria-label="Fechar janela">&times;</button>
                     <h2>Editar Produto Acabado</h2>
                     
                     <input type="hidden" id="edicaoProdutoAcabadoId">
@@ -1747,9 +2044,9 @@
             </div>
 
             <!-- NOVO MODAL PARA ADICIONAR ITEM -->
-            <div id="modalAdicionarItem" class="modal">
+            <div id="modalAdicionarItem" class="modal" role="dialog" aria-modal="true">
                 <div class="modal-content" style="max-width: 800px;">
-                    <span id="btn-fechar-adicionar-item" class="close-button">&times;</span>
+                    <button id="btn-fechar-adicionar-item" class="close-button" type="button" aria-label="Fechar janela">&times;</button>
                     <h2 id="modalAdicionarItemTitle">Adicionar Item</h2>
                     
                     <input type="hidden" id="addProdutoAcabadoId">
@@ -1769,7 +2066,7 @@
                         </div>
                         <div class="form-group" style="flex: 2;">
                             <label for="codigoOrcamento">Buscar Item (Código, Descrição, etc.):</label>
-                            <input id="codigoOrcamento" name="busca_item_field" placeholder="Digite para buscar" autocomplete="new-password">
+                            <input id="codigoOrcamento" name="busca_item_field" placeholder="Digite para buscar" autocomplete="off">
                         </div>
                     </div>
                     <div class="form-row">
@@ -1803,9 +2100,9 @@
                 </div>
             </div>
 
-            <div id="modalEdicaoItem" class="modal">
+            <div id="modalEdicaoItem" class="modal" role="dialog" aria-modal="true">
                 <div class="modal-content" style="max-width: 800px;">
-                    <span id="btn-fechar-edicao-item" class="close-button">&times;</span>
+                    <button id="btn-fechar-edicao-item" class="close-button" type="button" aria-label="Fechar janela">&times;</button>
                     <h2>Editar Item do Orçamento</h2>
                     
                     <input type="hidden" id="edicaoItemId">
@@ -1859,9 +2156,9 @@
                     </div>
                 </div>
             </div>
-            <div id="modalEdicaoProduto" class="modal">
+            <div id="modalEdicaoProduto" class="modal" role="dialog" aria-modal="true">
                 <div class="modal-content" style="max-width: 800px;">
-                    <span id="btn-fechar-edicao-produto" class="close-button">&times;</span>
+                    <button id="btn-fechar-edicao-produto" class="close-button" type="button" aria-label="Fechar janela">&times;</button>
                     <h2 class="section-title" style="margin-top: 0;">Editar Produto</h2>
                     
                     <input type="hidden" id="edicaoCodigoProdutoHidden">
@@ -1921,9 +2218,9 @@
                     </div>
                 </div>
             </div>
-            <div id="modalEdicaoFornecedor" class="modal">
+            <div id="modalEdicaoFornecedor" class="modal" role="dialog" aria-modal="true">
                 <div class="modal-content" style="max-width: 450px;">
-                    <span id="btn-fechar-edicao-fornecedor" class="close-button">&times;</span>
+                    <button id="btn-fechar-edicao-fornecedor" class="close-button" type="button" aria-label="Fechar janela">&times;</button>
                     <h2 class="section-title" style="margin-top: 0;">Editar Fornecedor</h2>
                     
                     <input type="hidden" id="edicaoFornecedorNomeAntigo">
@@ -1939,9 +2236,9 @@
                     </div>
                 </div>
             </div>
-            <div id="modalEdicaoCategoria" class="modal">
+            <div id="modalEdicaoCategoria" class="modal" role="dialog" aria-modal="true">
                 <div class="modal-content" style="max-width: 450px;">
-                    <span id="btn-fechar-edicao-categoria" class="close-button" >&times;</span>
+                    <button id="btn-fechar-edicao-categoria" class="close-button" type="button" aria-label="Fechar janela">&times;</button>
                     <h2 class="section-title" style="margin-top: 0;">Editar Categoria</h2>
                     
                     <input type="hidden" id="edicaoCategoriaNomeAntigo">
@@ -1957,13 +2254,13 @@
                     </div>
                 </div>
             </div>
-            <div id="modalGerenciarUnidadesMedida" class="modal">
+            <div id="modalGerenciarUnidadesMedida" class="modal" role="dialog" aria-modal="true">
                 <div class="modal-content">
-                    <span id="btn-fechar-gerenciar-unidades" class="close-button">&times;</span>
+                    <button id="btn-fechar-gerenciar-unidades" class="close-button" type="button" aria-label="Fechar janela">&times;</button>
                     <h2>Gerenciar Unidades de Medida</h2>
                     <div class="form-row">
                         <div class="form-group" style="flex: 2;">
-                            <input type="text" id="novaUnidadeMedidaModal" placeholder="Nova Unidade de Medida">
+                            <input type="text" id="novaUnidadeMedidaModal" aria-label="Nova unidade de medida" placeholder="Nova unidade de medida…">
                         </div>
                         <div class="form-group">
                             <button id="btn-adicionar-unidade-modal" class="btn btn-primary" type="button">Adicionar</button>
@@ -1973,9 +2270,9 @@
                 </div>
             </div>
 
-            <div id="modalEdicaoUnidadeMedida" class="modal">
+            <div id="modalEdicaoUnidadeMedida" class="modal" role="dialog" aria-modal="true">
                 <div class="modal-content" style="max-width: 450px;">
-                    <span id="btn-fechar-edicao-unidade" class="close-button">&times;</span>
+                    <button id="btn-fechar-edicao-unidade" class="close-button" type="button" aria-label="Fechar janela">&times;</button>
                     <h2 class="section-title" style="margin-top: 0;">Editar Unidade de Medida</h2>
                     
                     <input type="hidden" id="edicaoUnidadeMedidaNomeAntigo">

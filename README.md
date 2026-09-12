@@ -54,6 +54,9 @@ cp firebase-config.example.js firebase-config.js
 5. Sirva a pasta na raiz do projeto (não abra o HTML como `file://`):
 
 ```bash
+# Node.js, sem instalar pacotes
+node tests/static_server.mjs .
+
 # Python 3
 python -m http.server 4177 --bind 127.0.0.1
 
@@ -61,7 +64,7 @@ python -m http.server 4177 --bind 127.0.0.1
 npx --yes serve .
 ```
 
-6. Acesse `http://127.0.0.1:4177/`
+6. Acesse `http://127.0.0.1:4178/` ao usar o servidor Node.js, ou `http://127.0.0.1:4177/` nas demais opções.
 
 > `firebase-config.js` **não** é versionado (está no `.gitignore`). Só o `firebase-config.example.js` vai para o Git.
 

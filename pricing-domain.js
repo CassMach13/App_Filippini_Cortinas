@@ -12,6 +12,33 @@ export function calcularPrecoFinal(precoCompra, markup) {
     return numeroFinito(precoCompra) * numeroFinito(markup);
 }
 
+export function normalizarUnidadeMedida(unidadeMedida) {
+    const valorOriginal = String(unidadeMedida || '').trim();
+    const valorNormalizado = valorOriginal
+        .normalize('NFD')
+        .replace(/[\u0300-\u036f]/g, '')
+        .replace(/²/g, '2')
+        .replace(/[^a-zA-Z0-9]/g, '')
+        .toLowerCase();
+
+    if (['metrolinear', 'ml'].includes(valorNormalizado)) return 'MetroLinear';
+    if (['metroquadrado', 'm2'].includes(valorNormalizado)) return 'MetroQuadrado';
+    if (['unidade', 'un'].includes(valorNormalizado)) return 'Unidade';
+
+    return valorOriginal || 'Unidade';
+}
+
+export function validarParametrosProduto({ precoCompra, markup, unidadeMedida, alturaPadrao }) {
+    if (numeroFinito(precoCompra) <= 0) return 'O preço de compra deve ser maior que zero.';
+    if (numeroFinito(markup) <= 0) return 'O markup deve ser maior que zero.';
+
+    if (normalizarUnidadeMedida(unidadeMedida) === 'MetroLinear' && numeroFinito(alturaPadrao) <= 0) {
+        return 'A altura padrão deve ser maior que zero para produtos em metro linear.';
+    }
+
+    return null;
+}
+
 export function calcularTotaisProposta({
     subtotalProdutos,
     margemProdutos,
@@ -44,7 +71,7 @@ export function validarParametrosItem(produtoBase, quantidade, largura, altura) 
     if (!produtoBase) return 'Produto não encontrado.';
     if (numeroFinito(quantidade) <= 0) return 'A quantidade deve ser um número maior que zero.';
 
-    if (produtoBase.unidadeMedida === 'MetroQuadrado') {
+    if (normalizarUnidadeMedida(produtoBase.unidadeMedida) === 'MetroQuadrado') {
         if (numeroFinito(largura) <= 0 || numeroFinito(altura) <= 0) {
             return "Largura e altura são obrigatórias e devem ser maiores que zero para produtos em metro quadrado.";
         }
@@ -63,7 +90,7 @@ export function calcularDetalhesItem(produtoBase, quantidade, largura, altura, t
     let alturaSalva = null;
     let calculoTexto = '';
 
-    switch (produtoBase?.unidadeMedida) {
+    switch (normalizarUnidadeMedida(produtoBase?.unidadeMedida)) {
         case 'MetroLinear':
             quantidadeCompra = quantidadeNumerica;
             alturaSalva = produtoBase.alturaPadrao ?? null;

@@ -4,10 +4,35 @@ import assert from 'node:assert/strict';
 import {
     agruparItensPorFornecedor,
     calcularQuantidadeCompraDoItem,
+    criarOrcamentoDuplicado,
     criarSnapshotPedido,
     obterItensDoPedido,
     pedidoEstaConfirmado
 } from '../order-domain.js';
+
+test('duplicação atualiza a data e não herda uma validade absoluta vencida', () => {
+    const original = criarOrcamentoExemplo();
+    original.statusDocumento = 'pedido';
+    original.pedido = { confirmadoEm: '2025-01-01T12:00:00.000Z' };
+    original.infoGerais.nome = 'Orçamento ORC-10';
+    original.infoGerais.dataOrcamento = '2025-01-01';
+    original.infoGerais.prazoValidade = '2025-01-15';
+    original.infoGerais.dataInstalacao = '2025-02-01';
+
+    const copia = criarOrcamentoDuplicado(original, {
+        novoId: 'ORC-11',
+        dataOrcamento: '2026-09-12'
+    });
+
+    assert.equal(copia.id, 'ORC-11');
+    assert.equal(copia.infoGerais.nome, 'Orçamento ORC-11');
+    assert.equal(copia.infoGerais.dataOrcamento, '2026-09-12');
+    assert.equal(copia.infoGerais.prazoValidade, '');
+    assert.equal(copia.infoGerais.dataInstalacao, '');
+    assert.equal(copia.statusDocumento, 'orcamento');
+    assert.equal(copia.pedido, undefined);
+    assert.equal(original.infoGerais.prazoValidade, '2025-01-15');
+});
 
 function criarOrcamentoExemplo() {
     return {
