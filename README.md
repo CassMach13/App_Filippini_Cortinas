@@ -74,6 +74,7 @@ firebase-config.example.js # Modelo de configuração (copie para firebase-confi
 firebase.json              # Configuração Firebase Hosting
 firestore.rules            # Regras autenticadas do banco
 order-domain.js            # Regras puras de confirmação e congelamento do pedido
+pricing-domain.js          # Regras puras de preço, quantidade, comissão, desconto e margem
 tests/                     # Testes de domínio, integridade e navegador
 404.html                   # Página de erro do hosting
 ```

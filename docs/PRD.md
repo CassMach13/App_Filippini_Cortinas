@@ -4,14 +4,14 @@
 
 | Campo | Valor |
 | --- | --- |
-| Status | Rascunho para descoberta e validação |
-| Versão | 0.2 |
+| Status | Em evolução, com entregas pendentes de validação operacional |
+| Versão | 0.3 |
 | Última atualização | 12 de setembro de 2026 |
 | Responsável pelo produto | A definir |
 | Aprovadores | A definir |
 | Próxima revisão | Após a resposta às dúvidas do levantamento de 29 de agosto de 2026 |
 
-Este documento estabelece uma base única para registrar o problema, as regras de negócio, o escopo, os critérios de aceite e as decisões do Sistema de Orçamentos Filippini Cortinas. A versão atual descreve o produto existente e organiza as perguntas que precisam ser respondidas antes da priorização. Nenhuma funcionalidade candidata deste PRD está aprovada para desenvolvimento.
+Este documento estabelece uma base única para registrar o problema, as regras de negócio, o escopo, os critérios de aceite e as decisões do Sistema de Orçamentos Filippini Cortinas. Os requisitos FR 011 a FR 017 foram implementados e aguardam validação operacional conjunta; os demais continuam candidatos até aprovação específica.
 
 ## 1 Resumo do produto
 
@@ -84,7 +84,7 @@ Os papéis, permissões e a possibilidade de uma mesma pessoa exercer mais de um
 | Proposta | Resumo, detalhamento opcional, condições comerciais e impressão | Existente |
 | Operação | Instruções ao instalador e pedido Excel por fornecedor | Existente |
 | Persistência | Firestore com listeners em tempo real | Existente, requer reforço de integridade |
-| Backup | Exportação JSON | Parcial e ainda não confiável para restauração |
+| Backup | Exportação JSON e restauração por mesclagem em lotes | Implementado, pendente de teste periódico de recuperação |
 
 ## 8 Fluxo principal atual
 
@@ -189,13 +189,13 @@ Os itens abaixo são candidatos para discussão e não representam compromisso d
 | FR 008 | Relatórios gerenciais | Exibir métricas homologadas de vendas, margem e conversão | A definir | A validar |
 | FR 009 | Experiência móvel | Permitir consulta e operação dos fluxos prioritários em telas menores | A definir | A validar |
 | FR 010 | Backup e restauração | Recuperar todos os dados com validação, prévia e auditoria | Alta | Necessidade confirmada, solução a definir |
-| FR 011 | Proposta compacta | Reduzir drasticamente o número de páginas com modos reduzido e detalhado | Alta | Necessidade confirmada, solução a detalhar |
-| FR 012 | Transformar orçamento em pedido | Alterar formalmente o estado e registrar a confirmação comercial | Alta | Necessidade confirmada, regras a detalhar |
-| FR 013 | Congelamento do pedido | Impedir que mudanças futuras no catálogo alterem itens e custos confirmados | Alta | Regra confirmada, exceções a definir |
-| FR 014 | Pedido simplificado ao fornecedor | Exibir apenas identificação operacional, entrega e itens necessários | Alta | Necessidade confirmada, campos finais a validar |
-| FR 015 | Relação para o instalador | Informar cliente, endereço e itens a retirar na confecção | Alta | Necessidade confirmada, campos finais a validar |
-| FR 016 | Visibilidade de custos | Permitir gerar a saída com ou sem custos, conforme destinatário e permissão | Alta | Necessidade confirmada, padrão a definir |
-| FR 017 | Observações junto ao produto | Apresentar a observação específica no bloco do produto correspondente | Média | Interpretação das anotações, a confirmar |
+| FR 011 | Proposta compacta | Reduzir drasticamente o número de páginas com modos reduzido e detalhado | Alta | Implementado, pendente de validação operacional |
+| FR 012 | Transformar orçamento em pedido | Alterar formalmente o estado e registrar a confirmação comercial | Alta | Implementado, pendente de validação operacional |
+| FR 013 | Congelamento do pedido | Impedir que mudanças futuras no catálogo alterem itens e custos confirmados | Alta | Implementado, exceções ainda a definir |
+| FR 014 | Pedido simplificado ao fornecedor | Exibir apenas identificação operacional, entrega e itens necessários | Alta | Implementado, campos finais a validar |
+| FR 015 | Relação para o instalador | Informar cliente, endereço e itens a retirar na confecção | Alta | Implementado, campos finais a validar |
+| FR 016 | Visibilidade de custos | Permitir gerar a saída com ou sem custos, conforme destinatário e permissão | Alta | Implementado com custos ocultos por padrão |
+| FR 017 | Observações junto ao produto | Apresentar a observação específica no bloco do produto correspondente | Média | Implementado, pendente de validação operacional |
 
 ## 11 Modelo conceitual de dados
 
@@ -379,3 +379,4 @@ Cada requisito aprovado deve conter critérios verificáveis no formato Dado Qua
 | --- | --- | --- | --- | --- |
 | 0.1 | 12 de setembro de 2026 | Criação do PRD-base a partir do produto e da documentação existentes | Codex | Pendente |
 | 0.2 | 12 de setembro de 2026 | Incorporação do feedback, das anotações e das referências visuais recebidas em 29 de agosto de 2026 | Codex | Pendente |
+| 0.3 | 12 de setembro de 2026 | Registro da implementação dos pedidos confirmados, relatórios compactos, restauração por mesclagem e módulo financeiro coberto por testes | Codex | Validação operacional pendente |

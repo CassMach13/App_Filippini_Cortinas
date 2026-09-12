@@ -12,6 +12,13 @@ import {
     obterItensDoPedido,
     pedidoEstaConfirmado
 } from './order-domain.js';
+import {
+    arredondamentoFinanceiro,
+    calcularDetalhesItem,
+    calcularPrecoFinal,
+    calcularTotaisProposta,
+    validarParametrosItem
+} from './pricing-domain.js';
 
 // --- 2. REFERÊNCIAS DO DOM (Elementos da Página) ---
 const loginScreen = document.getElementById('login-screen');
@@ -950,13 +957,9 @@ btnLogout.addEventListener('click', handleLogout);
         const largura = parseFloat(document.getElementById('largura').value) || 0;
         const altura = parseFloat(document.getElementById('altura').value) || 0;
 
-        // Validações
-        if (produtoBase.unidadeMedida !== 'MetroQuadrado' && (isNaN(quantidade) || quantidade <= 0)) {
-            alert("A quantidade deve ser um número maior que zero para esta unidade de medida.");
-            return;
-        }
-        if (produtoBase.unidadeMedida === 'MetroQuadrado' && (isNaN(largura) || largura <= 0 || isNaN(altura) || altura <= 0)) {
-            alert("Largura e Altura são obrigatórias para produtos 'Metro Quadrado'.");
+        const erroValidacao = validarParametrosItem(produtoBase, quantidade, largura, altura);
+        if (erroValidacao) {
+            alert(erroValidacao);
             return;
         }
 
@@ -1253,18 +1256,16 @@ btnLogout.addEventListener('click', handleLogout);
         
         const subtotal = orcamento.totais?.totalProdutos || 0;
         const totalMargemOriginal = orcamento.totais?.totalMargemProposta || 0;
-        
-        const descontoValor = subtotal * (descontoGlobal / 100);
-        const totalComDesconto = subtotal - descontoValor;
-        const margemComDesconto = totalMargemOriginal - descontoValor;
-
-        let margemComDescontoPercentual;
-        if (totalComDesconto > 0) {
-            margemComDescontoPercentual = (margemComDesconto / totalComDesconto) * 100;
-        } else {
-            // Se o total com desconto for zero ou negativo (desconto de 100% ou mais), a margem é -100% do custo.
-            margemComDescontoPercentual = -100;
-        }
+        const totalInstalacaoGeral = orcamento.totais?.totalInstalacao || 0;
+        const totaisProposta = calcularTotaisProposta({
+            subtotalProdutos: subtotal,
+            margemProdutos: totalMargemOriginal,
+            totalInstalacao: totalInstalacaoGeral,
+            descontoPercentual: descontoGlobal
+        });
+        const descontoValor = totaisProposta.descontoValor;
+        const totalComDesconto = totaisProposta.totalProdutos;
+        const margemComDescontoPercentual = totaisProposta.margemPercentual;
         
         document.getElementById('margemComDesconto').textContent = `${truncarDecimal(margemComDescontoPercentual, 2)}%`;
 
@@ -1311,8 +1312,7 @@ btnLogout.addEventListener('click', handleLogout);
 
         html += `</tbody></table>`;
 
-        const totalInstalacaoGeral = orcamento.totais?.totalInstalacao || 0;
-        const totalFinalGeral = totalComDesconto + totalInstalacaoGeral;
+        const totalFinalGeral = totaisProposta.totalGeral;
 
         html += `
             <div class="proposta-summary">
@@ -1540,12 +1540,9 @@ btnLogout.addEventListener('click', handleLogout);
         const largura = parseFloat(document.getElementById('edicaoLarguraItem').value) || 0;
         const altura = parseFloat(document.getElementById('edicaoAlturaItem').value) || 0;
 
-        if (isNaN(quantidade) || quantidade <= 0) {
-            alert("A quantidade deve ser um número maior que zero para esta unidade de medida.");
-            return;
-        }
-        if (produtoBase.unidadeMedida === 'MetroQuadrado' && (isNaN(largura) || largura <= 0 || isNaN(altura) || altura <= 0)) {
-            alert("Largura e Altura são obrigatórias e devem ser maiores que zero para produtos 'Metro Quadrado'.");
+        const erroValidacao = validarParametrosItem(produtoBase, quantidade, largura, altura);
+        if (erroValidacao) {
+            alert(erroValidacao);
             return;           
         }
 
@@ -1824,83 +1821,6 @@ btnLogout.addEventListener('click', handleLogout);
         };
 
         window.print();
-    }
-
-    /** 
-     * SOLUÇÃO DEFINITIVA: Função de arredondamento financeiro robusta.
-     * Usa um método que evita erros de ponto flutuante do JavaScript.
-     * Ex: 58.095 será corretamente arredondado para 58.10.
-     * @param {number} num O número a ser arredondado.
-     * @param {number} casasDecimais O número de casas decimais.
-     * @returns {number} O número arredondado.
-    */
-    function arredondamentoFinanceiro(num, casasDecimais = 2) {
-        const fator = Math.pow(10, casasDecimais);
-        return Math.round((num + Number.EPSILON) * fator) / fator;
-    }
-
-
-    /**
-     * NOVA ABORDAGEM: Função Centralizada de Cálculo.
-     * Esta função é a única fonte da verdade para todos os cálculos de um item.
-     * @param {object} produtoBase - O objeto do produto da lista de preços.
-     * @param {number} quantidade - A quantidade de peças/cortes.
-     * @param {number} largura - A largura (para Metro Quadrado).
-     * @param {number} altura - A altura (para Metro Quadrado).
-     * @param {string} tipoCliente - 'cliente' ou 'arquiteto'.
-     * @returns {object} Um objeto com todos os detalhes calculados do item.
-     */
-    function calcularDetalhesItem(produtoBase, quantidade, largura, altura, tipoCliente) {
-        let quantidadeCompra = 0; // Quantidade final para cálculo de preço (ex: metros, m², unidades)
-        let larguraSalva = null;
-        let calculoTexto = ''; // NOVO: Adicionado para consistência
-        let alturaSalva = null;
-
-        switch (produtoBase.unidadeMedida) {
-            case 'MetroLinear':
-                quantidadeCompra = quantidade; // Quantidade é em metros
-                alturaSalva = produtoBase.alturaPadrao || null; // A "largura do material" é salva como altura do item
-                calculoTexto = `${quantidade.toFixed(3)} metro(s)`;
-                break;
-            case 'MetroQuadrado':
-                // Para M², a quantidade de compra é a área. A quantidade de peças é sempre 1.
-                quantidadeCompra = largura * altura * quantidade; // Área (largura x altura) multiplicada pela quantidade de peças.
-                larguraSalva = largura;
-                alturaSalva = altura;
-                calculoTexto = `(${largura}m x ${altura}m) x ${quantidade} pç(s) = ${quantidadeCompra.toFixed(2)}m²`;
-                break;
-            default: // 'Unidade'
-                quantidadeCompra = quantidade;
-                calculoTexto = `${quantidade} unidade(s)`;
-                break; 
-        }
-
-        // PASSO 1: Calcular o preço unitário base com precisão total.
-        const precoUnitarioBase = calcularPrecoFinal(produtoBase.precoCompra, produtoBase.markup);
-
-        // PASSO 2: Aplicar comissão (se houver) e neutralizar imprecisões de ponto flutuante.
-        const precoUnitarioComComissao = tipoCliente === 'arquiteto' ? precoUnitarioBase * 1.10 : precoUnitarioBase;
-        
-        // ARREDONDAMENTO CORRIGIDO: Usa a função de arredondamento financeiro robusta.
-        // Isso garante que 58.095 se torne 58.10.
-        const precoUnitarioFinal = arredondamentoFinanceiro(precoUnitarioComComissao, 2);
-
-        // PASSO 3: Calcular o preço total usando o preço unitário final já com a regra de negócio.
-        // CORREÇÃO: O cálculo do total também deve ser arredondado para evitar imprecisões.
-        const precoTotalBruto = arredondamentoFinanceiro(precoUnitarioFinal * quantidadeCompra, 2); // Ex: 58.10 * 7.5 = 435.75
-        const precoTotal = parseFloat(precoTotalBruto.toFixed(2));
-
-        // PASSO 4: Calcular custo, comissão e margem.
-        const custoReal = produtoBase.precoCompra * quantidadeCompra;
-        // A comissão é calculada sobre o preço base, antes do arredondamento final, para maior precisão.
-        const valorComissao = tipoCliente === 'arquiteto' ? (precoUnitarioBase * 0.10 * quantidadeCompra) : 0;
-        const margemLiquida = precoTotal - custoReal - valorComissao;
-        const margemPercentual = precoTotal > 0 ? (margemLiquida / precoTotal) * 100 : 0;
-
-        return {
-            quantidadeCompra, larguraSalva, alturaSalva, precoUnitario: precoUnitarioFinal,
-            precoTotal, custoReal, valorComissao, margemLiquida, margemPercentual, calculoTexto
-        };
     }
 
     async function recalcularComissao() {
@@ -2293,11 +2213,6 @@ btnLogout.addEventListener('click', handleLogout);
         // 4. Usa toFixed() apenas para garantir que haverá as 'casas' decimais, 
         // preenchendo com zeros se necessário (ex: 37.98 vira "37.98").
         return valorTruncado.toFixed(casas);
-    }
-
-    // Funções da aba de Preços
-    function calcularPrecoFinal(precoCompra, markup) {
-        return parseFloat(precoCompra) * parseFloat(markup);
     }
 
     async function adicionarPreco() {

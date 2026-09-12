@@ -9,6 +9,7 @@ const filesToPublish = [
     '404.html',
     'apps.js',
     'order-domain.js',
+    'pricing-domain.js',
     'firebase-config.js',
     'WhatsApp Image 2025-09-17 at 16.56.26.jpeg'
 ];
