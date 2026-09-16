@@ -124,6 +124,67 @@ test('contatos usam campo de telefone e links de WhatsApp seguros', () => {
     assert.match(appSource, /target="_blank" rel="noopener noreferrer"/);
 });
 
+function converterFontePadraoEmRegExp(fonte) {
+    // Suporte mínimo à sintaxe de "source" do Firebase Hosting usada neste projeto:
+    // "**" (qualquer sequência, inclusive vazia e com barras), "*" (qualquer sequência sem barra)
+    // e grupos de alternância no estilo extglob "@(a|b)".
+    let regexTexto = '';
+    for (let indice = 0; indice < fonte.length; indice++) {
+        const caractere = fonte[indice];
+        if (fonte.startsWith('**', indice)) {
+            regexTexto += '.*';
+            indice++;
+        } else if (caractere === '*') {
+            regexTexto += '[^/]*';
+        } else if (fonte.startsWith('@(', indice)) {
+            const fim = fonte.indexOf(')', indice);
+            const alternativas = fonte.slice(indice + 2, fim).split('|')
+                .map(alternativa => alternativa.replace(/[.*+?^${}()|[\]\\]/g, String.raw`\$&`));
+            regexTexto += `(?:${alternativas.join('|')})`;
+            indice = fim;
+        } else {
+            regexTexto += caractere.replace(/[.*+?^${}()|[\]\\]/g, String.raw`\$&`);
+        }
+    }
+    return new RegExp(`^${regexTexto}$`);
+}
+
+function obterCacheControlEfetivo(regrasHeaders, caminho) {
+    // Reproduz a regra do Firebase Hosting: quando várias definições correspondem ao mesmo
+    // caminho e definem o mesmo cabeçalho, vale o valor da definição que aparece por último.
+    let valor = null;
+    for (const regra of regrasHeaders) {
+        if (!converterFontePadraoEmRegExp(regra.source).test(caminho)) continue;
+        const cacheControl = regra.headers.find(cabecalho => cabecalho.key.toLowerCase() === 'cache-control');
+        if (cacheControl) valor = cacheControl.value;
+    }
+    return valor;
+}
+
+test('cabeçalhos de Hosting forçam revalidação do HTML de entrada, inclusive na raiz "/"', () => {
+    const regrasHeaders = firebaseConfig.hosting?.headers || [];
+    const forcaRevalidacao = valor => /\b(no-cache|no-store|must-revalidate)\b/i.test(valor || '');
+
+    // A raiz "/" é o caminho que o navegador realmente pede; sem uma regra própria, ela cai na
+    // política padrão de cache do Hosting (max-age=3600) em vez da regra pensada para HTML/JS.
+    const raiz = obterCacheControlEfetivo(regrasHeaders, '/');
+    assert.ok(raiz, 'nenhuma regra de headers alcança a raiz "/"');
+    assert.ok(forcaRevalidacao(raiz), `Cache-Control de "/" deve forçar revalidação, obtido: ${raiz}`);
+    assert.doesNotMatch(raiz, /max-age=\s*(?!0\b)\d+/, 'raiz "/" não pode aceitar um max-age longo sem revalidação');
+
+    // O documento também pode ser pedido explicitamente como /index.html; deve ter a mesma garantia.
+    const indice = obterCacheControlEfetivo(regrasHeaders, '/index.html');
+    assert.ok(forcaRevalidacao(indice), `Cache-Control de "/index.html" deve forçar revalidação, obtido: ${indice}`);
+
+    // Os módulos JavaScript continuam com a mesma política de revalidação, sem afrouxar.
+    const script = obterCacheControlEfetivo(regrasHeaders, '/apps.js');
+    assert.ok(forcaRevalidacao(script), `Cache-Control de "/apps.js" deve forçar revalidação, obtido: ${script}`);
+
+    // Um ativo estático comum não precisa de revalidação forçada; a proteção é específica do HTML/JS.
+    const imagem = obterCacheControlEfetivo(regrasHeaders, '/logo.png');
+    assert.equal(imagem, null, 'esta verificação não deve exigir revalidação para ativos estáticos comuns');
+});
+
 test('publicação ignora documentação, testes e arquivos de configuração local', () => {
     const ignorados = firebaseConfig.hosting?.ignore || [];
     assert.equal(firebaseConfig.hosting?.public, 'public');
