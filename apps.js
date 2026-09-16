@@ -7,12 +7,21 @@ import { auth, db } from './firebase-config.js';
 import { onAuthStateChanged, signOut, signInWithEmailAndPassword } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
 import { collection, getDocs, addDoc, doc, setDoc, updateDoc, deleteDoc, writeBatch, query, where, onSnapshot, runTransaction } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
 import {
+    STATUS_DOCUMENTO,
     agruparItensPorFornecedor,
     criarOrcamentoDuplicado,
     criarSnapshotPedido,
+    marcarOrcamentoComoPerdido,
     obterItensDoPedido,
-    pedidoEstaConfirmado
+    obterStatusComercial,
+    orcamentoEstaPerdido,
+    pedidoEstaConfirmado,
+    reabrirNegociacao,
+    validarExclusaoOrcamento
 } from './order-domain.js';
+import { formatarCelular, gerarLinkWhatsApp, normalizarCelular } from './contact-domain.js';
+import { converterInstanteParaDataCivil, ehDataCivilValida, obterDataCivilAtual } from './date-domain.js';
+import { listarFollowUps } from './followup-domain.js';
 import {
     arredondamentoFinanceiro,
     calcularDetalhesItem,
@@ -53,6 +62,12 @@ let estadoOrdenacao = { coluna: 'codigo', direcao: 'asc' };
 const dataVersion = "2.0"; // Versão para controle de backup
 const orcamentosComAlteracoesPendentes = new Set();
 let temporizadorNotificacao = null;
+// Campo de celular -> link de WhatsApp e texto de ajuda correspondentes.
+const CONTATOS_WHATSAPP = {
+    celularCliente: { link: 'whatsappCliente', ajuda: 'ajudaCelularCliente' },
+    celularComissionado: { link: 'whatsappComissionado', ajuda: 'ajudaCelularComissionado' }
+};
+const MENSAGEM_CELULAR_INVALIDO = 'Cadastre um celular válido com DDD, ex.: (11) 98765-4321, para abrir o WhatsApp.';
 
 function escaparHtml(valor) {
     return String(valor ?? '')
@@ -104,46 +119,88 @@ function obterOrcamentoAtual() {
 
 function garantirOrcamentoEditavel(acao = 'alterar os itens') {
     const orcamento = obterOrcamentoAtual();
+    if (orcamentoEstaPerdido(orcamento)) {
+        mostrarNotificacao(`Este orçamento está marcado como perdido / não fechado. Para ${acao}, reabra a negociação.`);
+        return false;
+    }
     if (!pedidoEstaConfirmado(orcamento)) return true;
 
     mostrarNotificacao(`Este registro já foi confirmado como pedido. Para ${acao}, duplique-o e crie um novo orçamento.`);
     return false;
 }
 
+function descreverStatusComercial(orcamento) {
+    const status = obterStatusComercial(orcamento);
+    if (status === STATUS_DOCUMENTO.PERDIDO) return 'Perdido / Não fechado';
+    if (status !== STATUS_DOCUMENTO.PEDIDO) return 'Em negociação';
+
+    const dataConfirmacao = converterInstanteParaDataCivil(orcamento.pedido.confirmadoEm);
+    return dataConfirmacao ? `Pedido confirmado em ${formatarData(dataConfirmacao)}` : 'Pedido confirmado';
+}
+
 function atualizarInterfacePedido() {
     const orcamento = obterOrcamentoAtual();
-    const confirmado = pedidoEstaConfirmado(orcamento);
-    const status = document.getElementById('statusDocumento');
+    const statusComercial = obterStatusComercial(orcamento);
+    const confirmado = statusComercial === STATUS_DOCUMENTO.PEDIDO;
+    const perdido = statusComercial === STATUS_DOCUMENTO.PERDIDO;
+    const emNegociacao = Boolean(orcamento) && statusComercial === STATUS_DOCUMENTO.ORCAMENTO;
     const botaoConfirmar = document.getElementById('btn-confirmar-pedido');
+    const botaoPerdido = document.getElementById('btn-marcar-perdido');
+    const botaoReabrir = document.getElementById('btn-reabrir-negociacao');
     const botaoExcluir = document.getElementById('btn-excluir-orcamento');
     const botaoFornecedor = document.getElementById('btn-baixar-excel-pedido-ao-fornecedor');
     const botaoInstalador = document.getElementById('btn-imprimir-instrucoes-ao-instalador');
     const possuiItens = Boolean(orcamento) && obterItensDoPedido(orcamento).length > 0;
 
-    if (status) {
-        status.textContent = confirmado ? 'Pedido confirmado' : 'Orçamento';
-        status.className = confirmado ? 'document-status document-status-pedido' : 'document-status document-status-orcamento';
-    }
+    const textoStatus = descreverStatusComercial(orcamento);
+    ['statusDocumento', 'statusDocumentoProposta'].forEach(id => {
+        const status = document.getElementById(id);
+        if (!status) return;
+        status.textContent = textoStatus;
+        status.className = `document-status document-status-${statusComercial}`;
+    });
 
     if (botaoConfirmar) {
-        botaoConfirmar.disabled = confirmado || !orcamento || !possuiItens;
+        botaoConfirmar.disabled = !emNegociacao || !possuiItens;
         botaoConfirmar.textContent = confirmado ? '✓ Pedido confirmado' : '✓ Transformar em Pedido';
         botaoConfirmar.title = !orcamento
             ? 'Selecione um orçamento.'
-            : !possuiItens
-                ? 'Adicione pelo menos um item antes de transformar em pedido.'
-                : confirmado
-                    ? 'Este pedido já foi confirmado.'
-                    : '';
+            : perdido
+                ? 'Reabra a negociação antes de transformar em pedido.'
+                : !possuiItens
+                    ? 'Adicione pelo menos um item antes de transformar em pedido.'
+                    : confirmado
+                        ? 'Este pedido já foi confirmado.'
+                        : '';
     }
 
-    if (botaoExcluir) {
-        botaoExcluir.disabled = confirmado || !orcamento || Object.keys(orcamentosSalvos).length <= 1;
-        botaoExcluir.title = confirmado
-            ? 'Pedidos confirmados não podem ser excluídos.'
-            : Object.keys(orcamentosSalvos).length <= 1
-                ? 'O único orçamento não pode ser excluído.'
+    if (botaoPerdido) {
+        botaoPerdido.hidden = perdido;
+        botaoPerdido.disabled = !emNegociacao;
+        botaoPerdido.title = confirmado
+            ? 'Pedidos confirmados não podem ser marcados como perdidos.'
+            : !orcamento
+                ? 'Selecione um orçamento.'
                 : '';
+    }
+
+    if (botaoReabrir) {
+        botaoReabrir.hidden = !perdido;
+        botaoReabrir.disabled = !perdido;
+    }
+
+    ['proximoFollowUp', 'observacaoFollowUp'].forEach(id => {
+        const campo = document.getElementById(id);
+        if (!campo) return;
+        campo.disabled = !emNegociacao;
+        campo.title = emNegociacao ? '' : 'Follow-ups são usados apenas em orçamentos em negociação.';
+    });
+
+    if (botaoExcluir) {
+        const bloqueioExclusao = validarExclusaoOrcamento(orcamento);
+        botaoExcluir.disabled = Boolean(bloqueioExclusao) || !orcamento || Object.keys(orcamentosSalvos).length <= 1;
+        botaoExcluir.title = bloqueioExclusao
+            || (Object.keys(orcamentosSalvos).length <= 1 ? 'O único orçamento não pode ser excluído.' : '');
     }
 
     [botaoFornecedor, botaoInstalador].forEach(botao => {
@@ -167,13 +224,15 @@ function atualizarInterfacePedido() {
         'observacoesComerciais'
     ];
 
+    // Pedido confirmado mantém o congelamento; orçamento perdido fica somente leitura até ser reaberto.
+    const bloqueado = confirmado || perdido;
     idsBloqueados.forEach(id => {
         const elemento = document.getElementById(id);
-        if (elemento) elemento.disabled = confirmado;
+        if (elemento) elemento.disabled = bloqueado;
     });
 
     document.querySelectorAll('.btn-item-action, .btn-produto-action, .btn-add-item-to-produto')
-        .forEach(botao => { botao.disabled = confirmado; });
+        .forEach(botao => { botao.disabled = bloqueado; });
 }
 
 async function confirmarPedido() {
@@ -181,6 +240,10 @@ async function confirmarPedido() {
     if (!orcamento) return;
     if (pedidoEstaConfirmado(orcamento)) {
         mostrarNotificacao('Este orçamento já foi confirmado como pedido.');
+        return;
+    }
+    if (orcamentoEstaPerdido(orcamento)) {
+        mostrarNotificacao('Reabra a negociação antes de transformar este orçamento em pedido.');
         return;
     }
 
@@ -209,6 +272,50 @@ async function confirmarPedido() {
     if (!salvou) return;
     atualizarInterfacePedido();
     mostrarNotificacao(`Pedido ${orcamento.id} confirmado com sucesso.`, 'sucesso');
+}
+
+async function alterarStatusDoOrcamentoAtual(alterarStatus, mensagemSucesso) {
+    const id = orcamentoAtualId;
+    const orcamento = obterOrcamentoAtual();
+    if (!orcamento) return false;
+
+    let atualizado;
+    try {
+        atualizado = alterarStatus(orcamento, {
+            alteradoEm: new Date().toISOString(),
+            alteradoPor: auth.currentUser?.uid || null
+        });
+    } catch (error) {
+        mostrarNotificacao(error.message);
+        return false;
+    }
+
+    orcamentosSalvos[id] = atualizado;
+    const salvou = await salvarOrcamentoAtual(id);
+    if (!salvou) return false;
+
+    atualizarSeletoresOrcamento(id);
+    atualizarInterfacePedido();
+    renderizarFollowUps();
+    mostrarNotificacao(mensagemSucesso, 'sucesso');
+    return true;
+}
+
+async function marcarOrcamentoAtualComoPerdido() {
+    const orcamento = obterOrcamentoAtual();
+    if (!orcamento) return;
+    // A confirmação só é pedida quando a mudança é permitida; nos demais casos a regra de domínio explica o bloqueio.
+    if (obterStatusComercial(orcamento) === STATUS_DOCUMENTO.ORCAMENTO
+        && !confirm(`Marcar ${orcamento.id} como perdido / não fechado? Itens, valores e histórico serão mantidos, e a negociação poderá ser reaberta.`)) {
+        return;
+    }
+    await alterarStatusDoOrcamentoAtual(marcarOrcamentoComoPerdido, `${orcamento.id} marcado como perdido / não fechado.`);
+}
+
+async function reabrirNegociacaoAtual() {
+    const orcamento = obterOrcamentoAtual();
+    if (!orcamento) return;
+    await alterarStatusDoOrcamentoAtual(reabrirNegociacao, `Negociação de ${orcamento.id} reaberta.`);
 }
 
 // --- 3. FUNÇÕES DE DADOS (LISTENERS EM TEMPO REAL - FASE 4) ---
@@ -299,6 +406,7 @@ function escutarOrcamentos() {
         
         atualizarSeletoresOrcamento();
         preencherInfoOrcamento(); // Atualiza a tela de orçamento com os novos dados
+        renderizarFollowUps();
         if (orcamentosComAlteracoesPendentes.size === 0) {
             atualizarStatusSincronizacao('Dados sincronizados', 'ok');
         }
@@ -442,11 +550,10 @@ window.addEventListener('beforeunload', (event) => {
     // Adiciona os listeners aos botões e outros elementos interativos
     // que não são criados dinamicamente.
     const inicializarEventListeners = () => {
-        // Abas Principais
-        document.getElementById('btn-tab-0').addEventListener('click', () => showTab(0));
-        document.getElementById('btn-tab-1').addEventListener('click', () => showTab(1));
-        document.getElementById('btn-tab-2').addEventListener('click', () => showTab(2));
-        document.getElementById('btn-tab-3').addEventListener('click', () => showTab(3));
+        // Abas Principais: o índice segue a ordem das abas no HTML.
+        document.querySelectorAll('#main-tabs [role="tab"]').forEach((aba, indice) => {
+            aba.addEventListener('click', () => showTab(indice));
+        });
         document.getElementById('main-tabs').addEventListener('keydown', (event) => {
             if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return;
             event.preventDefault();
@@ -467,6 +574,12 @@ window.addEventListener('beforeunload', (event) => {
         document.getElementById('btn-duplicar-orcamento').addEventListener('click', duplicarOrcamento);
         document.getElementById('btn-excluir-orcamento').addEventListener('click', excluirOrcamento);
         document.getElementById('btn-confirmar-pedido').addEventListener('click', confirmarPedido);
+        document.getElementById('btn-marcar-perdido').addEventListener('click', marcarOrcamentoAtualComoPerdido);
+        document.getElementById('btn-reabrir-negociacao').addEventListener('click', reabrirNegociacaoAtual);
+        document.getElementById('listaFollowUps').addEventListener('click', (event) => {
+            const botaoAbrir = event.target.closest('.btn-abrir-orcamento');
+            if (botaoAbrir) abrirOrcamentoDoFollowUp(botaoAbrir.dataset.orcamentoId);
+        });
         document.getElementById('btn-criar-produto-acabado').addEventListener('click', criarProdutoAcabado);
         // Botões movidos para dentro da tabela de orçamento
         document.getElementById('btn-adicionar-item-avulso').addEventListener('click', () => abrirModalAdicionarItem(null));
@@ -548,9 +661,26 @@ window.addEventListener('beforeunload', (event) => {
         document.getElementById('nomeInstalador').addEventListener('blur', (e) => atualizarInfoOrcamento('nomeInstalador', e.target.value));
         document.getElementById('observacoesGerais').addEventListener('blur', (e) => atualizarInfoOrcamento('observacoesGerais', e.target.value));
 
+        // Contatos e follow-up: campos opcionais, gravados só quando o valor muda.
+        Object.keys(CONTATOS_WHATSAPP).forEach(campo => {
+            const input = document.getElementById(campo);
+            input.addEventListener('input', () => atualizarContatoWhatsApp(campo, input.value));
+            input.addEventListener('blur', () => atualizarCelular(campo));
+        });
+        document.getElementById('nomeComissionado').addEventListener('blur', (e) => atualizarCampoOpcionalOrcamento('nomeComissionado', e.target.value.trim()));
+        document.getElementById('proximoFollowUp').addEventListener('blur', (e) => {
+            atualizarCampoOpcionalOrcamento('proximoFollowUp', ehDataCivilValida(e.target.value) ? e.target.value : '');
+        });
+        document.getElementById('observacaoFollowUp').addEventListener('blur', (e) => atualizarCampoOpcionalOrcamento('observacaoFollowUp', e.target.value.trim()));
+
         [
             'nomeCliente',
             'enderecoCliente',
+            'celularCliente',
+            'nomeComissionado',
+            'celularComissionado',
+            'proximoFollowUp',
+            'observacaoFollowUp',
             'dataOrcamento',
             'prazoValidade',
             'prazoEntrega',
@@ -680,8 +810,11 @@ window.addEventListener('beforeunload', (event) => {
 
         if (moverFoco) tabs[index]?.focus();
 
-        if (index === 2) { // Proposta Cliente tab
+        const painelAtivo = contents[index];
+        if (painelAtivo?.id === 'tab3') {
             atualizarPropostaCliente();
+        } else if (painelAtivo?.id === 'tab-followups') {
+            renderizarFollowUps();
         }
     }
 
@@ -2176,6 +2309,154 @@ window.addEventListener('beforeunload', (event) => {
             renderizarOrcamentos(); // Atualiza o texto no seletor de orçamentos
         }
         return salvarOrcamentoAtual(id);
+    }
+
+    async function atualizarCampoOpcionalOrcamento(campo, valor) {
+        // Campos novos só são gravados quando o valor muda, sem criar valores padrão em orçamentos antigos.
+        const id = orcamentoAtualId;
+        const orcamento = orcamentosSalvos[id];
+        if (!id || !orcamento) return false;
+
+        if ((orcamento.infoGerais?.[campo] ?? '') === valor) {
+            // Nada a gravar. O aviso de pendência só é removido se nenhum celular inválido ficou sem salvar.
+            const celularInvalidoNaTela = Object.keys(CONTATOS_WHATSAPP)
+                .some(campoCelular => document.getElementById(campoCelular).getAttribute('aria-invalid') === 'true');
+            if (!celularInvalidoNaTela && orcamentosComAlteracoesPendentes.delete(id) && orcamentosComAlteracoesPendentes.size === 0) {
+                atualizarStatusSincronizacao('Dados sincronizados', 'ok');
+            }
+            return true;
+        }
+        return atualizarInfoOrcamento(campo, valor);
+    }
+
+    async function atualizarCelular(campo) {
+        const input = document.getElementById(campo);
+        const celular = normalizarCelular(input.value);
+        atualizarContatoWhatsApp(campo, input.value, { validar: true });
+        // Número inválido continua na tela para correção e não é gravado.
+        if (celular === null) return false;
+
+        input.value = formatarCelular(celular);
+        return atualizarCampoOpcionalOrcamento(campo, celular);
+    }
+
+    function atualizarContatoWhatsApp(campo, valor, { validar = false } = {}) {
+        const { link, ajuda } = CONTATOS_WHATSAPP[campo];
+        const input = document.getElementById(campo);
+        const elementoLink = document.getElementById(link);
+        const elementoAjuda = document.getElementById(ajuda);
+        const url = gerarLinkWhatsApp(valor);
+        const invalido = normalizarCelular(valor) === null;
+
+        // Durante a digitação o aviso só é removido; ele aparece ao sair do campo ou ao abrir o orçamento.
+        if (!invalido || validar) {
+            elementoAjuda.textContent = invalido ? MENSAGEM_CELULAR_INVALIDO : '';
+            if (invalido) input.setAttribute('aria-invalid', 'true');
+            else input.removeAttribute('aria-invalid');
+        }
+
+        if (url) {
+            elementoLink.href = url;
+            elementoLink.removeAttribute('aria-disabled');
+            elementoLink.title = 'Abrir conversa no WhatsApp em nova aba';
+        } else {
+            elementoLink.removeAttribute('href');
+            elementoLink.setAttribute('aria-disabled', 'true');
+            elementoLink.title = MENSAGEM_CELULAR_INVALIDO;
+        }
+    }
+
+    function criarLinkWhatsAppDaLista(celular, rotulo, descricao) {
+        const url = gerarLinkWhatsApp(celular);
+        if (!url) return '';
+        return `<a class="btn btn-whatsapp btn-sm" href="${escaparHtml(url)}" target="_blank" rel="noopener noreferrer" aria-label="${escaparHtml(descricao)}">${rotulo}</a>`;
+    }
+
+    function criarLinhaFollowUp(registro) {
+        const nomeCliente = registro.nomeCliente || 'Não informado';
+        const linkCliente = criarLinkWhatsAppDaLista(
+            registro.celularCliente,
+            'WhatsApp cliente',
+            `Abrir WhatsApp do cliente ${nomeCliente} (${registro.id})`
+        );
+        const linkComissionado = criarLinkWhatsAppDaLista(
+            registro.celularComissionado,
+            'WhatsApp arquiteto',
+            `Abrir WhatsApp do arquiteto/comissionado ${registro.nomeComissionado || ''} (${registro.id})`
+        );
+        const avisoSemCelular = linkCliente ? '' : '<span class="acao-indisponivel">Cadastre um celular válido do cliente</span>';
+        const celularComissionado = registro.celularComissionado
+            ? `<span class="followup-comissionado">Arquiteto: <span class="followup-sem-quebra">${escaparHtml(formatarCelular(registro.celularComissionado))}</span></span>`
+            : '';
+
+        return `
+            <tr>
+                <td data-label="Data" class="followup-sem-quebra">${escaparHtml(formatarData(registro.dataFollowUp))}</td>
+                <td data-label="Orçamento" class="followup-sem-quebra">${escaparHtml(registro.id)}</td>
+                <td data-label="Cliente">${escaparHtml(nomeCliente)}${registro.nomeComissionado ? `<span class="followup-comissionado">Arquiteto: ${escaparHtml(registro.nomeComissionado)}</span>` : ''}</td>
+                <td data-label="Observação" class="followup-observacao">${escaparHtml(registro.observacao || '-')}</td>
+                <td data-label="Celular"><span class="followup-sem-quebra">${escaparHtml(formatarCelular(registro.celularCliente) || '-')}</span>${celularComissionado}</td>
+                <td data-label="Valor da proposta" class="followup-sem-quebra">${formatarMoeda(registro.totalPropostaCliente)}</td>
+                <td data-label="Ações">
+                    <div class="followup-acoes">
+                        ${linkCliente}${linkComissionado}${avisoSemCelular}
+                        <button type="button" class="btn btn-secondary btn-sm btn-abrir-orcamento" data-orcamento-id="${escaparHtml(registro.id)}">Abrir orçamento</button>
+                    </div>
+                </td>
+            </tr>`;
+    }
+
+    function renderizarFollowUps() {
+        const container = document.getElementById('listaFollowUps');
+        const resumo = document.getElementById('followupsResumo');
+        if (!container || !resumo) return;
+
+        const grupos = listarFollowUps(orcamentosSalvos, obterDataCivilAtual());
+        const secoes = [
+            { chave: 'vencidos', titulo: 'Vencidos', vazio: 'Nenhum follow-up vencido.' },
+            { chave: 'hoje', titulo: 'Hoje', vazio: 'Nenhum follow-up para hoje.' },
+            { chave: 'proximos', titulo: 'Próximos', vazio: 'Nenhum follow-up agendado para os próximos dias.' }
+        ];
+
+        resumo.textContent = `${grupos.vencidos.length} vencido(s) · ${grupos.hoje.length} para hoje · ${grupos.proximos.length} próximo(s)`;
+        container.innerHTML = secoes.map(({ chave, titulo, vazio }) => {
+            const registros = grupos[chave];
+            const conteudo = registros.length === 0
+                ? `<p class="followup-vazio">${vazio}</p>`
+                : `<table class="followups-table">
+                        <thead>
+                            <tr>
+                                <th scope="col">Data</th>
+                                <th scope="col">Orçamento</th>
+                                <th scope="col">Cliente</th>
+                                <th scope="col">Observação</th>
+                                <th scope="col">Celular</th>
+                                <th scope="col">Valor da proposta</th>
+                                <th scope="col">Ações</th>
+                            </tr>
+                        </thead>
+                        <tbody>${registros.map(criarLinhaFollowUp).join('')}</tbody>
+                    </table>`;
+
+            return `
+                <section class="followup-grupo followup-grupo-${chave}" data-grupo="${chave}" aria-labelledby="followups-titulo-${chave}">
+                    <h3 id="followups-titulo-${chave}">${titulo} (${registros.length})</h3>
+                    ${conteudo}
+                </section>`;
+        }).join('');
+    }
+
+    function abrirOrcamentoDoFollowUp(id) {
+        if (!orcamentosSalvos[id]) {
+            mostrarNotificacao('Orçamento não encontrado. A lista de follow-ups foi atualizada.');
+            renderizarFollowUps();
+            return;
+        }
+
+        alternarOrcamento(id);
+        atualizarSeletoresOrcamento(id);
+        const indiceLancamento = [...document.querySelectorAll('.tab-content')].findIndex(painel => painel.id === 'tab2');
+        showTab(indiceLancamento, true);
     }
 
     function inicializarSelectInteligente(inputId) {
@@ -3870,6 +4151,9 @@ window.addEventListener('beforeunload', (event) => {
                 "nome": `Orçamento ${newId}`, 
                 "nomeCliente": "",
                 "enderecoCliente": "",
+                "celularCliente": "",
+                "nomeComissionado": "",
+                "celularComissionado": "",
                 "tipoCliente": "cliente",
                 "dataOrcamento": dataAtual,
                 "dataInstalacao": "", 
@@ -3878,6 +4162,8 @@ window.addEventListener('beforeunload', (event) => {
                 "nomeInstalador": "",
                 "prazoValidade": "",
                 "prazoEntrega": "30 dias úteis",
+                "proximoFollowUp": "",
+                "observacaoFollowUp": "",
                 "observacoesGerais": ""
             },
             infoComercial: {
@@ -3952,8 +4238,10 @@ window.addEventListener('beforeunload', (event) => {
             mostrarNotificacao("Não é possível excluir o único orçamento existente.");
             return;
         }
-        if (pedidoEstaConfirmado(orcamentosSalvos[orcamentoAtualId])) {
-            mostrarNotificacao('Pedidos confirmados não podem ser excluídos por esta tela. Isso preserva o histórico operacional.');
+        // Pedidos confirmados e orçamentos perdidos não são excluídos, mesmo que o botão seja acionado.
+        const bloqueioExclusao = validarExclusaoOrcamento(orcamentosSalvos[orcamentoAtualId]);
+        if (bloqueioExclusao) {
+            mostrarNotificacao(bloqueioExclusao);
             return;
         }
         if (confirm("Tem certeza que deseja excluir este orçamento? Esta ação não pode ser desfeita.")) {
@@ -4466,7 +4754,12 @@ window.addEventListener('beforeunload', (event) => {
 
             const nomeBase = orcamento.infoGerais?.nome || `Orçamento ${id}`;
             const nomeCliente = orcamento.infoGerais?.nomeCliente ? ` - ${orcamento.infoGerais.nomeCliente.trim()}` : '';
-            const tipoDocumento = pedidoEstaConfirmado(orcamento) ? '[PEDIDO] ' : '';
+            const statusComercial = obterStatusComercial(orcamento);
+            const tipoDocumento = statusComercial === STATUS_DOCUMENTO.PEDIDO
+                ? '[PEDIDO] '
+                : statusComercial === STATUS_DOCUMENTO.PERDIDO
+                    ? '[PERDIDO] '
+                    : '';
             option.textContent = `${tipoDocumento}${nomeBase}${nomeCliente}`;
 
             seletor.appendChild(option);
@@ -4516,6 +4809,13 @@ window.addEventListener('beforeunload', (event) => {
             document.getElementById('enderecoCostureira').value = infoGerais.enderecoCostureira || '';
             document.getElementById('nomeInstalador').value = infoGerais.nomeInstalador || '';
             document.getElementById('descontoGlobal').value = infoComercial.descontoGlobal || 0;
+            document.getElementById('nomeComissionado').value = infoGerais.nomeComissionado || '';
+            Object.keys(CONTATOS_WHATSAPP).forEach(campo => {
+                document.getElementById(campo).value = formatarCelular(infoGerais[campo]);
+                atualizarContatoWhatsApp(campo, infoGerais[campo], { validar: true });
+            });
+            document.getElementById('proximoFollowUp').value = ehDataCivilValida(infoGerais.proximoFollowUp) ? infoGerais.proximoFollowUp : '';
+            document.getElementById('observacaoFollowUp').value = infoGerais.observacaoFollowUp || '';
 
             const apresentacao = orcamento.apresentacao || {};
             document.getElementById('modoProposta').value = apresentacao.modo || 'reduzida';

@@ -42,8 +42,9 @@ test('login usa formulário semântico e metadados de autenticação', () => {
 });
 
 test('abas, modais e ordenação usam controles semânticos', () => {
-    assert.equal((html.match(/role=["']tab["']/g) || []).length, 4);
-    assert.equal((html.match(/role=["']tabpanel["']/g) || []).length, 4);
+    // Cinco abas: a aba de Follow-ups foi incluída na Etapa 1.
+    assert.equal((html.match(/role=["']tab["']/g) || []).length, 5);
+    assert.equal((html.match(/role=["']tabpanel["']/g) || []).length, 5);
     assert.equal((html.match(/class=["']modal["'][^>]+role=["']dialog["']/g) || []).length, 11);
     assert.equal((html.match(/class=["']close-button["']/g) || []).length, 11);
     assert.doesNotMatch(html, /<span[^>]+class=["']close-button["']/i);
@@ -69,6 +70,58 @@ test('proposta detalhada móvel usa cartões responsivos apenas na tela', () => 
 
 test('configuração de impressão A4 mantém margens de 8 mm', () => {
     assert.match(html, /@media\s+print[\s\S]*?@page\s*\{[\s\S]*?size:\s*A4\s+portrait;[\s\S]*?margin:\s*8mm;/i);
+});
+
+test('impressão esconde todas as abas, exceto a proposta', () => {
+    const regraOculta = html.match(/@media\s+print\s*\{[\s\S]*?([^{}]*#tab1[^{}]*)\{\s*display:\s*none\s*!important;/i);
+    assert.ok(regraOculta, 'regra de impressão que esconde as abas não encontrada');
+
+    const seletores = regraOculta[1].split(',').map(seletor => seletor.trim());
+    const paineis = [...html.matchAll(/<div id=["']([^"']+)["'] class=["'][^"']*\btab-content\b[^"']*["'] role=["']tabpanel["']/g)]
+        .map(match => match[1]);
+
+    assert.deepEqual(paineis, ['tab1', 'tab2', 'tab3', 'tab-followups', 'tab4']);
+    paineis.filter(id => id !== 'tab3').forEach(id => assert.ok(seletores.includes(`#${id}`), `#${id} deve ficar fora da impressão`));
+    assert.equal(seletores.includes('#tab3'), false);
+});
+
+test('módulos importados pela aplicação fazem parte do pacote do Hosting', async () => {
+    const scriptPublicacao = await readFile(new URL('../scripts/build-hosting.mjs', import.meta.url), 'utf8');
+    const listaPublicacao = scriptPublicacao.match(/const filesToPublish = \[([\s\S]*?)\];/);
+    assert.ok(listaPublicacao, 'lista de arquivos publicados não encontrada');
+    const publicados = new Set([...listaPublicacao[1].matchAll(/'([^']+)'/g)].map(match => match[1]));
+
+    const importados = new Set();
+    const pendentes = ['apps.js'];
+    while (pendentes.length > 0) {
+        const arquivo = pendentes.pop();
+        const fonte = await readFile(new URL(`../${arquivo}`, import.meta.url), 'utf8');
+        for (const [, modulo] of fonte.matchAll(/from\s+['"]\.\/([^'"]+)['"]/g)) {
+            if (importados.has(modulo)) continue;
+            importados.add(modulo);
+            if (modulo !== 'firebase-config.js') pendentes.push(modulo);
+        }
+    }
+
+    assert.ok(importados.has('date-domain.js'));
+    assert.deepEqual([...importados].filter(modulo => !publicados.has(modulo)).sort(), []);
+});
+
+test('contatos usam campo de telefone e links de WhatsApp seguros', () => {
+    ['celularCliente', 'celularComissionado'].forEach(id => {
+        assert.match(html, new RegExp(`<input type=["']tel["'] id=["']${id}["']`));
+        assert.match(html, new RegExp(`<label for=["']${id}["']`));
+    });
+
+    const linksWhatsApp = [...html.matchAll(/<a\b[^>]*class=["'][^"']*btn-whatsapp[^"']*["'][^>]*>/g)].map(match => match[0]);
+    assert.equal(linksWhatsApp.length, 2);
+    linksWhatsApp.forEach(link => {
+        assert.match(link, /target=["']_blank["']/);
+        assert.match(link, /rel=["']noopener noreferrer["']/);
+        // Sem celular válido o link nasce indisponível e sem URL.
+        assert.doesNotMatch(link, /\bhref=/);
+    });
+    assert.match(appSource, /target="_blank" rel="noopener noreferrer"/);
 });
 
 test('publicação ignora documentação, testes e arquivos de configuração local', () => {

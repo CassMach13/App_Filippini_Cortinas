@@ -11,6 +11,13 @@ const CAMPOS_TOTAIS_PEDIDO = [
     'totalGeral'
 ];
 
+// `statusDocumento` é a única fonte do status comercial. Documentos sem o campo estão em negociação.
+export const STATUS_DOCUMENTO = Object.freeze({
+    ORCAMENTO: 'orcamento',
+    PEDIDO: 'pedido',
+    PERDIDO: 'perdido'
+});
+
 function numeroFinito(valor, padrao = 0) {
     const numero = Number(valor);
     return Number.isFinite(numero) ? numero : padrao;
@@ -18,6 +25,61 @@ function numeroFinito(valor, padrao = 0) {
 
 export function pedidoEstaConfirmado(orcamento) {
     return orcamento?.statusDocumento === 'pedido' && Boolean(orcamento?.pedido?.confirmadoEm);
+}
+
+export function orcamentoEstaPerdido(orcamento) {
+    return orcamento?.statusDocumento === STATUS_DOCUMENTO.PERDIDO;
+}
+
+export function obterStatusComercial(orcamento) {
+    if (pedidoEstaConfirmado(orcamento)) return STATUS_DOCUMENTO.PEDIDO;
+    if (orcamentoEstaPerdido(orcamento)) return STATUS_DOCUMENTO.PERDIDO;
+    return STATUS_DOCUMENTO.ORCAMENTO;
+}
+
+function alterarStatusComercial(orcamento, novoStatus, { alteradoEm, alteradoPor } = {}) {
+    // Itens, valores e contatos são preservados.
+    const atualizado = structuredClone(orcamento);
+    atualizado.statusDocumento = novoStatus;
+    atualizado.statusAlteradoEm = alteradoEm || new Date().toISOString();
+    atualizado.statusAlteradoPor = alteradoPor ?? null;
+    return atualizado;
+}
+
+export function marcarOrcamentoComoPerdido(orcamento, auditoria = {}) {
+    if (!orcamento || typeof orcamento !== 'object') {
+        throw new TypeError('O orçamento é obrigatório para alterar o status.');
+    }
+    const status = obterStatusComercial(orcamento);
+    if (status === STATUS_DOCUMENTO.PEDIDO) {
+        throw new Error('Pedidos confirmados não podem ser marcados como perdidos.');
+    }
+    if (status === STATUS_DOCUMENTO.PERDIDO) {
+        throw new Error('Este orçamento já está marcado como perdido.');
+    }
+    return alterarStatusComercial(orcamento, STATUS_DOCUMENTO.PERDIDO, auditoria);
+}
+
+export function reabrirNegociacao(orcamento, auditoria = {}) {
+    if (!orcamentoEstaPerdido(orcamento)) {
+        throw new Error('Somente orçamentos marcados como perdidos podem ser reabertos.');
+    }
+    const reaberto = alterarStatusComercial(orcamento, STATUS_DOCUMENTO.ORCAMENTO, auditoria);
+    // A data antiga não volta como follow-up vencido; a observação fica como contexto
+    // e a nova data é informada pelo usuário.
+    reaberto.infoGerais = { ...(reaberto.infoGerais || {}), proximoFollowUp: '' };
+    return reaberto;
+}
+
+export function validarExclusaoOrcamento(orcamento) {
+    // Retorna o motivo do bloqueio ou null. Pedidos e perdidos preservam o histórico.
+    if (pedidoEstaConfirmado(orcamento)) {
+        return 'Pedidos confirmados não podem ser excluídos por esta tela. Isso preserva o histórico operacional.';
+    }
+    if (orcamentoEstaPerdido(orcamento)) {
+        return 'Orçamentos perdidos / não fechados não podem ser excluídos. Isso preserva o histórico comercial.';
+    }
+    return null;
 }
 
 export function criarOrcamentoDuplicado(orcamentoOriginal, { novoId, dataOrcamento } = {}) {
@@ -37,10 +99,16 @@ export function criarOrcamentoDuplicado(orcamentoOriginal, { novoId, dataOrcamen
         dataInstalacao: '',
         // A criação normal deixa a validade em branco; a cópia segue a mesma regra
         // em vez de herdar uma data absoluta que pode já estar vencida.
-        prazoValidade: ''
+        prazoValidade: '',
+        // Contatos são copiados; o follow-up pertence à negociação original.
+        proximoFollowUp: '',
+        observacaoFollowUp: ''
     };
-    novoOrcamento.statusDocumento = 'orcamento';
+    novoOrcamento.statusDocumento = STATUS_DOCUMENTO.ORCAMENTO;
     delete novoOrcamento.pedido;
+    delete novoOrcamento.pagamentos;
+    delete novoOrcamento.statusAlteradoEm;
+    delete novoOrcamento.statusAlteradoPor;
 
     return novoOrcamento;
 }
