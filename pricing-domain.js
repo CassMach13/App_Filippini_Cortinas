@@ -8,6 +8,27 @@ export function arredondamentoFinanceiro(valor, casasDecimais = 2) {
     return Math.round((numeroFinito(valor) + Number.EPSILON) * fator) / fator;
 }
 
+export function converterValorParaCentavos(valor) {
+    // Arredonda exatamente como a exibição em moeda (Intl.NumberFormat): parte da menor
+    // representação decimal do número e leva o meio centavo para longe do zero.
+    // Ex.: 5.005 vira 501 centavos, enquanto Math.round(5.005 * 100) e toFixed(2) resultam em 500.
+    const numero = numeroFinito(valor);
+    const [, parteInteira, parteDecimal = '', expoente = '0'] = String(Math.abs(numero))
+        .match(/^(\d+)(?:\.(\d+))?(?:e([+-]\d+))?$/);
+    let digitos = parteInteira + parteDecimal;
+    let digitosDosCentavos = parteInteira.length + Number(expoente) + 2;
+
+    if (digitosDosCentavos < 1) {
+        digitos = '0'.repeat(1 - digitosDosCentavos) + digitos;
+        digitosDosCentavos = 1;
+    }
+    digitos = digitos.padEnd(digitosDosCentavos + 1, '0');
+
+    const centavos = Number(digitos.slice(0, digitosDosCentavos))
+        + (Number(digitos[digitosDosCentavos]) >= 5 ? 1 : 0);
+    return (numero < 0 ? -centavos : centavos) || 0;
+}
+
 export function calcularPrecoFinal(precoCompra, markup) {
     return numeroFinito(precoCompra) * numeroFinito(markup);
 }
