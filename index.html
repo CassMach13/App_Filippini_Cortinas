@@ -266,6 +266,140 @@
             background: #E8F5E9;
             border: 1px solid #6B8E6B;
         }
+
+        .document-status-perdido {
+            color: #7A2E2E;
+            background: #F8E1E1;
+            border: 1px solid #C89F8F;
+        }
+
+        .status-comercial-linha {
+            display: flex;
+            align-items: center;
+            flex-wrap: wrap;
+            gap: 8px;
+            margin: 0 0 15px;
+            font-weight: 600;
+            color: #4A4A4A;
+        }
+
+        .grupo-comissionado {
+            margin: 0 0 15px;
+            padding: 12px 16px 0;
+            border: 2px solid #E5E5E5;
+            border-radius: 12px;
+            min-width: 0;
+        }
+
+        .grupo-comissionado legend {
+            padding: 0 6px;
+            font-weight: 700;
+            color: #4A4A4A;
+        }
+
+        .campo-contato {
+            display: flex;
+            align-items: stretch;
+            gap: 8px;
+        }
+
+        .campo-contato input {
+            flex: 1;
+            min-width: 0;
+        }
+
+        .campo-ajuda {
+            min-height: 1.2em;
+            margin-top: 4px;
+            color: #A65555;
+            font-size: 0.85em;
+        }
+
+        input[aria-invalid="true"] {
+            border-color: #A65555;
+        }
+
+        .followups-intro {
+            margin-top: 0;
+            color: #4A4A4A;
+        }
+
+        .followups-resumo {
+            font-weight: 700;
+            color: #2C2C2C;
+        }
+
+        .followup-grupo {
+            margin-top: 24px;
+        }
+
+        .followup-grupo h3 {
+            margin: 0 0 10px;
+            font-family: 'Lora', serif;
+            color: #4A4A4A;
+        }
+
+        .followup-grupo-vencidos h3 {
+            color: #8F4545;
+        }
+
+        .followup-vazio {
+            margin: 0;
+            color: #5F5F5F;
+        }
+
+        /* Deixa aparecer o fundo escuro previsto para thead, em vez da cor de linha alternada. */
+        .followups-table thead tr {
+            background-color: transparent;
+        }
+
+        .followups-table th,
+        .followups-table td {
+            padding: 12px 14px;
+        }
+
+        .followups-table th {
+            cursor: default;
+        }
+
+        .followups-table th:hover {
+            background-color: transparent;
+        }
+
+        .followups-table td {
+            vertical-align: top;
+            overflow-wrap: anywhere;
+        }
+
+        .followup-sem-quebra {
+            white-space: nowrap;
+        }
+
+        .followup-observacao {
+            white-space: pre-line;
+        }
+
+        .followup-comissionado {
+            display: block;
+            margin-top: 4px;
+            color: #5F5F5F;
+            font-size: 0.85em;
+        }
+
+        .followup-acoes {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 6px;
+        }
+
+        .followup-acoes .btn {
+            margin-right: 0;
+        }
+
+        .acao-indisponivel {
+            color: #5F5F5F;
+            font-size: 0.85em;
+        }
         
         .btn {
             padding: 12px 24px;
@@ -335,8 +469,41 @@
             background-color: #6B8E6B;
             color: #FFFEF7;
         }
-        .btn-success:hover { 
+        .btn-success:hover {
             background-color: #5A7D5A;
+        }
+
+        /* Depois de .btn, para prevalecer sobre cor, borda e margem padrão. */
+        .btn-whatsapp {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            margin-right: 0;
+            white-space: nowrap;
+            background-color: #2E7D32;
+            color: #FFFEF7;
+        }
+
+        .btn-whatsapp:hover {
+            background-color: #256628;
+        }
+
+        .btn-whatsapp[aria-disabled="true"] {
+            cursor: not-allowed;
+            background-color: #E5E5E5;
+            color: #5F5F5F;
+            box-shadow: none;
+            transform: none;
+        }
+
+        .btn-perdido {
+            background-color: #FFFEF7;
+            color: #8F4545;
+            border: 2px solid #A65555;
+        }
+
+        .btn-perdido:hover {
+            background-color: #F8E1E1;
         }
         
         .table-container {
@@ -970,7 +1137,7 @@
             }
 
             /* Esconde todos os elementos da interface que não devem ser impressos */
-            .header, .tab-container, .form-container, .section-title, .budget-control, #tab1, #tab2, #tab4, .btn-print {
+            .header, .tab-container, .form-container, .section-title, .budget-control, #tab1, #tab2, #tab-followups, #tab4, .btn-print {
                 display: none !important;
             }
 
@@ -1346,6 +1513,9 @@
             display: flex;
             justify-content: space-between; /* Abas à esquerda, controles à direita */
             align-items: center;
+            /* Sem espaço para abas e controles na mesma linha, os controles descem em vez de criar rolagem horizontal. */
+            flex-wrap: wrap;
+            row-gap: 10px;
             width: 100%; /* Ocupa a largura total do header */
             padding-top: 10px; /* Espaço entre o título e esta barra */
         }
@@ -1545,6 +1715,40 @@
             }
         }
 
+        @media screen and (max-width: 900px) {
+            .followups-table,
+            .followups-table tbody,
+            .followups-table tr,
+            .followups-table td {
+                display: block;
+                box-sizing: border-box;
+                width: 100%;
+                min-width: 0;
+            }
+
+            .followups-table thead {
+                display: none;
+            }
+
+            .followups-table tr {
+                padding: 10px 12px;
+                border-bottom: 1px solid #E5E5E5;
+            }
+
+            .followups-table td {
+                padding: 4px 0;
+                border: 0;
+            }
+
+            .followups-table td::before {
+                content: attr(data-label);
+                display: block;
+                color: #5F5F5F;
+                font-size: 0.78em;
+                font-weight: 600;
+            }
+        }
+
         @media (prefers-reduced-motion: reduce) {
             *,
             *::before,
@@ -1597,6 +1801,7 @@
                     <button id="btn-tab-0" class="tab active" type="button" role="tab" aria-selected="true" aria-controls="tab1" tabindex="0"><span aria-hidden="true">📋</span> Lista de Preços</button>
                     <button id="btn-tab-1" class="tab" type="button" role="tab" aria-selected="false" aria-controls="tab2" tabindex="-1"><span aria-hidden="true">💰</span> Lançamento de Orçamento</button>
                     <button id="btn-tab-2" class="tab" type="button" role="tab" aria-selected="false" aria-controls="tab3" tabindex="-1"><span aria-hidden="true">📄</span> Proposta Cliente</button>
+                    <button id="btn-tab-followups" class="tab" type="button" role="tab" aria-selected="false" aria-controls="tab-followups" tabindex="-1"><span aria-hidden="true">📅</span> Follow-ups</button>
                     <button id="btn-tab-3" class="tab" type="button" role="tab" aria-selected="false" aria-controls="tab4" tabindex="-1"><span aria-hidden="true">⚙️</span> Configurações</button>
                 </div>
 
@@ -1718,8 +1923,10 @@
                 <button id="btn-novo-orcamento" class="btn btn-primary">➕ Novo Orçamento</button>
                 <button id="btn-duplicar-orcamento" class="btn btn-info">📋 Duplicar Orçamento</button>
                 <button id="btn-excluir-orcamento" class="btn btn-danger">🗑️ Excluir Orçamento</button>
-                <span id="statusDocumento" class="document-status document-status-orcamento">Orçamento</span>
+                <span id="statusDocumento" class="document-status document-status-orcamento">Em negociação</span>
                 <button id="btn-confirmar-pedido" class="btn btn-success" type="button">✓ Transformar em Pedido</button>
+                <button id="btn-marcar-perdido" class="btn btn-perdido" type="button">Marcar como perdido</button>
+                <button id="btn-reabrir-negociacao" class="btn btn-secondary" type="button" hidden>Reabrir negociação</button>
                 <div class="budget-report-actions" style="flex: 1;">
                     <label for="mostrarCustosFornecedor" class="checkbox-inline">
                         <input type="checkbox" id="mostrarCustosFornecedor">
@@ -1744,16 +1951,41 @@
                         </select>
                     </div>
                     <div class="form-group" style="flex: 3;">
-                        <label for="nomeCliente">Nome do Cliente/Arquiteto:</label>
+                        <label for="nomeCliente">Nome do Cliente:</label>
                         <input type="text" id="nomeCliente" placeholder="Nome Completo">
                     </div>
                 </div>
                 <div class="form-row">
-                    <div class="form-group-full">
+                    <div class="form-group" style="flex: 3;">
                         <label for="enderecoCliente">Endereço Cliente:</label>
                         <input type="text" id="enderecoCliente" name="endereco_cliente_field" placeholder="Endereço Completo" autocomplete="off">
                     </div>
+                    <div class="form-group">
+                        <label for="celularCliente">Celular do Cliente:</label>
+                        <div class="campo-contato">
+                            <input type="tel" id="celularCliente" inputmode="tel" autocomplete="off" placeholder="(11) 98765-4321" aria-describedby="ajudaCelularCliente">
+                            <a id="whatsappCliente" class="btn btn-whatsapp" target="_blank" rel="noopener noreferrer" aria-disabled="true" aria-describedby="ajudaCelularCliente">WhatsApp</a>
+                        </div>
+                        <small id="ajudaCelularCliente" class="campo-ajuda" aria-live="polite"></small>
+                    </div>
                 </div>
+                <fieldset class="grupo-comissionado">
+                    <legend>Arquiteto / Comissionado (opcional)</legend>
+                    <div class="form-row">
+                        <div class="form-group" style="flex: 3;">
+                            <label for="nomeComissionado">Nome do Arquiteto / Comissionado:</label>
+                            <input type="text" id="nomeComissionado" placeholder="Nome do arquiteto ou comissionado" autocomplete="off">
+                        </div>
+                        <div class="form-group">
+                            <label for="celularComissionado">Celular do Arquiteto / Comissionado:</label>
+                            <div class="campo-contato">
+                                <input type="tel" id="celularComissionado" inputmode="tel" autocomplete="off" placeholder="(11) 98765-4321" aria-describedby="ajudaCelularComissionado">
+                                <a id="whatsappComissionado" class="btn btn-whatsapp" target="_blank" rel="noopener noreferrer" aria-disabled="true" aria-describedby="ajudaCelularComissionado">WhatsApp</a>
+                            </div>
+                            <small id="ajudaCelularComissionado" class="campo-ajuda" aria-live="polite"></small>
+                        </div>
+                    </div>
+                </fieldset>
                 <div class="form-row">
                     <div class="form-group">
                         <label for="dataOrcamento">Data do Orçamento:</label>
@@ -1766,6 +1998,16 @@
                     <div class="form-group">
                         <label for="prazoEntrega">Prazo de Entrega:</label>
                         <input type="text" id="prazoEntrega" placeholder="Ex: 30 dias úteis" class="campo-curto">
+                    </div>
+                </div>
+                <div class="form-row">
+                    <div class="form-group">
+                        <label for="proximoFollowUp">Próximo follow-up:</label>
+                        <input type="date" id="proximoFollowUp" class="campo-curto">
+                    </div>
+                    <div class="form-group" style="flex: 3;">
+                        <label for="observacaoFollowUp">Observação do follow-up:</label>
+                        <textarea id="observacaoFollowUp" rows="2" placeholder="Ex.: ligar para saber a decisão do cliente"></textarea>
                     </div>
                 </div>
                 <div class="form-row">
@@ -1857,6 +2099,7 @@
 
                 <div class="form-container">
                     <div class="section-title">Dados Comerciais</div>
+                    <p class="status-comercial-linha">Situação: <span id="statusDocumentoProposta" class="document-status document-status-orcamento">Em negociação</span></p>
                     <div class="form-row">
                         <div class="form-group">
                             <label for="condicaoPagamento">Condição de Pagamento:</label>
@@ -1918,6 +2161,15 @@
             </div>
         </div>
         
+        <div id="tab-followups" class="tab-content" role="tabpanel" aria-labelledby="btn-tab-followups" tabindex="0">
+            <div class="card-container">
+                <div class="section-title">Follow-ups</div>
+                <p class="followups-intro">Orçamentos em negociação com próximo contato agendado. As datas seguem o horário de Brasília.</p>
+                <p id="followupsResumo" class="followups-resumo" aria-live="polite"></p>
+                <div id="listaFollowUps"></div>
+            </div>
+        </div>
+
         <div id="tab4" class="tab-content" role="tabpanel" aria-labelledby="btn-tab-3" tabindex="0">
             <div class="card-container">
                 <div class="section-title">Gerenciar Fornecedores</div>
