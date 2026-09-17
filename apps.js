@@ -7,16 +7,22 @@ import { auth, db } from './firebase-config.js';
 import { onAuthStateChanged, signOut, signInWithEmailAndPassword } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
 import { collection, getDocs, addDoc, doc, setDoc, updateDoc, deleteDoc, writeBatch, query, where, onSnapshot, runTransaction } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
 import {
+    PERCENTUAL_COMISSAO_PADRAO,
     STATUS_DOCUMENTO,
     agruparItensPorFornecedor,
+    alterarPercentualComissao,
+    calcularIndicadoresDoItem,
+    calcularTotaisOrcamento,
+    confirmarOrcamentoComoPedido,
     criarOrcamentoDuplicado,
-    criarSnapshotPedido,
     marcarOrcamentoComoPerdido,
     obterItensDoPedido,
+    obterPercentualComissao,
     obterStatusComercial,
     orcamentoEstaPerdido,
     pedidoEstaConfirmado,
     reabrirNegociacao,
+    somarIndicadoresDosItens,
     validarExclusaoOrcamento
 } from './order-domain.js';
 import { formatarCelular, gerarLinkWhatsApp, normalizarCelular } from './contact-domain.js';
@@ -26,7 +32,7 @@ import {
     arredondamentoFinanceiro,
     calcularDetalhesItem,
     calcularPrecoFinal,
-    calcularTotaisProposta,
+    interpretarPercentualComissao,
     normalizarUnidadeMedida,
     validarParametrosProduto,
     validarParametrosItem
@@ -217,7 +223,8 @@ function atualizarInterfacePedido() {
         'btn-criar-produto-acabado',
         'btn-adicionar-item-avulso',
         'btn-limpar-itens-do-orcamento',
-        'tipoCliente',
+        'vendaComComissao',
+        'percentualComissao',
         'condicaoPagamento',
         'formaPagamento',
         'descontoGlobal',
@@ -262,15 +269,22 @@ async function confirmarPedido() {
     const confirmado = confirm('Ao transformar em pedido, itens, quantidades e custos serão congelados. Deseja continuar?');
     if (!confirmado) return;
 
-    orcamento.statusDocumento = 'pedido';
-    orcamento.pedido = criarSnapshotPedido(orcamento, {
-        confirmadoEm: new Date().toISOString(),
-        confirmadoPor: auth.currentUser?.uid || null
-    });
+    // A confirmação também registra o percentual de comissão efetivo de documentos antigos.
+    const id = orcamentoAtualId;
+    try {
+        orcamentosSalvos[id] = confirmarOrcamentoComoPedido(orcamento, {
+            confirmadoEm: new Date().toISOString(),
+            confirmadoPor: auth.currentUser?.uid || null
+        });
+    } catch (error) {
+        mostrarNotificacao(error.message);
+        return;
+    }
 
-    const salvou = await salvarOrcamentoAtual();
+    const salvou = await salvarOrcamentoAtual(id);
     if (!salvou) return;
-    atualizarInterfacePedido();
+    atualizarSeletoresOrcamento(id);
+    if (id === orcamentoAtualId) preencherInfoOrcamento();
     mostrarNotificacao(`Pedido ${orcamento.id} confirmado com sucesso.`, 'sucesso');
 }
 
@@ -584,7 +598,23 @@ window.addEventListener('beforeunload', (event) => {
         // Botões movidos para dentro da tabela de orçamento
         document.getElementById('btn-adicionar-item-avulso').addEventListener('click', () => abrirModalAdicionarItem(null));
         document.getElementById('btn-limpar-itens-do-orcamento').addEventListener('click', limparOrcamento);
-        document.getElementById('tipoCliente').addEventListener('change', recalcularComissao);
+        // Comissão: o checkbox é só uma projeção de percentualComissao > 0.
+        document.getElementById('vendaComComissao').addEventListener('change', (e) => {
+            const percentualAtual = obterPercentualComissao(obterOrcamentoAtual());
+            const novoPercentual = e.target.checked
+                ? (percentualAtual > 0 ? percentualAtual : PERCENTUAL_COMISSAO_PADRAO)
+                : 0;
+            alterarComissaoPelaTela(novoPercentual);
+        });
+        document.getElementById('percentualComissao').addEventListener('change', (e) => {
+            const percentual = interpretarPercentualComissao(e.target.value);
+            if (percentual === null) {
+                mostrarNotificacao('Informe um percentual de comissão entre 0 e 100, com até duas casas decimais (ex.: 7,5).');
+                atualizarCamposComissao();
+                return;
+            }
+            alterarComissaoPelaTela(percentual);
+        });
         document.getElementById('seletorOrcamento').addEventListener('change', (event) => alternarOrcamento(event.target.value));
         // Listeners para o NOVO MODAL de adicionar item
         document.getElementById('btn-adicionar-item').addEventListener('click', adicionarItemAoOrcamento); // Botão "Salvar" do modal
@@ -668,6 +698,7 @@ window.addEventListener('beforeunload', (event) => {
             input.addEventListener('blur', () => atualizarCelular(campo));
         });
         document.getElementById('nomeComissionado').addEventListener('blur', (e) => atualizarCampoOpcionalOrcamento('nomeComissionado', e.target.value.trim()));
+        document.getElementById('nomeComissionado').addEventListener('input', () => atualizarAvisoComissao());
         document.getElementById('proximoFollowUp').addEventListener('blur', (e) => {
             atualizarCampoOpcionalOrcamento('proximoFollowUp', ehDataCivilValida(e.target.value) ? e.target.value : '');
         });
@@ -729,7 +760,15 @@ window.addEventListener('beforeunload', (event) => {
         // Listeners para os campos de dados comerciais
         document.getElementById('condicaoPagamento').addEventListener('change', (e) => atualizarInfoComercial('condicaoPagamento', e.target.value));
         document.getElementById('formaPagamento').addEventListener('change', (e) => atualizarInfoComercial('formaPagamento', e.target.value));
-        document.getElementById('descontoGlobal').addEventListener('input', atualizarPropostaCliente);
+        document.getElementById('descontoGlobal').addEventListener('input', (e) => {
+            // A prévia usa o documento em memória, com o mesmo valor que será gravado ao sair do campo;
+            // assim a proposta continua vindo de calcularTotaisOrcamento, sem fórmula paralela na tela.
+            const orcamento = obterOrcamentoAtual();
+            if (orcamento && obterStatusComercial(orcamento) === STATUS_DOCUMENTO.ORCAMENTO) {
+                orcamento.infoComercial = { ...(orcamento.infoComercial || {}), descontoGlobal: parseFloat(e.target.value) || 0 };
+            }
+            atualizarPropostaCliente();
+        });
         document.getElementById('descontoGlobal').addEventListener('blur', (e) => atualizarInfoComercial('descontoGlobal', parseFloat(e.target.value) || 0));
         document.getElementById('observacoesComerciais').addEventListener('blur', (e) => atualizarInfoComercial('observacoesComerciais', e.target.value));
         document.getElementById('modoProposta').addEventListener('change', atualizarConfiguracaoProposta);
@@ -860,15 +899,15 @@ window.addEventListener('beforeunload', (event) => {
         
         const orcamento = orcamentosSalvos[orcamentoAtualId];
         if (!orcamento) return;
+        // Margens internas (antes do desconto) derivadas pelo domínio; nada é gravado nos itens.
+        const percentualComissao = obterPercentualComissao(orcamento);
 
         // Renderizar Produtos Acabados
         (orcamento.produtosAcabados || []).forEach(produto => {
-            const valorTotalProduto = (produto.itens || []).reduce((sum, item) => sum + (item.precoTotal || 0), 0);
-            const margemTotalProduto = (produto.itens || []).reduce((sum, item) => sum + (item.margemLiquida || 0), 0);
-            const margemPercentualProduto = valorTotalProduto > 0 ? (margemTotalProduto / valorTotalProduto) * 100 : 0;
-
-            produto.valorTotal = valorTotalProduto;
-            produto.margemTotal = margemTotalProduto;
+            const indicadoresProduto = somarIndicadoresDosItens(produto.itens, percentualComissao);
+            const valorTotalProduto = indicadoresProduto.precoTotal;
+            const margemTotalProduto = indicadoresProduto.margem;
+            const margemPercentualProduto = indicadoresProduto.margemPercentual;
 
             const produtoRow = document.createElement('tr');
             produtoRow.className = 'produto-acabado-row';
@@ -915,10 +954,11 @@ window.addEventListener('beforeunload', (event) => {
                 // A lógica de salvamento foi corrigida para que `item.altura` contenha a altura padrão.
                 if (normalizarUnidadeMedida(item.unidadeMedida) === 'MetroLinear') {
                     // Agora lemos diretamente de item.altura, que contém o valor correto.
-                    alturaDisplay = item.altura ? item.altura.toFixed(2) : '-'; 
+                    alturaDisplay = item.altura ? item.altura.toFixed(2) : '-';
                     larguraDisplay = '-'; // A coluna Largura fica vazia
                 }
-                
+                const indicadoresItem = calcularIndicadoresDoItem(item, percentualComissao);
+
                 itemRow.innerHTML = `
                     <td colspan="2" style="padding-left: 40px;">↳ ${item.categoria || 'Componente'}</td>
                     <td>${item.fornecedor || '-'}</td>
@@ -930,9 +970,9 @@ window.addEventListener('beforeunload', (event) => {
                     <td>${alturaDisplay}</td>
                     <td>${formatarMoeda(item.precoUnitario || 0)}</td>
                     <td>${formatarMoeda(item.precoTotal || 0)}</td>
-                    <td style="color: ${(item.margemPercentual || 0) >= 30 ? '#6B8E6B' : (item.margemPercentual || 0) >= 15 ? '#C89F8F' : '#A65555'}; font-weight: bold;">
-                        ${formatarMoeda(item.margemLiquida || 0)}<br>
-                        <small>(${truncarDecimal(item.margemPercentual || 0, 2)}%)</small>
+                    <td style="color: ${indicadoresItem.margemPercentual >= 30 ? '#6B8E6B' : indicadoresItem.margemPercentual >= 15 ? '#C89F8F' : '#A65555'}; font-weight: bold;">
+                        ${formatarMoeda(indicadoresItem.margem)}<br>
+                        <small>(${truncarDecimal(indicadoresItem.margemPercentual, 2)}%)</small>
                     </td>
                     <td style="text-align: center;"></td>
                 `;
@@ -967,9 +1007,10 @@ window.addEventListener('beforeunload', (event) => {
         // Renderizar Itens Avulsos
         if(orcamento.itens && orcamento.itens.length > 0) {
             
-            const totalItensAvulsos = (orcamento.itens || []).reduce((sum, item) => sum + (item.precoTotal || 0), 0);
-            const margemTotalAvulsos = (orcamento.itens || []).reduce((sum, item) => sum + (item.margemLiquida || 0), 0);
-            const margemPercentualAvulsos = totalItensAvulsos > 0 ? (margemTotalAvulsos / totalItensAvulsos) * 100 : 0;
+            const indicadoresAvulsos = somarIndicadoresDosItens(orcamento.itens, percentualComissao);
+            const totalItensAvulsos = indicadoresAvulsos.precoTotal;
+            const margemTotalAvulsos = indicadoresAvulsos.margem;
+            const margemPercentualAvulsos = indicadoresAvulsos.margemPercentual;
 
             // LINHA DE RESUMO (avulsoSummaryRow)
             const avulsoSummaryRow = document.createElement('tr');
@@ -1020,7 +1061,8 @@ window.addEventListener('beforeunload', (event) => {
                     alturaDisplay = item.altura ? item.altura.toFixed(2) : '-';
                     larguraDisplay = '-'; // A coluna Largura fica vazia
                 }
-                
+                const indicadoresItem = calcularIndicadoresDoItem(item, percentualComissao);
+
                 itemRow.innerHTML = `
                     <td colspan="2" style="padding-left: 40px;">↳ ${item.categoria || 'Avulso'}</td>
                     <td>${item.fornecedor || '-'}</td>
@@ -1032,9 +1074,9 @@ window.addEventListener('beforeunload', (event) => {
                     <td>${alturaDisplay}</td>
                     <td>${formatarMoeda(item.precoUnitario || 0)}</td>
                     <td>${formatarMoeda(item.precoTotal || 0)}</td>
-                    <td style="color: ${(item.margemPercentual || 0) >= 30 ? '#6B8E6B' : (item.margemPercentual || 0) >= 15 ? '#C89F8F' : '#A65555'}; font-weight: bold;">
-                        ${formatarMoeda(item.margemLiquida || 0)}<br>
-                        <small>(${(item.margemPercentual || 0).toFixed(1)}%)</small>
+                    <td style="color: ${indicadoresItem.margemPercentual >= 30 ? '#6B8E6B' : indicadoresItem.margemPercentual >= 15 ? '#C89F8F' : '#A65555'}; font-weight: bold;">
+                        ${formatarMoeda(indicadoresItem.margem)}<br>
+                        <small>(${indicadoresItem.margemPercentual.toFixed(1)}%)</small>
                     </td>
                     <td style="text-align: center;"></td>
                 `;
@@ -1068,30 +1110,19 @@ window.addEventListener('beforeunload', (event) => {
             return;
         }
 
-        const totalOrcamento = todosOsItens.reduce((sum, item) => sum + (item.precoTotal || 0), 0);
-        const totalMargemProposta = todosOsItens.reduce((sum, item) => sum + (item.margemLiquida || 0), 0);
-        const margemPercentualProposta = totalOrcamento > 0 ? (totalMargemProposta / totalOrcamento) * 100 : 0;
-        
-        if (!orcamento.totais) {
-            orcamento.totais = {};
-        }
-        orcamento.totais.totalProdutos = totalOrcamento;
-        orcamento.totais.totalMargemProposta = totalMargemProposta;
-        orcamento.totais.margemPercentualProposta = margemPercentualProposta;
-        
-        const resumoPorAmbiente = {};
+        // Fonte única dos totais; o cache `orcamento.totais` não é mais lido nem atualizado.
+        const totais = calcularTotaisOrcamento(orcamento);
 
+        const itensPorAmbiente = {};
         todosOsItens.forEach(item => {
             const ambiente = item.ambiente || 'Itens Avulsos';
-            if (!resumoPorAmbiente[ambiente]) {
-                resumoPorAmbiente[ambiente] = { subtotal: 0, totalMargem: 0 };
-            }
-            resumoPorAmbiente[ambiente].subtotal += (item.precoTotal || 0);
-            resumoPorAmbiente[ambiente].totalMargem += (item.margemLiquida || 0);
+            if (!itensPorAmbiente[ambiente]) itensPorAmbiente[ambiente] = [];
+            itensPorAmbiente[ambiente].push(item);
         });
 
-        for (const ambiente in resumoPorAmbiente) {
-            const subtotalProdutos = resumoPorAmbiente[ambiente].subtotal;
+        for (const ambiente in itensPorAmbiente) {
+            const indicadoresAmbiente = somarIndicadoresDosItens(itensPorAmbiente[ambiente], percentualComissao);
+            const subtotalProdutos = indicadoresAmbiente.precoTotal;
             // CORREÇÃO: Garante que orcamento.valoresInstalacao exista antes de acessá-lo.
             const valorInstalacao = orcamento.valoresInstalacao?.[ambiente] || 0;
             const totalAmbiente = subtotalProdutos + valorInstalacao;
@@ -1099,7 +1130,7 @@ window.addEventListener('beforeunload', (event) => {
             const resumoCard = document.createElement('div');
             resumoCard.classList.add('summary-card');
 
-            const margemPorcentagemAmbiente = (resumoPorAmbiente[ambiente].totalMargem / subtotalProdutos) * 100 || 0;
+            const margemPorcentagemAmbiente = indicadoresAmbiente.margemPercentual;
             resumoCard.innerHTML = `
                 <h3>
                     <span>${ambiente}</span> 
@@ -1112,7 +1143,7 @@ window.addEventListener('beforeunload', (event) => {
                 <div class="management-item" style="background: linear-gradient(135deg, #E8F5E9 0%, #C8E6C9 100%); padding: 12px; border-radius: 8px; margin-top: 8px;">
                     <span style="font-weight: bold; color: #2E7D32;">💰 Margem do Ambiente:</span>
                     <span style="font-weight: bold; color: #2E7D32; font-size: 1.1em;">
-                        ${formatarMoeda(resumoPorAmbiente[ambiente].totalMargem)} 
+                        ${formatarMoeda(indicadoresAmbiente.margem)}
                         <small style="font-size: 0.9em;">(${truncarDecimal(margemPorcentagemAmbiente, 2)}%)</small>
                     </span>
                 </div>
@@ -1132,50 +1163,128 @@ window.addEventListener('beforeunload', (event) => {
             resumoAmbientesDiv.appendChild(resumoCard);
         }
         
-        const totalInstalacaoGeral = calcularTotalInstalacao();
         const totaisGeraisDiv = document.createElement('div');
         totaisGeraisDiv.classList.add('summary-card');
         totaisGeraisDiv.style.border = '2px solid #D4AF37';
-        
+
         totaisGeraisDiv.innerHTML = `
             <h3 style="font-size: 1.5em;">Resumo Geral do Orçamento</h3>
             <div class="management-item">
                 <span>Total de Produtos:</span>
-                <span style="font-weight: bold;">${formatarMoeda(totalOrcamento)}</span>
+                <span style="font-weight: bold;">${formatarMoeda(totais.subtotalProdutos)}</span>
             </div>
             <div class="management-item">
                 <span>Total de Instalação:</span>
-                <span style="font-weight: bold; color: #A65555;">${formatarMoeda(totalInstalacaoGeral)}</span>
+                <span style="font-weight: bold; color: #A65555;">${formatarMoeda(totais.totalInstalacao)}</span>
             </div>
-            <div class="management-item" style="background: linear-gradient(135deg, #E8F5E9 0%, #C8E6C9 100%); padding: 15px; border-radius: 10px; margin: 12px 0; border: 2px solid #4CAF50;">
-                <span style="font-weight: bold; font-size: 1.1em; color: #1B5E20;">💎 Margem Líquida Total:</span>
-                <div style="text-align: right;">
-                    <span style="font-weight: bold; color: #2E7D32; font-size: 1.3em;">${formatarMoeda(totalMargemProposta)}</span>
-                    <br>
-                    <small style="color: #388E3C; font-weight: 600;">(${truncarDecimal(margemPercentualProposta, 2)}% do total)</small>
-                </div>
-            </div>
+            ${criarResumoInternoComissao(orcamento, totais)}
             <div class="management-item" style="font-size: 1.2em; border-top: 2px solid #D4AF37; margin-top: 10px; padding-top: 10px;">
                 <strong>TOTAL GERAL:</strong>
-                <strong class="price-display">${formatarMoeda(totalOrcamento + totalInstalacaoGeral)}</strong>
+                <strong class="price-display">${formatarMoeda(totais.subtotalProdutos + totais.totalInstalacao)}</strong>
             </div>
         `;
         resumoAmbientesDiv.appendChild(totaisGeraisDiv);
     }
 
-    function calcularTotalInstalacao() {
-        const orcamento = orcamentosSalvos[orcamentoAtualId];
-        if (!orcamento || !orcamento.valoresInstalacao) return 0;
+    function formatarPercentualComissao(percentual) {
+        return Number(percentual || 0).toFixed(2).replace('.', ',');
+    }
 
-        let totalInstalacao = 0;
-        for (const ambiente in orcamento.valoresInstalacao) {
-            const valor = parseFloat(orcamento.valoresInstalacao[ambiente]) || 0;
-            totalInstalacao += valor;
+    function descreverAvisoComissao(aviso) {
+        if (aviso.codigo === 'percentual-comissao-invalido') {
+            return `O percentual de comissão gravado é inválido; foi usado ${formatarPercentualComissao(aviso.percentualUsado)}% pela regra antiga.`;
+        }
+        if (aviso.codigo === 'residuo-comissao-anormal') {
+            return `A soma dos preços não fecha com a comissão calculada (diferença de ${formatarMoeda(aviso.residuo)}). Revise os itens; nenhum valor foi alterado automaticamente.`;
+        }
+        return '';
+    }
+
+    function criarResumoInternoComissao(orcamento, totais) {
+        // Somente na aba Lançamento, que não é impressa. A proposta ao cliente nunca recebe estes valores.
+        const origemPercentual = totais.percentualComissaoGravado || totais.percentualComissao === 0
+            ? ''
+            : '<small>Percentual herdado do tipo de cliente antigo (Arquiteto); será gravado se for alterado ou ao confirmar o pedido.</small>';
+        const avisos = totais.avisos
+            .map(descreverAvisoComissao)
+            .filter(Boolean)
+            .map(texto => `<p class="resumo-interno-aviso" role="status">${escaparHtml(texto)}</p>`)
+            .join('');
+
+        return `
+            <section id="resumoInternoComissao" class="resumo-interno" aria-labelledby="tituloResumoInternoComissao">
+                <h4 id="tituloResumoInternoComissao">🔒 Informações internas <small>Não aparecem na proposta nem na impressão.</small></h4>
+                <div class="management-item"><span>Comissão:</span><span data-interno="percentual">${formatarPercentualComissao(totais.percentualComissao)}%</span></div>
+                ${origemPercentual}
+                <div class="management-item"><span>Produtos sem comissão:</span><span data-interno="subtotal-sem-comissao">${formatarMoeda(totais.subtotalSemComissao)}</span></div>
+                <div class="management-item"><span>Desconto sobre a base (${escaparHtml(totais.descontoPercentual)}%):</span><span data-interno="desconto-base">- ${formatarMoeda(totais.descontoBase)}</span></div>
+                <div class="management-item"><span>Base líquida da comissão:</span><span data-interno="base-liquida">${formatarMoeda(totais.centavos.baseLiquida / 100)}</span></div>
+                <div class="management-item"><span>Valor da comissão:</span><span data-interno="valor-comissao">${formatarMoeda(totais.valorComissao)}</span></div>
+                <div class="management-item"><span>Produtos cobrados do cliente (com desconto):</span><span data-interno="produtos-cobrados">${formatarMoeda(totais.totalProdutos)}</span></div>
+                <div class="management-item resumo-interno-destaque"><span>Líquido Filippini:</span><span data-interno="liquido-filippini">${formatarMoeda(totais.liquidoFilippini)}</span></div>
+                <div class="management-item"><span>Margem antes do desconto:</span><span data-interno="margem-antes">${formatarMoeda(totais.margemProdutos)} (${truncarDecimal(totais.margemProdutosPercentual, 2)}%)</span></div>
+                <div class="management-item resumo-interno-destaque"><span>💎 Margem após o desconto:</span><span data-interno="margem-depois">${formatarMoeda(totais.margemComDesconto)} (${truncarDecimal(totais.margemPercentual, 2)}% do líquido)</span></div>
+                ${avisos}
+            </section>
+        `;
+    }
+
+    function atualizarAvisoComissao(orcamento = obterOrcamentoAtual()) {
+        // Aviso discreto: percentual sem nome do comissionado não bloqueia nenhuma ação.
+        const percentual = orcamento ? obterPercentualComissao(orcamento) : 0;
+        const nome = document.getElementById('nomeComissionado').value.trim();
+        document.getElementById('ajudaComissao').textContent = percentual > 0 && !nome
+            ? 'Venda com comissão sem nome do arquiteto / comissionado. Informe o nome para identificar quem recebe.'
+            : '';
+    }
+
+    function atualizarCamposComissao(orcamento = obterOrcamentoAtual()) {
+        // A tela sempre reflete o percentual efetivo do documento; o checkbox não é gravado.
+        const percentual = orcamento ? obterPercentualComissao(orcamento) : 0;
+        document.getElementById('vendaComComissao').checked = percentual > 0;
+        document.getElementById('percentualComissao').value = formatarPercentualComissao(percentual);
+        atualizarAvisoComissao(orcamento);
+    }
+
+    async function alterarComissaoPelaTela(novoPercentual) {
+        const id = orcamentoAtualId;
+        const orcamento = obterOrcamentoAtual();
+        if (!orcamento) return false;
+        if (!garantirOrcamentoEditavel('alterar a comissão')) {
+            atualizarCamposComissao(orcamento);
+            return false;
         }
 
-        if (!orcamento.totais) orcamento.totais = {};
-        orcamento.totais.totalInstalacao = totalInstalacao;
-        return totalInstalacao;
+        // Mesmo percentual efetivo: nada muda e documentos antigos não ganham o campo.
+        if (novoPercentual === obterPercentualComissao(orcamento)) {
+            atualizarCamposComissao(orcamento);
+            return true;
+        }
+
+        const possuiItens = calcularTotaisOrcamento(orcamento).quantidadeItens > 0;
+        if (possuiItens && !confirm('Alterar o percentual recalculará os preços dos itens deste orçamento. Deseja continuar?')) {
+            // Cancelado: o documento não foi tocado; apenas a tela volta ao valor gravado.
+            atualizarCamposComissao(orcamento);
+            return false;
+        }
+
+        let atualizado;
+        try {
+            atualizado = alterarPercentualComissao(orcamento, novoPercentual);
+        } catch (error) {
+            mostrarNotificacao(error.message);
+            atualizarCamposComissao(orcamento);
+            return false;
+        }
+
+        orcamentosSalvos[id] = atualizado;
+        const salvou = await salvarOrcamentoAtual(id);
+        if (!salvou) return false;
+        if (id === orcamentoAtualId) preencherInfoOrcamento();
+        mostrarNotificacao(possuiItens
+            ? `Comissão alterada para ${formatarPercentualComissao(novoPercentual)}%. Os preços dos itens foram recalculados.`
+            : `Comissão definida em ${formatarPercentualComissao(novoPercentual)}%.`, 'sucesso');
+        return true;
     }
 
     async function atualizarValorInstalacao(ambiente, inputElement) {
@@ -1230,15 +1339,14 @@ window.addEventListener('beforeunload', (event) => {
             return;
         }
 
-        const tipoCliente = document.getElementById('tipoCliente').value; 
-
-        // NOVA ABORDAGEM: Usa a função centralizada para obter todos os valores
+        // NOVA ABORDAGEM: Usa a função centralizada para obter todos os valores,
+        // com o percentual de comissão do próprio orçamento.
         const detalhesCalculados = calcularDetalhesItem(
             produtoBase,
             quantidade,
             largura,
             altura, // Para Metro Linear, a altura é a largura do material
-            tipoCliente
+            obterPercentualComissao(orcamento)
         );
 
         const novoItem = {
@@ -1258,14 +1366,14 @@ window.addEventListener('beforeunload', (event) => {
             largura: detalhesCalculados.larguraSalva,
             altura: detalhesCalculados.alturaSalva,
             unidadeMedida: produtoBase.unidadeMedida,
+            // Valores sem comissão (base) e com a comissão embutida; comissão e margem são derivadas.
+            precoUnitarioBase: detalhesCalculados.precoUnitarioBase,
+            precoTotalSemComissao: detalhesCalculados.precoTotalSemComissao,
             precoUnitario: detalhesCalculados.precoUnitario,
             precoTotal: detalhesCalculados.precoTotal,
             custoReal: detalhesCalculados.custoReal,
             quantidadeCompra: detalhesCalculados.quantidadeCompra,
             precoCompraUnitario: produtoBase.precoCompra,
-            margemLiquida: detalhesCalculados.margemLiquida,
-            margemPercentual: detalhesCalculados.margemPercentual,
-            valorComissao: detalhesCalculados.valorComissao,
             observacoes: document.getElementById('observacoesItem').value.trim()
         };
 
@@ -1417,9 +1525,7 @@ window.addEventListener('beforeunload', (event) => {
             ambiente: ambiente,
             observacoes: observacoes,
             observacoesCliente: observacoesCliente,
-            itens: [],
-            valorTotal: 0,
-            margemTotal: 0
+            itens: []
         };
 
         if (!orcamento.produtosAcabados) {
@@ -1526,28 +1632,21 @@ window.addEventListener('beforeunload', (event) => {
 
         const orcamentoFinalDiv = document.getElementById('orcamentoFinal');
         const orcamento = orcamentosSalvos[orcamentoAtualId];
-        const descontoGlobal = Math.min(100, Math.max(0, parseFloat(document.getElementById('descontoGlobal').value) || 0));
-        
+
         if (!orcamento || (!orcamento.itens || orcamento.itens.length === 0) && (!orcamento.produtosAcabados || orcamento.produtosAcabados.length === 0)) {
             orcamentoFinalDiv.innerHTML = '<p style="text-align: center; color: #777;">Adicione itens ao orçamento para visualizar a proposta.</p>';
-            document.getElementById('margemComDesconto').textContent = '0.00%';
             return;
         }
-        
-        const subtotal = orcamento.totais?.totalProdutos || 0;
-        const totalMargemOriginal = orcamento.totais?.totalMargemProposta || 0;
-        const totalInstalacaoGeral = orcamento.totais?.totalInstalacao || 0;
-        const totaisProposta = calcularTotaisProposta({
-            subtotalProdutos: subtotal,
-            margemProdutos: totalMargemOriginal,
-            totalInstalacao: totalInstalacaoGeral,
-            descontoPercentual: descontoGlobal
-        });
-        const descontoValor = totaisProposta.descontoValor;
-        const totalComDesconto = totaisProposta.totalProdutos;
-        const margemComDescontoPercentual = totaisProposta.margemPercentual;
-        
-        document.getElementById('margemComDesconto').textContent = `${truncarDecimal(margemComDescontoPercentual, 2)}%`;
+
+        // Fonte única dos totais. A aba Proposta é inteiramente voltada ao cliente, na tela e na impressão:
+        // só usa valores cobrados (com a comissão já embutida nas linhas). Comissão, margem, custo, base e
+        // líquido Filippini ficam no resumo interno da aba Lançamento.
+        const totais = calcularTotaisOrcamento(orcamento);
+        const subtotal = totais.subtotalProdutos;
+        const totalInstalacaoGeral = totais.totalInstalacao;
+        const descontoValor = totais.descontoValor;
+        const totalComDesconto = totais.totalProdutos;
+        const totalProdutoAcabado = produto => somarIndicadoresDosItens(produto.itens, totais.percentualComissao).precoTotal;
 
         // LÓGICA DE GERAÇÃO DE HTML RESTAURADA
         const todosOsItens = [...(orcamento.itens || []), ...(orcamento.produtosAcabados || []).flatMap(p => p.itens || [])];
@@ -1582,23 +1681,23 @@ window.addEventListener('beforeunload', (event) => {
                     <thead><tr><th>Produto</th><th style="text-align: right;">Valor Total</th></tr></thead><tbody>`;
         
         (orcamento.produtosAcabados || []).forEach(produto => {
-            html += `<tr><td><strong>${escaparHtml(produto.nome)} (${escaparHtml(produto.ambiente)})</strong>${produto.observacoesCliente ? `<span class="proposta-observacao-produto">${escaparHtml(produto.observacoesCliente)}</span>` : ''}</td><td class="item-value">${formatarMoeda(produto.valorTotal)}</td></tr>`;
+            html += `<tr><td><strong>${escaparHtml(produto.nome)} (${escaparHtml(produto.ambiente)})</strong>${produto.observacoesCliente ? `<span class="proposta-observacao-produto">${escaparHtml(produto.observacoesCliente)}</span>` : ''}</td><td class="item-value">${formatarMoeda(totalProdutoAcabado(produto))}</td></tr>`;
         });
 
         if (orcamento.itens && orcamento.itens.length > 0) {
-             const totalAvulsos = orcamento.itens.reduce((sum, item) => sum + Number(item.precoTotal || 0), 0);
+             const totalAvulsos = somarIndicadoresDosItens(orcamento.itens, totais.percentualComissao).precoTotal;
              html += `<tr><td>Itens Avulsos</td><td class="item-value">${formatarMoeda(totalAvulsos)}</td></tr>`;
         }
 
         html += `</tbody></table>`;
 
-        const totalFinalGeral = totaisProposta.totalGeral;
+        const totalFinalGeral = totais.totalGeral;
 
         html += `
             <div class="proposta-summary">
                 <div class="summary-line"><span>Subtotal Geral (Produtos sem desconto):</span><span>${formatarMoeda(subtotal)}</span></div>`;
         if (descontoValor > 0) {
-            html += `<div class="summary-line"><span>Desconto (${document.getElementById('descontoGlobal').value}%):</span><span>- ${formatarMoeda(descontoValor)}</span></div>`;
+            html += `<div class="summary-line"><span>Desconto (${escaparHtml(totais.descontoPercentual)}%):</span><span>- ${formatarMoeda(descontoValor)}</span></div>`;
         }
         html += `
                 <div class="summary-line" style="border-top: 2px solid #333; padding-top: 10px; font-size: 1.1em; font-weight: bold;">
@@ -1643,7 +1742,7 @@ window.addEventListener('beforeunload', (event) => {
                             </tr>`;
                 });
                 html += `</tbody></table>
-                    ${mostrarValoresItens ? `<div class="proposta-subtotal">Subtotal do Produto: ${formatarMoeda(produto.valorTotal)}</div>` : ''}`;
+                    ${mostrarValoresItens ? `<div class="proposta-subtotal">Subtotal do Produto: ${formatarMoeda(totalProdutoAcabado(produto))}</div>` : ''}`;
             });
             
             if(orcamento.itens && orcamento.itens.length > 0) {
@@ -1792,10 +1891,11 @@ window.addEventListener('beforeunload', (event) => {
         const quantidade = parseFloat(document.getElementById('edicaoQuantidadeItem').value) || 0;
         const largura = parseFloat(document.getElementById('edicaoLarguraItem').value) || 0;
         const altura = parseFloat(document.getElementById('edicaoAlturaItem').value) || 0;
-        const tipoCliente = document.getElementById('tipoCliente').value;
 
         // REUTILIZA A LÓGICA CENTRAL: Usa a mesma função que calcula o item final.
-        const { precoTotal, calculoTexto } = calcularDetalhesItem(produto, quantidade, largura, altura, tipoCliente);
+        const { precoTotal, calculoTexto } = calcularDetalhesItem(
+            produto, quantidade, largura, altura, obterPercentualComissao(obterOrcamentoAtual())
+        );
 
         previewDiv.innerHTML = `
             Cálculo: ${calculoTexto} <br>
@@ -1826,18 +1926,17 @@ window.addEventListener('beforeunload', (event) => {
             return;           
         }
 
-        const tipoCliente = document.getElementById('tipoCliente').value;
+        const orcamento = orcamentosSalvos[orcamentoAtualId];
 
-        // NOVA ABORDAGEM: Usa a função centralizada para obter todos os valores
+        // NOVA ABORDAGEM: Usa a função centralizada para obter todos os valores,
+        // com o percentual de comissão do próprio orçamento.
         const detalhesCalculados = calcularDetalhesItem(
             produtoBase,
             quantidade,
             largura,
             altura,
-            tipoCliente
+            obterPercentualComissao(orcamento)
         );
-
-        const orcamento = orcamentosSalvos[orcamentoAtualId];
         let itemParaAtualizar = null;
         if (produtoAcabadoId) {
             const produto = orcamento.produtosAcabados.find(p => p.id === produtoAcabadoId);
@@ -1862,16 +1961,19 @@ window.addEventListener('beforeunload', (event) => {
             itemParaAtualizar.largura = detalhesCalculados.larguraSalva;
             itemParaAtualizar.altura = detalhesCalculados.alturaSalva;
             itemParaAtualizar.unidadeMedida = produtoBase.unidadeMedida;
+            itemParaAtualizar.precoUnitarioBase = detalhesCalculados.precoUnitarioBase;
+            itemParaAtualizar.precoTotalSemComissao = detalhesCalculados.precoTotalSemComissao;
             itemParaAtualizar.precoUnitario = detalhesCalculados.precoUnitario;
             itemParaAtualizar.precoTotal = detalhesCalculados.precoTotal;
             itemParaAtualizar.observacoes = document.getElementById('edicaoObservacoesItem').value.trim();
-            
+
             itemParaAtualizar.custoReal = detalhesCalculados.custoReal;
             itemParaAtualizar.quantidadeCompra = detalhesCalculados.quantidadeCompra;
             itemParaAtualizar.precoCompraUnitario = produtoBase.precoCompra;
-            itemParaAtualizar.margemLiquida = detalhesCalculados.margemLiquida;
-            itemParaAtualizar.margemPercentual = detalhesCalculados.margemPercentual;
-            itemParaAtualizar.valorComissao = detalhesCalculados.valorComissao;
+            // O item editado passa ao formato atual; valores derivados da regra antiga deixam de valer.
+            delete itemParaAtualizar.margemLiquida;
+            delete itemParaAtualizar.margemPercentual;
+            delete itemParaAtualizar.valorComissao;
 
             // PONTO DE DEPURAÇÃO 2: O que está sendo atualizado?
             console.log("DEBUG: Objeto 'itemParaAtualizar' antes de salvar:", JSON.stringify(itemParaAtualizar, null, 2));
@@ -2102,59 +2204,6 @@ window.addEventListener('beforeunload', (event) => {
         };
 
         window.print();
-    }
-
-    async function recalcularComissao() {
-        const orcamento = orcamentosSalvos[orcamentoAtualId];
-        if (!orcamento) return;
-
-        if (!garantirOrcamentoEditavel('alterar o tipo de cliente')) {
-            document.getElementById('tipoCliente').value = orcamento.infoGerais?.tipoCliente || 'cliente';
-            return;
-        }
-
-        const tipoCliente = document.getElementById('tipoCliente').value;
-        if (!orcamento.infoGerais) orcamento.infoGerais = {};
-        orcamento.infoGerais.tipoCliente = tipoCliente;
-
-        const recalcularArray = (itensArray) => {
-            itensArray.forEach(item => {
-                const produtoBase = precos.find(p => p.codigo === item.codigo);
-                if (!produtoBase) return;
-
-                // NOVA ABORDAGEM: Usa a função centralizada
-                // CORREÇÃO DEFINITIVA: Passa os parâmetros corretos para a função de cálculo
-                // de acordo com a unidade de medida do item, resolvendo o bug do Metro Linear.
-                let quantidadeParaCalculo = item.quantidade;
-                let larguraParaCalculo = item.largura;
-                let alturaParaCalculo = item.altura;
-
-                // A função `calcularDetalhesItem` já lida com a lógica interna,
-                // só precisamos garantir que os valores corretos do item salvo sejam passados.
-                // Para Metro Linear e Unidade, a largura/altura não são usadas no cálculo do preço final,
-                // apenas a quantidade. Para Metro Quadrado, são usadas.
-                const detalhesCalculados = calcularDetalhesItem(
-                    produtoBase,
-                    quantidadeParaCalculo,
-                    larguraParaCalculo,
-                    alturaParaCalculo,
-                    tipoCliente
-                );
-
-                // Atualiza o item com os novos valores calculados
-                item.precoUnitario = detalhesCalculados.precoUnitario;
-                item.precoTotal = detalhesCalculados.precoTotal;
-                item.custoReal = detalhesCalculados.custoReal;
-                item.valorComissao = detalhesCalculados.valorComissao;
-                item.margemLiquida = detalhesCalculados.margemLiquida;
-                item.margemPercentual = detalhesCalculados.margemPercentual;
-            });
-        };
-        
-        recalcularArray(orcamento.produtosAcabados.flatMap(p => p.itens));
-        recalcularArray(orcamento.itens);
-
-        await salvarOrcamentoAtual();
     }
 
     function exportarDados() {
@@ -2629,9 +2678,10 @@ window.addEventListener('beforeunload', (event) => {
         const quantidade = parseFloat(document.getElementById('quantidade').value) || 0;
         const largura = parseFloat(document.getElementById('largura').value) || 0;
         const altura = parseFloat(document.getElementById('altura').value) || 0;
-        const tipoCliente = document.getElementById('tipoCliente').value;
 
-        const { precoTotal, calculoTexto } = calcularDetalhesItem(produto, quantidade, largura, altura, tipoCliente);
+        const { precoTotal, calculoTexto } = calcularDetalhesItem(
+            produto, quantidade, largura, altura, obterPercentualComissao(obterOrcamentoAtual())
+        );
         previewDiv.innerHTML = `Cálculo: ${calculoTexto} <br><b>Preço Total Previsto: ${formatarMoeda(precoTotal)}</b>`;
         previewDiv.style.display = 'block';
     }
@@ -4154,7 +4204,6 @@ window.addEventListener('beforeunload', (event) => {
                 "celularCliente": "",
                 "nomeComissionado": "",
                 "celularComissionado": "",
-                "tipoCliente": "cliente",
                 "dataOrcamento": dataAtual,
                 "dataInstalacao": "", 
                 "nomeCostureira": "",
@@ -4170,6 +4219,8 @@ window.addEventListener('beforeunload', (event) => {
                 "condicaoPagamento": "À vista",
                 "formaPagamento": "PIX",
                 "descontoGlobal": 0,
+                // Fonte única da comissão; o tipo de cliente não é mais gravado.
+                "percentualComissao": 0,
                 "observacoesComerciais": ""
             },
             itens: [],
@@ -4327,8 +4378,7 @@ window.addEventListener('beforeunload', (event) => {
                 produtoBase,
                 item.quantidade,
                 item.largura,
-                item.altura,
-                orcamento.infoGerais.tipoCliente || 'cliente'
+                item.altura
             );
             const quantidadeCompra = detalhes.quantidadeCompra;
 
@@ -4796,7 +4846,6 @@ window.addEventListener('beforeunload', (event) => {
             document.getElementById('orcamentoId').textContent = orcamentoAtualId;
             document.getElementById('nomeCliente').value = infoGerais.nomeCliente || '';
             document.getElementById('enderecoCliente').value = infoGerais.enderecoCliente || ''; // CORREÇÃO: Esta linha estava faltando.
-            document.getElementById('tipoCliente').value = infoGerais.tipoCliente || 'cliente';
             document.getElementById('dataOrcamento').value = infoGerais.dataOrcamento || '';
             document.getElementById('prazoValidade').value = infoGerais.prazoValidade || '';
             document.getElementById('prazoEntrega').value = infoGerais.prazoEntrega || '';
@@ -4810,6 +4859,7 @@ window.addEventListener('beforeunload', (event) => {
             document.getElementById('nomeInstalador').value = infoGerais.nomeInstalador || '';
             document.getElementById('descontoGlobal').value = infoComercial.descontoGlobal || 0;
             document.getElementById('nomeComissionado').value = infoGerais.nomeComissionado || '';
+            atualizarCamposComissao(orcamento);
             Object.keys(CONTATOS_WHATSAPP).forEach(campo => {
                 document.getElementById(campo).value = formatarCelular(infoGerais[campo]);
                 atualizarContatoWhatsApp(campo, infoGerais[campo], { validar: true });

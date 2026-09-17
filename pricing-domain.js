@@ -29,8 +29,57 @@ export function converterValorParaCentavos(valor) {
     return (numero < 0 ? -centavos : centavos) || 0;
 }
 
+export function calcularPercentualEmCentavos(valorCentavos, percentual) {
+    // Aplica um percentual com até duas casas a um valor inteiro em centavos, sem erro de ponto
+    // flutuante: o produto é inteiro e a divisão por 10^6 tem representação decimal exata, então
+    // converterValorParaCentavos arredonda o meio centavo para longe do zero como na exibição.
+    const percentualCentesimal = Math.round(numeroFinito(percentual) * 100);
+    return converterValorParaCentavos((Math.trunc(numeroFinito(valorCentavos)) * percentualCentesimal) / 1e6);
+}
+
+export function percentualComissaoEhValido(percentual) {
+    // Somente números de 0 a 100 com no máximo duas casas decimais. Textos não são aceitos
+    // como valor gravado; a tela converte o que foi digitado com interpretarPercentualComissao.
+    return typeof percentual === 'number'
+        && Number.isFinite(percentual)
+        && percentual >= 0
+        && percentual <= 100
+        && Math.round(percentual * 100) / 100 === percentual;
+}
+
+export function interpretarPercentualComissao(texto) {
+    // Aceita "10", "7,5", "7.25" ou "10,00 %". Retorna null quando o texto não é um percentual válido.
+    const normalizado = String(texto ?? '').replace('%', '').trim().replace(',', '.');
+    if (!/^\d{1,3}(?:\.\d{1,2})?$/.test(normalizado)) return null;
+    const percentual = Number(normalizado);
+    return percentualComissaoEhValido(percentual) ? percentual : null;
+}
+
 export function calcularPrecoFinal(precoCompra, markup) {
     return numeroFinito(precoCompra) * numeroFinito(markup);
+}
+
+export function calcularPrecoTotalSemComissao(precoUnitarioBase, quantidadeCompra) {
+    // Mesmo arredondamento usado até hoje no preço de cliente final: unitário e depois a linha.
+    const precoUnitarioSemComissao = arredondamentoFinanceiro(precoUnitarioBase, 2);
+    return arredondamentoFinanceiro(precoUnitarioSemComissao * numeroFinito(quantidadeCompra), 2);
+}
+
+export function aplicarComissaoAoItem({ precoUnitarioBase, precoTotalSemComissao }, percentualComissao) {
+    // A comissão é embutida por fora em cada linha: linha sem comissão × (1 + p/100), arredondada
+    // uma única vez. O cálculo parte sempre dos valores sem comissão, por isso nunca acumula.
+    if (!percentualComissaoEhValido(percentualComissao)) {
+        throw new RangeError('O percentual da comissão deve estar entre 0 e 100, com até duas casas decimais.');
+    }
+    const unitarioSemComissaoCentavos = converterValorParaCentavos(arredondamentoFinanceiro(precoUnitarioBase, 2));
+    const totalSemComissaoCentavos = converterValorParaCentavos(precoTotalSemComissao);
+
+    return {
+        precoUnitario: (unitarioSemComissaoCentavos
+            + calcularPercentualEmCentavos(unitarioSemComissaoCentavos, percentualComissao)) / 100,
+        precoTotal: (totalSemComissaoCentavos
+            + calcularPercentualEmCentavos(totalSemComissaoCentavos, percentualComissao)) / 100
+    };
 }
 
 export function normalizarUnidadeMedida(unidadeMedida) {
@@ -101,7 +150,7 @@ export function validarParametrosItem(produtoBase, quantidade, largura, altura) 
     return null;
 }
 
-export function calcularDetalhesItem(produtoBase, quantidade, largura, altura, tipoCliente = 'cliente') {
+export function calcularDetalhesItem(produtoBase, quantidade, largura, altura, percentualComissao = 0) {
     const quantidadeNumerica = numeroFinito(quantidade);
     const larguraNumerica = numeroFinito(largura);
     const alturaNumerica = numeroFinito(altura);
@@ -129,25 +178,24 @@ export function calcularDetalhesItem(produtoBase, quantidade, largura, altura, t
             break;
     }
 
+    // Preço-base sem comissão e sem arredondamento; os valores com comissão derivam dele.
     const precoUnitarioBase = calcularPrecoFinal(precoCompra, produtoBase?.markup);
-    const percentualComissao = tipoCliente === 'arquiteto' ? 0.10 : 0;
-    const precoUnitario = arredondamentoFinanceiro(precoUnitarioBase * (1 + percentualComissao), 2);
-    const precoTotal = arredondamentoFinanceiro(precoUnitario * quantidadeCompra, 2);
-    const custoReal = precoCompra * quantidadeCompra;
-    const valorComissao = precoUnitarioBase * percentualComissao * quantidadeCompra;
-    const margemLiquida = precoTotal - custoReal - valorComissao;
-    const margemPercentual = precoTotal > 0 ? (margemLiquida / precoTotal) * 100 : 0;
+    const precoTotalSemComissao = calcularPrecoTotalSemComissao(precoUnitarioBase, quantidadeCompra);
+    const { precoUnitario, precoTotal } = aplicarComissaoAoItem(
+        { precoUnitarioBase, precoTotalSemComissao },
+        percentualComissao
+    );
 
+    // Comissão e margem não fazem parte do item: são calculadas no nível do orçamento.
     return {
         quantidadeCompra,
         larguraSalva,
         alturaSalva,
+        precoUnitarioBase,
+        precoTotalSemComissao,
         precoUnitario,
         precoTotal,
-        custoReal,
-        valorComissao,
-        margemLiquida,
-        margemPercentual,
+        custoReal: precoCompra * quantidadeCompra,
         calculoTexto
     };
 }

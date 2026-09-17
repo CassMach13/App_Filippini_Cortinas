@@ -1,5 +1,6 @@
 import re
 import sys
+import unicodedata
 from datetime import date
 from pathlib import Path
 
@@ -50,6 +51,93 @@ def texto_visivel(locator):
 def preencher_e_sair(locator, valor):
     locator.fill(valor)
     locator.blur()
+
+
+def normalizar(texto):
+    return (texto or "").replace("\xa0", " ")
+
+
+def normalizar_para_busca(texto):
+    # Sem acentos e em minúsculas: "Líquido", "LIQUIDO" e "liquido" são o mesmo termo.
+    decomposto = unicodedata.normalize("NFKD", normalizar(texto))
+    return "".join(caractere for caractere in decomposto if not unicodedata.combining(caractere)).lower()
+
+
+# Informação econômica interna da Filippini. A aba Proposta Cliente é inteiramente voltada ao cliente:
+# nenhum destes termos pode aparecer nela, na tela (inclusive em blocos ocultos e no HTML) ou na impressão.
+# Os nomes usados no teste (cliente, produto, ambiente e comissionado) não contêm nenhum destes termos.
+TERMOS_INTERNOS = [
+    "comissao",
+    "comiss",
+    "margem",
+    "margem liquida",
+    "margem com desconto",
+    "liquido filippini",
+    "liquido",
+    "base liquida",
+    "sem comissao",
+    "custo",
+    "informacoes internas",
+    "\U0001F512",
+    "data-interno",
+    "resumointernocomissao",
+    "margemcomdesconto",
+    "arquiteta parceira",
+]
+# O relatório ao fornecedor é interno e pode mostrar custo de compra, mas nunca comissão ou margem.
+TERMOS_INTERNOS_FORNECEDOR = [termo for termo in TERMOS_INTERNOS if termo != "custo"]
+# Valores internos do cenário principal: base 1.000, desconto 10%, comissão 10%, custo 500.
+VALORES_INTERNOS_DEZ_PORCENTO = [
+    "10,00%", "r$ 1.000,00", "r$ 100,00", "r$ 900,00", "r$ 90,00",
+    "r$ 500,00", "r$ 400,00", "50.00%", "50,00%", "44.44%", "44,44%",
+]
+
+
+def verificar_sem_dados_internos(texto, contexto, valores=(), termos=TERMOS_INTERNOS):
+    texto_busca = normalizar_para_busca(texto)
+    encontrados = [termo for termo in [*termos, *valores] if normalizar_para_busca(termo) in texto_busca]
+    assert encontrados == [], f"{contexto}: informação interna exposta {encontrados}"
+
+
+def verificar_aba_proposta_sem_dados_internos(page, contexto, valores=()):
+    # Tela: texto visível, texto de elementos ocultos e o próprio HTML da aba.
+    assert page.locator("#tab3").is_visible(), contexto
+    assert page.locator("#tab3 #margemComDesconto, #tab3 [data-interno], #tab3 #resumoInternoComissao").count() == 0, contexto
+    verificar_sem_dados_internos(page.locator("#tab3").inner_text(), f"{contexto} (texto visível)", valores)
+    verificar_sem_dados_internos(page.locator("#tab3").text_content(), f"{contexto} (texto com ocultos)", valores)
+    verificar_sem_dados_internos(page.locator("#tab3").inner_html(), f"{contexto} (HTML)", valores)
+
+
+def verificar_impressao_sem_dados_internos(page, contexto, valores=()):
+    page.emulate_media(media="print")
+    try:
+        texto = normalizar(page.evaluate("document.body.innerText"))
+        verificar_sem_dados_internos(texto, contexto, valores)
+        assert page.locator("#resumoInternoComissao").evaluate("elemento => elemento.getClientRects().length") == 0
+        return texto
+    finally:
+        page.emulate_media(media="screen")
+
+
+def aceitar_dialogo(page, mensagens, aceitar=True):
+    def tratar(dialog):
+        mensagens.append(dialog.message)
+        if aceitar:
+            dialog.accept()
+        else:
+            dialog.dismiss()
+    page.once("dialog", tratar)
+
+
+def texto_interno(page, chave):
+    return normalizar(page.locator(f'[data-interno="{chave}"]').inner_text())
+
+
+def itens_do_documento(documento):
+    return {
+        "itens": documento.get("itens", []),
+        "produtos": [produto.get("itens", []) for produto in documento.get("produtosAcabados", [])],
+    }
 
 
 def sem_rolagem_horizontal(page):
@@ -426,6 +514,14 @@ def main():
             page.locator(f"#{campo}").blur()
         info_orc01 = documento_orcamento(page, "ORC-01")["infoGerais"]
         assert [campo for campo in CAMPOS_NOVOS_INFO_GERAIS if campo in info_orc01] == []
+        # Comissão: documento antigo de cliente final mostra 0% e não ganha percentualComissao ao ser percorrido.
+        assert not page.locator("#vendaComComissao").is_checked()
+        assert page.locator("#percentualComissao").input_value() == "0,00"
+        page.locator("#percentualComissao").focus()
+        page.locator("#percentualComissao").blur()
+        orc01 = documento_orcamento(page, "ORC-01")
+        assert "percentualComissao" not in orc01["infoComercial"]
+        assert orc01["infoGerais"]["tipoCliente"] == "cliente"
 
         # A aba de follow-ups não aparece na impressão.
         tabs.nth(3).click()
@@ -443,6 +539,363 @@ def main():
         page.wait_for_timeout(100)
         assert sem_rolagem_horizontal(page)
 
+        # Etapa 2B: comissão configurável.
+        page.set_viewport_size({"width": 1440, "height": 1000})
+        venda_com_comissao = page.locator("#vendaComComissao")
+        percentual_comissao = page.locator("#percentualComissao")
+        ajuda_comissao = page.locator("#ajudaComissao")
+        dialogos = []
+
+        # 1. Criar orçamento sem comissão.
+        page.locator("#btn-novo-orcamento").click()
+        page.wait_for_function("[...document.querySelectorAll('#seletorOrcamento option')].some(opcao => opcao.value === 'ORC-04')")
+        seletor.select_option("ORC-04")
+        assert page.locator("#orcamentoId").inner_text() == "ORC-04"
+        assert not venda_com_comissao.is_checked()
+        assert percentual_comissao.input_value() == "0,00"
+        assert ajuda_comissao.inner_text() == ""
+        orc04 = documento_orcamento(page, "ORC-04")
+        assert orc04["infoComercial"]["percentualComissao"] == 0
+        assert "tipoCliente" not in orc04["infoGerais"]
+
+        # 2. Cadastrar cliente e comissionado (comissionado com 0% é permitido).
+        preencher_e_sair(page.locator("#nomeCliente"), "Cliente Etapa 2B")
+        preencher_e_sair(page.locator("#nomeComissionado"), "Arquiteta Parceira")
+        page.wait_for_function("document.getElementById('nomeComissionado').value === 'Arquiteta Parceira'")
+        assert documento_orcamento(page, "ORC-04")["infoGerais"]["nomeComissionado"] == "Arquiteta Parceira"
+        assert documento_orcamento(page, "ORC-04")["infoComercial"]["percentualComissao"] == 0
+
+        # 3. Ativar a comissão: sem itens não há confirmação e o padrão é 10%.
+        venda_com_comissao.check()
+        page.wait_for_function("document.getElementById('percentualComissao').value === '10,00'")
+        assert venda_com_comissao.is_checked()
+        assert documento_orcamento(page, "ORC-04")["infoComercial"]["percentualComissao"] == 10
+        assert dialogos == []
+        # Percentual sem nome do comissionado gera só um aviso discreto.
+        page.locator("#nomeComissionado").fill("")
+        assert "sem nome do arquiteto" in ajuda_comissao.inner_text()
+        page.locator("#nomeComissionado").fill("Arquiteta Parceira")
+        assert ajuda_comissao.inner_text() == ""
+        page.locator("#nomeComissionado").blur()
+
+        # 4. Adicionar itens: 3 unidades num produto acabado e 2 avulsas (base R$ 200 cada).
+        preencher_e_sair(page.locator("#nomeProdutoAcabado"), "Cortina Etapa 2B")
+        preencher_e_sair(page.locator("#ambienteProdutoAcabado"), "Sala Etapa 2B")
+        page.locator("#btn-criar-produto-acabado").click()
+        page.locator(".btn-add-item-to-produto").wait_for(state="visible")
+        page.locator(".btn-add-item-to-produto").click()
+        page.locator("#modalAdicionarItem").wait_for(state="visible")
+        page.locator("#codigoOrcamento").fill("TEST-UNIT")
+        page.locator("#codigoOrcamento").press("Escape")
+        page.locator("#quantidade").fill("3")
+        page.locator("#previewCalculo").wait_for(state="visible")
+        assert "660,00" in page.locator("#previewCalculo").inner_text()
+        page.locator("#btn-adicionar-item").click()
+        page.locator("#modalAdicionarItem").wait_for(state="hidden")
+
+        page.locator("#btn-adicionar-item-avulso").click()
+        page.locator("#modalAdicionarItem").wait_for(state="visible")
+        page.locator("#codigoOrcamento").fill("TEST-UNIT")
+        page.locator("#codigoOrcamento").press("Escape")
+        page.locator("#quantidade").fill("2")
+        page.locator("#previewCalculo").wait_for(state="visible")
+        assert "440,00" in page.locator("#previewCalculo").inner_text()
+        page.locator("#btn-adicionar-item").click()
+        page.locator("#modalAdicionarItem").wait_for(state="hidden")
+
+        # 5. Conferir valores gravados e exibidos.
+        orc04 = documento_orcamento(page, "ORC-04")
+        item_produto = orc04["produtosAcabados"][0]["itens"][0]
+        item_avulso = orc04["itens"][0]
+        for item, sem_comissao, com_comissao in [(item_produto, 600, 660), (item_avulso, 400, 440)]:
+            assert item["precoUnitarioBase"] == 200
+            assert item["precoTotalSemComissao"] == sem_comissao
+            assert item["precoUnitario"] == 220
+            assert item["precoTotal"] == com_comissao
+            assert [campo for campo in ["valorComissao", "margemLiquida", "margemPercentual"] if campo in item] == []
+        itens_com_dez_porcento = itens_do_documento(orc04)
+        tabela = normalizar(page.locator("#tabelaOrcamento").text_content())
+        for valor in ["R$ 660,00", "R$ 440,00", "R$ 220,00"]:
+            assert valor in tabela, valor
+        assert texto_interno(page, "percentual") == "10,00%"
+        assert texto_interno(page, "subtotal-sem-comissao") == "R$ 1.000,00"
+        assert texto_interno(page, "valor-comissao") == "R$ 100,00"
+        assert texto_interno(page, "produtos-cobrados") == "R$ 1.100,00"
+        assert texto_interno(page, "liquido-filippini") == "R$ 1.000,00"
+        assert texto_interno(page, "margem-antes") == "R$ 500,00 (50.00%)"
+
+        # Instalação fica fora da comissão.
+        instalacao = page.locator('input[data-ambiente="Sala Etapa 2B"]')
+        instalacao.fill("150,00")
+        instalacao.blur()
+        page.wait_for_function("() => document.querySelector('[data-interno=\"valor-comissao\"]') !== null")
+
+        # 6. Aplicar desconto de 10% na aba Proposta.
+        tabs.nth(2).click()
+        preencher_e_sair(page.locator("#descontoGlobal"), "10")
+        page.wait_for_function("document.getElementById('orcamentoFinal').innerText.includes('990,00')")
+        orc04 = documento_orcamento(page, "ORC-04")
+        assert orc04["infoComercial"]["descontoGlobal"] == 10
+        assert orc04["valoresInstalacao"]["Sala Etapa 2B"] == 150
+        # A aba Proposta Cliente não tem indicador de margem, nem na tela.
+        assert page.locator("#margemComDesconto").count() == 0
+
+        # 7. Proposta reduzida: valores com a comissão embutida e nenhum dado econômico interno.
+        page.locator("#modoProposta").select_option("reduzida")
+        proposta = normalizar(page.locator("#orcamentoFinal").inner_text())
+        for esperado in ["Cortina Etapa 2B (Sala Etapa 2B)", "R$ 660,00", "R$ 440,00",
+                         "Subtotal Geral (Produtos sem desconto):", "R$ 1.100,00", "Desconto (10%):", "- R$ 110,00",
+                         "TOTAL DE PRODUTOS (Pago à Filippini):", "R$ 990,00", "R$ 150,00", "R$ 1.140,00"]:
+            assert esperado in proposta, esperado
+        verificar_aba_proposta_sem_dados_internos(page, "aba Proposta reduzida", VALORES_INTERNOS_DEZ_PORCENTO)
+
+        # 8. Proposta detalhada com valores por item.
+        page.locator("#modoProposta").select_option("detalhada")
+        page.locator("#mostrarValoresItens").check()
+        proposta_detalhada = normalizar(page.locator("#orcamentoFinal").inner_text())
+        for esperado in ["Detalhamento dos Itens", "Subtotal do Produto: R$ 660,00", "R$ 440,00", "R$ 1.140,00"]:
+            assert esperado in proposta_detalhada, esperado
+        verificar_aba_proposta_sem_dados_internos(page, "aba Proposta detalhada", VALORES_INTERNOS_DEZ_PORCENTO)
+
+        # 9. O bloco "🔒 Informações internas" existe uma única vez, dentro da aba Lançamento.
+        assert page.evaluate(
+            "[...document.querySelectorAll('#resumoInternoComissao')].map(bloco => bloco.closest('[role=\"tabpanel\"]').id)"
+        ) == ["tab2"]
+        assert "\U0001F512 Informações internas" in normalizar(page.locator("#resumoInternoComissao").text_content())
+
+        # 10. Impressão reduzida e detalhada: nenhum dado interno e paginação preservada.
+        page.locator("#modoProposta").select_option("reduzida")
+        texto_impresso = verificar_impressao_sem_dados_internos(page, "impressão reduzida", VALORES_INTERNOS_DEZ_PORCENTO)
+        assert "R$ 1.140,00" in texto_impresso
+        page.emulate_media(media="print")
+        assert page.locator("#tab2").evaluate("elemento => getComputedStyle(elemento).display") == "none"
+        # A notificação flutuante pode trazer "Comissão alterada para ..." e nunca é impressa.
+        assert page.locator("#app-notification").evaluate("elemento => getComputedStyle(elemento).display") == "none"
+        pdf_reduzido = page.pdf(format="A4", print_background=True, prefer_css_page_size=True)
+        assert len(re.findall(rb"/Type\s*/Page\b", pdf_reduzido)) == 1
+        page.emulate_media(media="screen")
+        page.locator("#modoProposta").select_option("detalhada")
+        texto_impresso_detalhado = verificar_impressao_sem_dados_internos(page, "impressão detalhada", VALORES_INTERNOS_DEZ_PORCENTO)
+        assert "Subtotal do Produto: R$ 660,00" in texto_impresso_detalhado
+        page.emulate_media(media="print")
+        pdf_detalhado = page.pdf(format="A4", print_background=True, prefer_css_page_size=True)
+        assert 1 <= len(re.findall(rb"/Type\s*/Page\b", pdf_detalhado)) <= 3
+        page.emulate_media(media="screen")
+
+        # 11. Informações internas somente na aba Lançamento.
+        tabs.nth(1).click()
+        assert page.locator("#resumoInternoComissao").is_visible()
+        assert "Não aparecem na proposta nem na impressão" in page.locator("#resumoInternoComissao").inner_text()
+        assert texto_interno(page, "desconto-base") == "- R$ 100,00"
+        assert texto_interno(page, "base-liquida") == "R$ 900,00"
+        assert texto_interno(page, "valor-comissao") == "R$ 90,00"
+        assert texto_interno(page, "produtos-cobrados") == "R$ 990,00"
+        assert texto_interno(page, "liquido-filippini") == "R$ 900,00"
+        assert texto_interno(page, "margem-depois") == "R$ 400,00 (44.44% do líquido)"
+        page.locator("#resumoInternoComissao").screenshot(path=str(artifacts / "comissao-resumo-interno.png"))
+        page.locator(".grupo-comissionado").screenshot(path=str(artifacts / "comissao-controles-desktop.png"))
+
+        # 12 e 13. Trocar 10% por 5% e aceitar a confirmação.
+        mensagem_recalculo = "Alterar o percentual recalculará os preços dos itens deste orçamento. Deseja continuar?"
+        aceitar_dialogo(page, dialogos)
+        preencher_e_sair(percentual_comissao, "5")
+        page.wait_for_function("document.getElementById('percentualComissao').value === '5,00'")
+        assert dialogos == [mensagem_recalculo]
+
+        # 14. Novos valores: base, custo e quantidade preservados.
+        orc04 = documento_orcamento(page, "ORC-04")
+        assert orc04["infoComercial"]["percentualComissao"] == 5
+        item_produto = orc04["produtosAcabados"][0]["itens"][0]
+        assert item_produto["precoUnitarioBase"] == 200
+        assert item_produto["precoTotalSemComissao"] == 600
+        assert item_produto["precoUnitario"] == 210
+        assert item_produto["precoTotal"] == 630
+        assert item_produto["custoReal"] == 300
+        assert item_produto["quantidade"] == 3
+        assert orc04["itens"][0]["precoTotal"] == 420
+        assert venda_com_comissao.is_checked()
+        assert texto_interno(page, "valor-comissao") == "R$ 45,00"
+        assert texto_interno(page, "produtos-cobrados") == "R$ 945,00"
+        assert texto_interno(page, "liquido-filippini") == "R$ 900,00"
+        tabs.nth(2).click()
+        assert "R$ 1.050,00" in normalizar(page.locator("#orcamentoFinal").inner_text())
+        verificar_aba_proposta_sem_dados_internos(page, "aba Proposta com 5%", [
+            "5,00%", "r$ 1.000,00", "r$ 900,00", "r$ 45,00", "r$ 500,00", "r$ 400,00", "44.44%", "44,44%",
+        ])
+        tabs.nth(1).click()
+
+        # 15. Trocar de novo (5 -> 7,5 -> 10) sem acumular: volta exatamente aos itens com 10%.
+        aceitar_dialogo(page, dialogos)
+        preencher_e_sair(percentual_comissao, "7,5")
+        page.wait_for_function("document.getElementById('percentualComissao').value === '7,50'")
+        assert documento_orcamento(page, "ORC-04")["itens"][0]["precoTotal"] == 430
+        aceitar_dialogo(page, dialogos)
+        preencher_e_sair(percentual_comissao, "10")
+        page.wait_for_function("document.getElementById('percentualComissao').value === '10,00'")
+        orc04 = documento_orcamento(page, "ORC-04")
+        assert itens_do_documento(orc04) == itens_com_dez_porcento
+        assert texto_interno(page, "valor-comissao") == "R$ 90,00"
+
+        # 16. Cancelar a alteração devolve percentual, itens e totais exatamente como estavam.
+        antes_cancelamento = documento_orcamento(page, "ORC-04")
+        aceitar_dialogo(page, dialogos, aceitar=False)
+        preencher_e_sair(percentual_comissao, "12,34")
+        assert dialogos[-1] == mensagem_recalculo
+        assert percentual_comissao.input_value() == "10,00"
+        assert documento_orcamento(page, "ORC-04") == antes_cancelamento
+        aceitar_dialogo(page, dialogos, aceitar=False)
+        venda_com_comissao.click()
+        assert venda_com_comissao.is_checked()
+        assert percentual_comissao.input_value() == "10,00"
+        assert documento_orcamento(page, "ORC-04") == antes_cancelamento
+        assert texto_interno(page, "valor-comissao") == "R$ 90,00"
+        # Valor inválido não gera diálogo nem gravação.
+        quantidade_dialogos = len(dialogos)
+        preencher_e_sair(percentual_comissao, "150")
+        assert len(dialogos) == quantidade_dialogos
+        assert percentual_comissao.input_value() == "10,00"
+        assert documento_orcamento(page, "ORC-04") == antes_cancelamento
+
+        # 17 e 18. Duplicar: a cópia nasce com o percentual gravado e as mesmas bases.
+        page.locator("#btn-duplicar-orcamento").click()
+        page.wait_for_function("document.querySelector('#seletorOrcamento').value === 'ORC-05'")
+        orc05 = documento_orcamento(page, "ORC-05")
+        assert orc05["infoComercial"]["percentualComissao"] == 10
+        assert "tipoCliente" not in orc05["infoGerais"]
+        assert orc05["infoGerais"]["nomeComissionado"] == "Arquiteta Parceira"
+        assert orc05["statusDocumento"] == "orcamento"
+        assert itens_do_documento(orc05) == itens_do_documento(antes_cancelamento)
+        assert venda_com_comissao.is_checked()
+        assert percentual_comissao.input_value() == "10,00"
+        assert texto_interno(page, "valor-comissao") == "R$ 90,00"
+
+        # 19. Confirmar o pedido do orçamento original.
+        seletor.select_option("ORC-04")
+        aceitar_dialogo(page, dialogos)
+        page.locator("#btn-confirmar-pedido").click()
+        page.wait_for_function("document.getElementById('statusDocumento').textContent.startsWith('Pedido confirmado')")
+        pedido04 = documento_orcamento(page, "ORC-04")
+        assert pedido04["pedido"]["versaoSnapshot"] == 1
+        assert pedido04["infoComercial"]["percentualComissao"] == 10
+
+        # 20. Campo de comissão bloqueado, inclusive se reabilitado à força.
+        assert venda_com_comissao.is_disabled()
+        assert percentual_comissao.is_disabled()
+        quantidade_dialogos = len(dialogos)
+        percentual_comissao.evaluate("campo => { campo.disabled = false; campo.value = '5'; campo.dispatchEvent(new Event('change')); }")
+        assert "já foi confirmado como pedido" in texto_visivel(page.locator("#app-notification"))
+        assert percentual_comissao.input_value() == "10,00"
+        assert len(dialogos) == quantidade_dialogos
+        assert documento_orcamento(page, "ORC-04") == pedido04
+
+        # Regressão: relatórios do pedido usam só quantidade e custo, sem preço de venda nem comissão.
+        page.evaluate("""() => {
+            window.__planilhas = [];
+            window.print = () => {};
+            window.XLSX = {
+                utils: {
+                    book_new: () => ({}),
+                    aoa_to_sheet: linhas => ({ __linhas: linhas }),
+                    book_append_sheet: (_livro, aba, nome) => window.__planilhas.push({ nome, linhas: aba.__linhas }),
+                    encode_cell: ({ r, c }) => `${r}:${c}`,
+                    decode_range: () => ({ s: { r: 0, c: 0 }, e: { r: 0, c: 0 } })
+                },
+                writeFile: () => {}
+            };
+        }""")
+        page.locator("#mostrarCustosFornecedor").check()
+        page.locator("#btn-baixar-excel-pedido-ao-fornecedor").click()
+        planilhas = page.evaluate("window.__planilhas")
+        assert [planilha["nome"] for planilha in planilhas] == ["Fornecedor Teste"]
+        linhas_fornecedor = planilhas[0]["linhas"]
+        assert linhas_fornecedor[8:] == [
+            ["TEST-UNIT", "Produto válido para teste de navegador", "Unidade", 5, 100, 500],
+            [],
+            ["", "TOTAL", "", "", "", 500],
+        ]
+        celulas_fornecedor = [celula for linha in linhas_fornecedor for celula in linha]
+        verificar_sem_dados_internos(" | ".join(str(celula) for celula in celulas_fornecedor),
+                                     "relatório do fornecedor", termos=TERMOS_INTERNOS_FORNECEDOR)
+        # Nenhum preço de venda, comissão, base ou líquido; só quantidade e custo de compra.
+        assert {660, 440, 1100, 990, 900, 90, 220} & {celula for celula in celulas_fornecedor if isinstance(celula, (int, float))} == set()
+        tabs.nth(2).click()
+        page.locator("#btn-imprimir-instrucoes-ao-instalador").click()
+        relatorio_instalador = normalizar(page.locator("#orcamentoFinal").inner_text())
+        assert "Retirada para instalação" in relatorio_instalador
+        assert "TEST-UNIT" in relatorio_instalador
+        assert "R$" not in relatorio_instalador
+        verificar_sem_dados_internos(relatorio_instalador, "relatório do instalador", VALORES_INTERNOS_DEZ_PORCENTO)
+        verificar_sem_dados_internos(page.locator("#orcamentoFinal").inner_html(), "HTML do relatório do instalador")
+        page.evaluate("window.onafterprint && window.onafterprint()")
+        tabs.nth(1).click()
+
+        # Documento antigo de arquiteto: 10% herdados, leitura sem gravação e recálculo sem catálogo.
+        orc90 = {
+            "id": "ORC-90",
+            "statusDocumento": "orcamento",
+            "infoGerais": {"nome": "Orçamento ORC-90", "nomeCliente": "Cliente Arquiteto Antigo",
+                           "tipoCliente": "arquiteto", "dataOrcamento": "2025-01-01", "prazoEntrega": "30 dias úteis"},
+            "infoComercial": {"condicaoPagamento": "À vista", "formaPagamento": "PIX", "descontoGlobal": 0,
+                              "observacoesComerciais": ""},
+            "itens": [{
+                "id": "item-antigo-1", "ambiente": "", "categoria": "Acessórios", "codigo": "CODIGO-FORA-DO-CATALOGO",
+                "descricao": "Item antigo", "cor": "Branco", "fornecedor": "Fornecedor Teste", "quantidade": 3,
+                "largura": None, "altura": None, "unidadeMedida": "Unidade", "precoUnitario": 220, "precoTotal": 660,
+                "custoReal": 300, "quantidadeCompra": 3, "precoCompraUnitario": 100, "margemLiquida": 300,
+                "margemPercentual": 45.45, "valorComissao": 60, "observacoes": "",
+            }],
+            "produtosAcabados": [],
+            "valoresInstalacao": {},
+        }
+        page.evaluate("""async (documento) => {
+            const firestore = await import('https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js');
+            await firestore.setDoc(firestore.doc(null, 'orcamentos', documento.id), documento);
+        }""", orc90)
+        page.wait_for_function("[...document.querySelectorAll('#seletorOrcamento option')].some(opcao => opcao.value === 'ORC-90')")
+        seletor.select_option("ORC-90")
+        assert venda_com_comissao.is_checked()
+        assert percentual_comissao.input_value() == "10,00"
+        assert "herdado do tipo de cliente antigo" in page.locator("#resumoInternoComissao").inner_text()
+        assert texto_interno(page, "valor-comissao") == "R$ 60,00"
+        assert texto_interno(page, "liquido-filippini") == "R$ 600,00"
+        percentual_comissao.focus()
+        percentual_comissao.blur()
+        tabs.nth(2).click()
+        assert "R$ 660,00" in normalizar(page.locator("#orcamentoFinal").inner_text())
+        # Base 600, comissão 60, custo 300 e margem 300 são internos.
+        verificar_aba_proposta_sem_dados_internos(page, "aba Proposta de documento antigo de arquiteto", [
+            "10,00%", "r$ 600,00", "r$ 60,00", "r$ 300,00",
+        ])
+        tabs.nth(1).click()
+        assert documento_orcamento(page, "ORC-90") == orc90
+        aceitar_dialogo(page, dialogos)
+        preencher_e_sair(percentual_comissao, "5")
+        page.wait_for_function("document.getElementById('percentualComissao').value === '5,00'")
+        orc90_recalculado = documento_orcamento(page, "ORC-90")
+        item_antigo = orc90_recalculado["itens"][0]
+        assert orc90_recalculado["infoComercial"]["percentualComissao"] == 5
+        assert orc90_recalculado["infoGerais"]["tipoCliente"] == "arquiteto"
+        assert item_antigo["precoUnitarioBase"] == 200
+        assert item_antigo["precoTotalSemComissao"] == 600
+        assert item_antigo["precoTotal"] == 630
+        assert item_antigo["custoReal"] == 300
+        assert item_antigo["codigo"] == "CODIGO-FORA-DO-CATALOGO"
+        assert [campo for campo in ["valorComissao", "margemLiquida", "margemPercentual"] if campo in item_antigo] == []
+
+        # Celular: controles de comissão e resumo interno sem rolagem horizontal.
+        seletor.select_option("ORC-05")
+        page.set_viewport_size({"width": 390, "height": 844})
+        page.wait_for_timeout(100)
+        assert sem_rolagem_horizontal(page)
+        page.locator(".grupo-comissionado").screenshot(path=str(artifacts / "comissao-mobile-smoke.png"))
+        tabs.nth(2).click()
+        page.wait_for_timeout(100)
+        assert sem_rolagem_horizontal(page)
+        # Mesma garantia de privacidade no layout de celular (ORC-05: cópia com 10%, desconto e instalação).
+        verificar_aba_proposta_sem_dados_internos(page, "aba Proposta em 390 px", VALORES_INTERNOS_DEZ_PORCENTO)
+        verificar_impressao_sem_dados_internos(page, "impressão em 390 px", VALORES_INTERNOS_DEZ_PORCENTO)
+        page.set_viewport_size({"width": 1440, "height": 1000})
+
         assert console_errors == []
         assert request_failures == []
         browser.close()
@@ -453,7 +906,7 @@ def main():
     print(
         "Browser smoke test passou: login, prévia com produto válido, salvamento, "
         "duplicação, validade, impressão, proposta detalhada móvel, contatos, WhatsApp, "
-        "follow-ups, status perdido/reaberto e pedido confirmado validados."
+        "follow-ups, status perdido/reaberto, pedido confirmado e comissão configurável validados."
     )
 
 

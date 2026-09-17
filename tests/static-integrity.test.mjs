@@ -83,6 +83,36 @@ test('impressão esconde todas as abas, exceto a proposta', () => {
     assert.deepEqual(paineis, ['tab1', 'tab2', 'tab3', 'tab-followups', 'tab4']);
     paineis.filter(id => id !== 'tab3').forEach(id => assert.ok(seletores.includes(`#${id}`), `#${id} deve ficar fora da impressão`));
     assert.equal(seletores.includes('#tab3'), false);
+    // Notificações podem conter mensagens internas (ex.: alteração da comissão).
+    assert.ok(seletores.includes('.app-notification'), 'a notificação flutuante deve ficar fora da impressão');
+});
+
+test('controles de comissão ficam no bloco do comissionado e o tipo de cliente saiu da tela', () => {
+    const grupoComissionado = html.match(/<fieldset class=["']grupo-comissionado["']>([\s\S]*?)<\/fieldset>/i);
+    assert.ok(grupoComissionado, 'bloco do comissionado não encontrado');
+    assert.match(grupoComissionado[1], /<input type=["']checkbox["'] id=["']vendaComComissao["']/);
+    assert.match(grupoComissionado[1], /<label for=["']percentualComissao["']>Percentual da comissão:<\/label>/);
+    assert.match(grupoComissionado[1], /id=["']percentualComissao["'][^>]*inputmode=["']decimal["']/);
+    assert.doesNotMatch(html, /id=["']tipoCliente["']/);
+    assert.doesNotMatch(appSource, /getElementById\(['"]tipoCliente['"]\)/);
+
+});
+
+test('aba Proposta Cliente não contém nenhuma informação econômica interna', () => {
+    // A aba é inteiramente voltada ao cliente, na tela e na impressão.
+    const abaProposta = html.match(/<div id=["']tab3["'][\s\S]*?<div id=["']tab-followups["']/i);
+    assert.ok(abaProposta, 'aba Proposta não encontrada');
+    assert.doesNotMatch(abaProposta[0], /comiss|margem|custo|l[ií]quido|base l[ií]quida|informa[cç][oõ]es internas|margemComDesconto/i);
+
+    // A montagem da proposta só usa valores cobrados do cliente (comentários são ignorados).
+    const inicio = appSource.indexOf('function atualizarPropostaCliente()');
+    const fim = appSource.indexOf('function abrirModalEdicaoItemOrcamento(');
+    assert.ok(inicio > 0 && fim > inicio, 'função atualizarPropostaCliente não encontrada');
+    const codigoProposta = appSource.slice(inicio, fim).replace(/(^|[^:])\/\/.*$/gm, '$1');
+    const referenciasInternas = codigoProposta.match(
+        /margem\w*|custo\w*|liquidoFilippini|valorComissao|baseLiquida|subtotalSemComissao|descontoBase|nomeComissionado|residuo|resumoInterno\w*|data-interno/gi
+    ) || [];
+    assert.deepEqual(referenciasInternas, []);
 });
 
 test('módulos importados pela aplicação fazem parte do pacote do Hosting', async () => {
