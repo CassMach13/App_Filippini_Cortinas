@@ -2,9 +2,12 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import {
+    TAMANHO_MAXIMO_MOTIVO_CANCELAMENTO,
+    avaliarRestauracaoOrcamento,
     cancelarPedido,
     confirmarOrcamentoComoPedido,
-    obterItensAtuaisDoOrcamento
+    obterItensAtuaisDoOrcamento,
+    validarCancelamentoPedido
 } from '../../order-domain.js';
 import { calcularDetalhesItem } from '../../pricing-domain.js';
 
@@ -362,4 +365,113 @@ test('restauração de backup: cria pedido v1 íntegro ou v2 válido, sem sobres
     // Orçamento existente não vira pedido por restauração.
     await semear('ORC-65', criarOrcamento('ORC-65'));
     assert.equal((await mesclar(USUARIO, 'ORC-65', pedidoV1(criarOrcamento('ORC-65')))).permitido, false);
+});
+
+test('motivo do cancelamento segue o contrato do domínio: até 500 caracteres e sem espaços nas pontas', async () => {
+    const confirmado = confirmar(criarOrcamento());
+    const cancelamentoCom = motivo => ({ ...CANCELAMENTO, motivo });
+    const tentar = async motivo => {
+        await limpar();
+        await semear('ORC-50', confirmado);
+        return (await atualizar(USUARIO, 'ORC-50', { 'pedido.cancelamento': cancelamentoCom(motivo) })).permitido;
+    };
+
+    assert.equal(TAMANHO_MAXIMO_MOTIVO_CANCELAMENTO, 500);
+    assert.equal(await tentar('x'.repeat(500)), true, '500 caracteres');
+    assert.equal(await tentar('é'.repeat(500)), true, '500 caracteres acentuados');
+    assert.equal(await tentar('x'.repeat(501)), false, '501 caracteres');
+    assert.equal(await tentar(' motivo '), false, 'espaços nas extremidades');
+    assert.equal(await tentar('motivo '), false, 'espaço no fim');
+    assert.equal(await tentar(''), false, 'vazio');
+    assert.equal(await tentar('   '), false, 'só espaços');
+
+    // O domínio aceita e recusa exatamente os mesmos motivos.
+    assert.deepEqual(validarCancelamentoPedido(cancelamentoCom('x'.repeat(500))), []);
+    assert.deepEqual(validarCancelamentoPedido(cancelamentoCom('é'.repeat(500))), []);
+    ['x'.repeat(501), ' motivo ', 'motivo ', '', '   '].forEach(motivo => {
+        assert.ok(validarCancelamentoPedido(cancelamentoCom(motivo)).length > 0, JSON.stringify(motivo));
+    });
+});
+
+test('documento que não é pedido não carrega snapshot, nem na criação nem antes da confirmação', async () => {
+    await limpar();
+    const orcamento = criarOrcamento();
+    const snapshotV2 = confirmar(orcamento).pedido;
+    const snapshotV1 = pedidoV1(orcamento).pedido;
+
+    // 1. Orçamento novo não nasce com pedido.
+    assert.equal((await gravarDocumento(USUARIO, 'ORC-50', { ...orcamento, pedido: snapshotV2 })).permitido, false, 'criação com snapshot v2');
+    assert.equal((await gravarDocumento(USUARIO, 'ORC-50', { ...orcamento, pedido: snapshotV1 })).permitido, false, 'criação com snapshot v1');
+    assert.equal((await mesclar(USUARIO, 'ORC-50', { ...orcamento, pedido: snapshotV2 })).permitido, false, 'restauração de orçamento com snapshot');
+    assert.equal((await gravarDocumento(USUARIO, 'ORC-50', orcamento)).permitido, true, 'criação normal');
+
+    // 2. Orçamento existente não recebe pedido sem mudar o status.
+    assert.equal((await atualizar(USUARIO, 'ORC-50', { pedido: snapshotV2 })).permitido, false, 'plantar snapshot por update');
+    assert.equal((await atualizar(USUARIO, 'ORC-50', { ...orcamento, pedido: snapshotV2 })).permitido, false, 'plantar snapshot regravando o documento');
+    assert.equal((await mesclar(USUARIO, 'ORC-50', { pedido: snapshotV2 })).permitido, false, 'plantar snapshot por merge');
+
+    // 3. Como o passo 2 falha, trocar só o status não encontra snapshot e é recusado.
+    assert.equal((await atualizar(USUARIO, 'ORC-50', { statusDocumento: 'pedido' })).permitido, false, 'trocar só o status');
+    // Mesmo um snapshot válido já gravado (dado inconsistente) não permite confirmar.
+    const plantado = confirmar(criarOrcamento('ORC-51'));
+    await semear('ORC-51', { ...criarOrcamento('ORC-51'), pedido: plantado.pedido });
+    assert.equal((await atualizar(USUARIO, 'ORC-51', { statusDocumento: 'pedido' })).permitido, false, 'status sobre snapshot plantado');
+    assert.equal((await atualizar(USUARIO, 'ORC-51', camposDaConfirmacao(plantado))).permitido, false, 'confirmação sobre snapshot plantado');
+    assert.equal((await atualizar(USUARIO, 'ORC-51', { 'infoGerais.nomeCliente': 'Outro' })).permitido, false, 'orçamento com snapshot não aceita edição');
+
+    // 4. A confirmação transacional normal continua permitida.
+    assert.equal((await atualizar(USUARIO, 'ORC-50', camposDaConfirmacao(confirmar(orcamento)))).permitido, true, 'confirmação v2');
+
+    // 5. Perdido não carrega pedido.
+    await semear('ORC-52', { ...criarOrcamento('ORC-52'), statusDocumento: 'perdido' });
+    assert.equal((await atualizar(USUARIO, 'ORC-52', { pedido: snapshotV2 })).permitido, false, 'perdido recebe snapshot');
+    assert.equal((await gravarDocumento(USUARIO, 'ORC-53', { ...criarOrcamento('ORC-53'), statusDocumento: 'perdido', pedido: snapshotV2 })).permitido, false, 'perdido nasce com snapshot');
+    await semear('ORC-54', criarOrcamento('ORC-54'));
+    assert.equal((await atualizar(USUARIO, 'ORC-54', { statusDocumento: 'perdido', pedido: snapshotV2 })).permitido, false, 'marcar perdido com snapshot');
+    assert.equal((await atualizar(USUARIO, 'ORC-54', { statusDocumento: 'perdido' })).permitido, true, 'marcar perdido normal');
+    assert.equal((await atualizar(USUARIO, 'ORC-52', { statusDocumento: 'orcamento', 'infoGerais.celularCliente': '5511987654321' })).permitido, true, 'reabrir perdido');
+});
+
+test('restauração de pedido v1 exige o contrato histórico completo', async () => {
+    const completo = pedidoV1(criarOrcamento('ORC-60'));
+    const snapshotV2 = confirmar(criarOrcamento('ORC-60')).pedido;
+    const casosRecusados = [
+        ['orcamentoId divergente', p => { p.orcamentoId = 'ORC-99'; }],
+        ['sem cliente', p => { delete p.cliente; }],
+        ['sem costureira', p => { delete p.costureira; }],
+        ['sem itens', p => { delete p.itens; }],
+        ['itens vazios', p => { p.itens = []; }],
+        ['campo extra no snapshot', p => { p.observacao = 'extra'; }],
+        ['financeiro em v1', p => { p.financeiro = snapshotV2.financeiro; }],
+        ['proposta em v1', p => { p.proposta = snapshotV2.proposta; }],
+        ['cliente com campo extra', p => { p.cliente.telefone = '11999999999'; }],
+        ['costureira sem endereço de entrega', p => { delete p.costureira.enderecoEntrega; }],
+        ['confirmadoPor numérico', p => { p.confirmadoPor = 42; }],
+        ['sem confirmadoPor', p => { delete p.confirmadoPor; }],
+        ['confirmadoEm fora do formato', p => { p.confirmadoEm = '12/09/2026'; }],
+        ['cancelamento com 501 caracteres', p => { p.cancelamento = { ...CANCELAMENTO, motivo: 'x'.repeat(501) }; }],
+        ['cancelamento com espaços nas pontas', p => { p.cancelamento = { ...CANCELAMENTO, motivo: ' Cancelado ' }; }]
+    ];
+    for (const [nome, alterar] of casosRecusados) {
+        await limpar();
+        const documento = structuredClone(completo);
+        alterar(documento.pedido);
+        assert.equal((await mesclar(USUARIO, 'ORC-60', documento)).permitido, false, nome);
+        // Regras e domínio (avaliarRestauracaoOrcamento) concordam.
+        assert.equal(avaliarRestauracaoOrcamento(null, documento).gravar, false, nome);
+    }
+
+    await limpar();
+    assert.equal((await mesclar(USUARIO, 'ORC-60', completo)).permitido, true, 'backup v1 completo');
+    assert.deepEqual(avaliarRestauracaoOrcamento(null, completo), { gravar: true });
+
+    const cancelado = pedidoV1(criarOrcamento('ORC-61'));
+    cancelado.pedido.cancelamento = { ...CANCELAMENTO, motivo: 'Pedido antigo cancelado' };
+    assert.equal((await mesclar(USUARIO, 'ORC-61', cancelado)).permitido, true, 'backup v1 cancelado');
+    assert.deepEqual(avaliarRestauracaoOrcamento(null, cancelado), { gravar: true });
+
+    const confirmadoPorNulo = pedidoV1(criarOrcamento('ORC-62'));
+    confirmadoPorNulo.pedido.confirmadoPor = null;
+    assert.equal((await mesclar(USUARIO, 'ORC-62', confirmadoPorNulo)).permitido, true, 'confirmadoPor nulo');
+    assert.deepEqual(avaliarRestauracaoOrcamento(null, confirmadoPorNulo), { gravar: true });
 });

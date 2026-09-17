@@ -612,6 +612,41 @@ test('blocos financeiros derivados não dependem de estado externo', () => {
     assert.equal(calcularFinanceiroDoOrcamento(orcamento, { confirmadoEm: 'inválido' }).financeiro.dataVenda, null);
 });
 
+test('espelho das regras: restauração exige o contrato v1 completo e orçamento sem snapshot', () => {
+    const v1 = criarPedidoV1(criarOrcamento({ id: 'ORC-82' }));
+    assert.deepEqual(avaliarRestauracaoOrcamento(null, v1), { gravar: true });
+    assert.deepEqual(avaliarRestauracaoOrcamento(null, cancelarPedido(v1, CANCELAMENTO)), { gravar: true });
+
+    const invalidos = [
+        ['orcamentoId divergente', p => { p.orcamentoId = 'ORC-99'; }],
+        ['sem cliente', p => { delete p.cliente; }],
+        ['sem costureira', p => { delete p.costureira; }],
+        ['sem itens', p => { delete p.itens; }],
+        ['itens vazios', p => { p.itens = []; }],
+        ['campo extra', p => { p.observacao = 'x'; }],
+        ['financeiro', p => { p.financeiro = {}; }],
+        ['proposta', p => { p.proposta = {}; }],
+        ['cliente com campo extra', p => { p.cliente.telefone = '1'; }],
+        ['confirmadoPor numérico', p => { p.confirmadoPor = 1; }],
+        ['sem confirmadoPor', p => { delete p.confirmadoPor; }],
+        ['confirmadoEm com fuso local', p => { p.confirmadoEm = '2026-09-12T12:00:00.000-03:00'; }],
+        ['cancelamento com 501 caracteres', p => { p.cancelamento = { ...CANCELAMENTO, motivo: 'x'.repeat(501) }; }],
+        ['cancelamento com espaços nas pontas', p => { p.cancelamento = { ...CANCELAMENTO, motivo: ' motivo ' }; }]
+    ];
+    invalidos.forEach(([nome, alterar]) => {
+        assert.equal(avaliarRestauracaoOrcamento(null, comAlteracao(v1, alterar)).motivo, 'pedido-v1-incompleto', nome);
+    });
+
+    // Documento que não é pedido não carrega snapshot.
+    const snapshot = confirmar(criarOrcamento({ id: 'ORC-84' })).pedido;
+    const orcamentoComSnapshot = { ...criarOrcamento({ id: 'ORC-84' }), pedido: snapshot };
+    assert.equal(avaliarRestauracaoOrcamento(null, orcamentoComSnapshot).motivo, 'orcamento-com-snapshot');
+    assert.equal(avaliarRestauracaoOrcamento(null, { ...orcamentoComSnapshot, statusDocumento: 'perdido' }).motivo, 'orcamento-com-snapshot');
+    assert.equal(avaliarRestauracaoOrcamento(criarOrcamento({ id: 'ORC-84' }), orcamentoComSnapshot).motivo, 'orcamento-com-snapshot');
+    assert.equal(avaliarRestauracaoOrcamento(orcamentoComSnapshot, criarOrcamento({ id: 'ORC-84' })).motivo, 'orcamento-atual-com-snapshot');
+    assert.deepEqual(avaliarRestauracaoOrcamento(criarOrcamento({ id: 'ORC-84' }), criarOrcamento({ id: 'ORC-84' })), { gravar: true });
+});
+
 test('restauração de backup preserva pedidos confirmados e só cria pedidos v1 íntegros ou v2 válidos', () => {
     const orcamento = criarOrcamento({ id: 'ORC-80', percentualComissao: 10 });
     const pedidoV2 = confirmar(orcamento);

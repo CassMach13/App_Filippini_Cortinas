@@ -2,12 +2,13 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 
-const [html, appSource, firebaseConfig, firestoreRules, packageJson] = await Promise.all([
+const [html, appSource, firebaseConfig, firestoreRules, packageJson, domainSource] = await Promise.all([
     readFile(new URL('../index.html', import.meta.url), 'utf8'),
     readFile(new URL('../apps.js', import.meta.url), 'utf8'),
     readFile(new URL('../firebase.json', import.meta.url), 'utf8').then(JSON.parse),
     readFile(new URL('../firestore.rules', import.meta.url), 'utf8'),
-    readFile(new URL('../package.json', import.meta.url), 'utf8').then(JSON.parse)
+    readFile(new URL('../package.json', import.meta.url), 'utf8').then(JSON.parse),
+    readFile(new URL('../order-domain.js', import.meta.url), 'utf8')
 ]);
 
 test('todos os IDs acessados diretamente no JavaScript existem no HTML', () => {
@@ -248,6 +249,13 @@ test('regras do Firestore protegem pedidos sem abrir permissões genéricas em o
     assert.match(blocoOrcamentos[1], /allow create: if isSignedIn\(\) && criacaoValida\(documentId\);/);
     assert.match(blocoOrcamentos[1], /allow delete: if isSignedIn\(\) && \(resource == null \|\| !ehPedido\(resource\.data\)\);/);
     assert.match(firestoreRules, /pedido\.versaoSnapshot == 2/);
+    // Cancelamento com o mesmo limite do domínio e documento sem pedido proibido de carregar snapshot.
+    const limiteMotivo = Number(domainSource.match(/TAMANHO_MAXIMO_MOTIVO_CANCELAMENTO = (\d+);/)[1]);
+    assert.equal(limiteMotivo, 500);
+    assert.match(firestoreRules, new RegExp(`c\\.motivo\\.size\\(\\) <= ${limiteMotivo};`));
+    assert.match(firestoreRules, /c\.motivo == c\.motivo\.trim\(\)/);
+    assert.match(firestoreRules, /return !ehPedido\(dados\) && !\('pedido' in dados\);/);
+    assert.match(firestoreRules, /&& !\('pedido' in antes\)/);
     assert.match(firestoreRules, /affectedKeys\(\)\.hasOnly\(\['infoGerais', 'apresentacao', 'firestoreId', 'pedido'\]\)/);
     // As demais coleções não mudaram.
     ['precos', 'fornecedores', 'categorias', 'unidadesDeMedida', 'contadores'].forEach(colecao => {

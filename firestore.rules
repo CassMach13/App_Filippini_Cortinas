@@ -16,6 +16,12 @@ service cloud.firestore {
       return dados.get('statusDocumento', 'orcamento') == 'pedido';
     }
 
+    function ehOrcamentoSemSnapshot(dados) {
+      // Invariante: documento que não é pedido (em negociação ou perdido) não carrega snapshot. O
+      // snapshot só nasce na mesma escrita que confirma o pedido, a partir do estado mais recente.
+      return !ehPedido(dados) && !('pedido' in dados);
+    }
+
     function instanteIsoUtc(valor) {
       // Exatamente o formato de Date.prototype.toISOString().
       return valor is string
@@ -83,11 +89,16 @@ service cloud.firestore {
     }
 
     function cancelamentoValido(c) {
+      // Mesmo contrato do domínio (validarCancelamentoPedido): motivo sem espaços nas extremidades,
+      // não vazio e com no máximo TAMANHO_MAXIMO_MOTIVO_CANCELAMENTO (500) caracteres.
       let campos = ['canceladoEm', 'canceladoPor', 'motivo'];
       return c is map && c.keys().hasAll(campos) && c.keys().hasOnly(campos)
         && instanteIsoUtc(c.canceladoEm)
         && textoOuNulo(c.canceladoPor)
-        && c.motivo is string && c.motivo.trim().size() > 0 && c.motivo.size() <= 2000;
+        && c.motivo is string
+        && c.motivo == c.motivo.trim()
+        && c.motivo.size() > 0
+        && c.motivo.size() <= 500;
     }
 
     function snapshotV2Valido(pedido, documentId) {
@@ -109,30 +120,42 @@ service cloud.firestore {
         && (!('cancelamento' in pedido) || cancelamentoValido(pedido.cancelamento));
     }
 
-    function snapshotV1Restauravel(pedido) {
+    function snapshotV1Restauravel(pedido, documentId) {
       // Exceção documentada: somente a criação direta (restauração de backup histórico) aceita v1.
-      // A confirmação de um documento existente (update) nunca aceita v1.
+      // A confirmação de um documento existente (update) nunca aceita v1. O formato exigido é o
+      // contrato histórico completo do v1 (igual em todas as versões que o geraram), mais o registro
+      // de cancelamento quando o pedido v1 foi cancelado depois.
+      let obrigatorios = ['versaoSnapshot', 'orcamentoId', 'confirmadoEm', 'confirmadoPor',
+        'cliente', 'costureira', 'itens'];
       return pedido is map
+        && pedido.keys().hasAll(obrigatorios)
+        && pedido.keys().hasOnly(obrigatorios.concat(['cancelamento']))
         && pedido.versaoSnapshot is int && pedido.versaoSnapshot == 1
+        && pedido.orcamentoId == documentId
         && instanteIsoUtc(pedido.confirmadoEm)
-        && pedido.itens is list
+        && textoOuNulo(pedido.confirmadoPor)
+        && textos(pedido.cliente, ['nome', 'endereco'])
+        && textos(pedido.costureira, ['nome', 'enderecoEntrega'])
+        && pedido.itens is list && pedido.itens.size() > 0
         && !('financeiro' in pedido)
         && !('proposta' in pedido)
         && (!('cancelamento' in pedido) || cancelamentoValido(pedido.cancelamento));
     }
 
     function criacaoValida(documentId) {
+      // Orçamento novo nasce sem snapshot; pedido só é criado diretamente na restauração de backup.
       let dados = request.resource.data;
-      return !ehPedido(dados)
-        || ('pedido' in dados
-          && (snapshotV1Restauravel(dados.pedido) || snapshotV2Valido(dados.pedido, documentId)));
+      return ehOrcamentoSemSnapshot(dados)
+        || (ehPedido(dados) && 'pedido' in dados
+          && (snapshotV1Restauravel(dados.pedido, documentId) || snapshotV2Valido(dados.pedido, documentId)));
     }
 
     function confirmacaoValida(documentId) {
-      // Orçamento em negociação → pedido, feito pela transação de confirmação.
+      // Orçamento em negociação, ainda sem snapshot → pedido v2, feito pela transação de confirmação.
       let antes = resource.data;
       let depois = request.resource.data;
       return antes.get('statusDocumento', 'orcamento') == 'orcamento'
+        && !('pedido' in antes)
         && depois.diff(antes).affectedKeys().hasOnly(['statusDocumento', 'pedido', 'infoComercial'])
         && snapshotV2Valido(depois.pedido, documentId)
         && !('cancelamento' in depois.pedido)
@@ -182,7 +205,9 @@ service cloud.firestore {
       allow update: if isSignedIn() && (
         ehPedido(resource.data)
           ? atualizacaoDePedidoValida()
-          : (!ehPedido(request.resource.data) || confirmacaoValida(documentId))
+          : (ehPedido(request.resource.data)
+            ? confirmacaoValida(documentId)
+            : ehOrcamentoSemSnapshot(request.resource.data))
       );
       // Pedidos (v1 ou v2, cancelados ou não) preservam o histórico e não são excluídos.
       allow delete: if isSignedIn() && (resource == null || !ehPedido(resource.data));

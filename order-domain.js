@@ -645,28 +645,45 @@ function semCancelamento(pedido) {
     return restante;
 }
 
-function snapshotV1Restauravel(pedido) {
-    // Pedidos v1 sempre gravaram toISOString(); só o formato mínimo operacional é exigido.
-    return instanteIsoUtcValido(pedido.confirmadoEm)
-        && Array.isArray(pedido.itens)
-        && !Object.hasOwn(pedido, 'financeiro')
-        && !Object.hasOwn(pedido, 'proposta')
+const CAMPOS_PEDIDO_V1 = ['versaoSnapshot', 'orcamentoId', 'confirmadoEm', 'confirmadoPor', 'cliente', 'costureira', 'itens'];
+
+function snapshotV1Restauravel(pedido, orcamentoId) {
+    // Contrato histórico do v1, igual em todas as versões que o geraram, mais o cancelamento
+    // opcional. Espelha snapshotV1Restauravel de firestore.rules.
+    if (!ehObjetoSimples(pedido)) return false;
+    const erros = [];
+    verificarCampos(pedido, CAMPOS_PEDIDO_V1, ['cancelamento'], 'pedido', erros);
+    verificarTextos(pedido.cliente, ['nome', 'endereco'], 'cliente', erros);
+    verificarTextos(pedido.costureira, ['nome', 'enderecoEntrega'], 'costureira', erros);
+    return erros.length === 0
+        && pedido.versaoSnapshot === 1
+        && typeof pedido.orcamentoId === 'string' && pedido.orcamentoId === orcamentoId
+        && instanteIsoUtcValido(pedido.confirmadoEm)
+        && (pedido.confirmadoPor === null || typeof pedido.confirmadoPor === 'string')
+        && Array.isArray(pedido.itens) && pedido.itens.length > 0
         && (pedido.cancelamento === undefined || validarCancelamentoPedido(pedido.cancelamento).length === 0);
+}
+
+function temSnapshot(documento) {
+    return Object.hasOwn(documento, 'pedido') && documento.pedido !== undefined;
 }
 
 export function avaliarRestauracaoOrcamento(atual, doBackup) {
     // Espelha as regras do Firestore para que um backup não seja recusado inteiro: pedidos confirmados
-    // não são sobrescritos, um orçamento existente não vira pedido por restauração, e só são criados
-    // pedidos com snapshot v1 íntegro (histórico) ou v2 válido.
+    // não são sobrescritos, um orçamento existente não vira pedido por restauração, documento que não
+    // é pedido não carrega snapshot, e só são criados pedidos com snapshot v1 histórico íntegro ou v2 válido.
     if (!ehObjetoSimples(doBackup)) return { gravar: false, motivo: 'registro-invalido' };
     const backupEhPedido = doBackup.statusDocumento === STATUS_DOCUMENTO.PEDIDO;
+    if (!backupEhPedido && temSnapshot(doBackup)) return { gravar: false, motivo: 'orcamento-com-snapshot' };
 
     if (!atual) {
         if (!backupEhPedido) return { gravar: true };
         const pedido = doBackup.pedido;
         if (!ehObjetoSimples(pedido)) return { gravar: false, motivo: 'pedido-ausente' };
         if (pedido.versaoSnapshot === 1) {
-            return snapshotV1Restauravel(pedido) ? { gravar: true } : { gravar: false, motivo: 'pedido-v1-incompleto' };
+            return snapshotV1Restauravel(pedido, doBackup.id)
+                ? { gravar: true }
+                : { gravar: false, motivo: 'pedido-v1-incompleto' };
         }
         if (pedido.versaoSnapshot === VERSAO_SNAPSHOT_FINANCEIRO) {
             return validarSnapshotPedidoV2(pedido).valido && pedido.orcamentoId === doBackup.id
@@ -688,6 +705,8 @@ export function avaliarRestauracaoOrcamento(atual, doBackup) {
     }
 
     if (backupEhPedido) return { gravar: false, motivo: 'orcamento-existente-nao-vira-pedido' };
+    // Um orçamento atual que já carrega snapshot (dado inconsistente) não aceita nenhuma gravação.
+    if (temSnapshot(atual)) return { gravar: false, motivo: 'orcamento-atual-com-snapshot' };
     return { gravar: true };
 }
 
