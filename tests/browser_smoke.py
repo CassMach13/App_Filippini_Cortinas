@@ -140,6 +140,17 @@ def itens_do_documento(documento):
     }
 
 
+def pedido_participa_financeiro(page, orcamento_id):
+    return page.evaluate("""async (id) => {
+        const { pedidoParticipaFinanceiro } = await import('/order-domain.js');
+        return pedidoParticipaFinanceiro(globalThis.__firestoreMock.lerDiretamente('orcamentos', id));
+    }""", orcamento_id)
+
+
+def notificacao(page):
+    return texto_visivel(page.locator("#app-notification"))
+
+
 def sem_rolagem_horizontal(page):
     dimensions = page.evaluate("""({
         clientWidth: document.documentElement.clientWidth,
@@ -226,8 +237,8 @@ def main():
         page.locator("#app-container").wait_for(state="visible")
         page.locator("#sync-status").wait_for(state="visible")
 
-        assert page.locator('.modal[role="dialog"][aria-modal="true"][aria-labelledby]').count() == 11
-        assert page.locator('button.close-button[aria-label]').count() == 11
+        assert page.locator('.modal[role="dialog"][aria-modal="true"][aria-labelledby]').count() == 12
+        assert page.locator('button.close-button[aria-label]').count() == 12
         unlabeled_controls = page.evaluate("""() => [...document.querySelectorAll('input:not([type="hidden"]), select, textarea')]
             .filter(element => {
                 const labels = element.labels ? [...element.labels] : [];
@@ -487,8 +498,10 @@ def main():
         status_pedido = f"Pedido confirmado em {formatar_data(hoje)}"
         page.wait_for_function("(esperado) => document.getElementById('statusDocumento').textContent === esperado", arg=status_pedido)
 
-        # 12. Status e data de confirmação visíveis.
+        # 12. Status e data de confirmação visíveis; a confirmação transacional gera o snapshot v2.
         assert documento_orcamento(page, "ORC-02")["pedido"]["confirmadoEm"]
+        assert documento_orcamento(page, "ORC-02")["pedido"]["versaoSnapshot"] == 2
+        assert pedido_participa_financeiro(page, "ORC-02")
         assert "[PEDIDO]" in seletor.locator("option:checked").inner_text()
         tabs.nth(2).click()
         assert page.locator("#statusDocumentoProposta").inner_text() == status_pedido
@@ -775,8 +788,33 @@ def main():
         page.locator("#btn-confirmar-pedido").click()
         page.wait_for_function("document.getElementById('statusDocumento').textContent.startsWith('Pedido confirmado')")
         pedido04 = documento_orcamento(page, "ORC-04")
-        assert pedido04["pedido"]["versaoSnapshot"] == 1
         assert pedido04["infoComercial"]["percentualComissao"] == 10
+        # Snapshot financeiro v2 congelado em centavos: base 1.000, desconto 10%, comissão 10%, custo 500.
+        assert pedido04["pedido"]["versaoSnapshot"] == 2
+        assert pedido04["pedido"]["financeiro"] == {
+            "dataVenda": hoje,
+            "descontoPercentual": 10,
+            "percentualComissao": 10,
+            "subtotalSemComissaoCentavos": 100000,
+            "descontoBaseCentavos": 10000,
+            "baseLiquidaCentavos": 90000,
+            "valorComissaoCentavos": 9000,
+            "valorProdutosCobradoClienteCentavos": 99000,
+            "valorLiquidoFilippiniCentavos": 90000,
+            "custoProdutosCentavos": 50000,
+            "margemCentavos": 40000,
+        }
+        assert pedido04["pedido"]["proposta"] == {"totalInstalacaoCentavos": 15000, "totalPropostaClienteCentavos": 114000}
+        assert pedido04["pedido"]["comissionado"]["nome"] == "Arquiteta Parceira"
+        assert pedido04["pedido"]["confirmadoPor"] == "usuario-teste"
+        assert pedido_participa_financeiro(page, "ORC-04")
+        assert page.evaluate("""async () => {
+            const { obterValorReceberCentavos } = await import('/order-domain.js');
+            return obterValorReceberCentavos(globalThis.__firestoreMock.lerDiretamente('orcamentos', 'ORC-04').pedido);
+        }""") == 99000
+        assert "Snapshot financeiro v2" in texto_visivel(page.locator("#infoPedido"))
+        assert texto_interno(page, "custo-produtos") == "R$ 500,00"
+        assert "Valores congelados na confirmação" in page.locator("#resumoInternoComissao").inner_text()
 
         # 20. Campo de comissão bloqueado, inclusive se reabilitado à força.
         assert venda_com_comissao.is_disabled()
@@ -882,6 +920,284 @@ def main():
         assert item_antigo["codigo"] == "CODIGO-FORA-DO-CATALOGO"
         assert [campo for campo in ["valorComissao", "margemLiquida", "margemPercentual"] if campo in item_antigo] == []
 
+        # Etapa 3B1: snapshot financeiro v2, transações, cancelamento e compatibilidade.
+        firestore_mock = "globalThis.__firestoreMock"
+
+        # A. O bloco interno de um pedido v2 lê o snapshot, não o orçamento vivo.
+        seletor.select_option("ORC-04")
+        pedido04_original = documento_orcamento(page, "ORC-04")
+        page.evaluate(f"""() => {{
+            const mock = {firestore_mock};
+            const documento = mock.lerDiretamente('orcamentos', 'ORC-04');
+            documento.infoComercial.descontoGlobal = 50;
+            documento.itens[0].precoTotal = 1;
+            documento.itens[0].custoReal = 1;
+            mock.escreverDiretamente('orcamentos', 'ORC-04', documento);
+        }}""")
+        assert texto_interno(page, "valor-comissao") == "R$ 90,00"
+        assert texto_interno(page, "liquido-filippini") == "R$ 900,00"
+        assert texto_interno(page, "custo-produtos") == "R$ 500,00"
+        assert pedido_participa_financeiro(page, "ORC-04")
+        page.evaluate("(documento) => globalThis.__firestoreMock.escreverDiretamente('orcamentos', 'ORC-04', documento)", pedido04_original)
+        assert documento_orcamento(page, "ORC-04") == pedido04_original
+
+        # B. Aba desatualizada: outro dispositivo confirma ORC-05 enquanto esta aba ainda o vê em negociação.
+        # Os cenários de falha B e C registram erros esperados no console; eles são conferidos e retirados abaixo.
+        erros_console_antes_das_falhas = len(console_errors)
+        seletor.select_option("ORC-05")
+        assert status.inner_text() == "Em negociação"
+        page.evaluate(f"""() => {{
+            // Espelha a regra do Firestore: pedido confirmado não volta a orçamento nem troca de snapshot.
+            {firestore_mock}.definirRegraDeEscrita((colecao, id, anterior, novo) => !(
+                colecao === 'orcamentos' && anterior?.statusDocumento === 'pedido'
+                && (novo.statusDocumento !== 'pedido' || JSON.stringify(novo.pedido) !== JSON.stringify(anterior.pedido))
+            ));
+            {firestore_mock}.pausarNotificacoes();
+        }}""")
+        page.evaluate(f"""async () => {{
+            const {{ confirmarOrcamentoComoPedido }} = await import('/order-domain.js');
+            const mock = {firestore_mock};
+            const atual = mock.lerDiretamente('orcamentos', 'ORC-05');
+            mock.escreverDiretamente('orcamentos', 'ORC-05', confirmarOrcamentoComoPedido(atual, {{
+                confirmadoEm: new Date().toISOString(), confirmadoPor: 'outro-dispositivo'
+            }}));
+        }}""")
+        pedido05_confirmado = page.evaluate(f"() => {firestore_mock}.lerDiretamente('orcamentos', 'ORC-05')")
+        assert status.inner_text() == "Em negociação"
+        # Gravação do documento inteiro pela aba antiga é recusada e desfeita na tela.
+        preencher_e_sair(page.locator("#nomeCliente"), "Cliente da aba antiga")
+        page.wait_for_function("document.getElementById('app-notification').textContent.includes('Não foi possível salvar')")
+        assert page.evaluate(f"() => {firestore_mock}.lerDiretamente('orcamentos', 'ORC-05')") == pedido05_confirmado
+        # A confirmação pela aba antiga lê o servidor na transação e falha sem sobrescrever o pedido.
+        aceitar_dialogo(page, dialogos)
+        page.locator("#btn-confirmar-pedido").click()
+        page.wait_for_function("document.getElementById('app-notification').textContent.includes('já foi confirmado')")
+        assert page.evaluate(f"() => {firestore_mock}.lerDiretamente('orcamentos', 'ORC-05')") == pedido05_confirmado
+        page.evaluate(f"() => {{ {firestore_mock}.definirRegraDeEscrita(null); {firestore_mock}.retomarNotificacoes(); }}")
+        page.wait_for_function("document.getElementById('statusDocumento').textContent.startsWith('Pedido confirmado')")
+        assert documento_orcamento(page, "ORC-05")["pedido"]["confirmadoPor"] == "outro-dispositivo"
+
+        # C. Confirmar pedido exige internet: offline, nada é gravado.
+        page.locator("#btn-novo-orcamento").click()
+        page.wait_for_function("[...document.querySelectorAll('#seletorOrcamento option')].some(opcao => opcao.value === 'ORC-91')")
+        seletor.select_option("ORC-91")
+        preencher_e_sair(page.locator("#nomeCliente"), "Cliente Snapshot 3B1")
+        page.locator("#btn-adicionar-item-avulso").click()
+        page.locator("#modalAdicionarItem").wait_for(state="visible")
+        page.locator("#codigoOrcamento").fill("TEST-UNIT")
+        page.locator("#codigoOrcamento").press("Escape")
+        page.locator("#quantidade").fill("1")
+        page.locator("#previewCalculo").wait_for(state="visible")
+        page.locator("#btn-adicionar-item").click()
+        page.locator("#modalAdicionarItem").wait_for(state="hidden")
+        assert "Requer conexão com a internet" in page.locator("#btn-confirmar-pedido").get_attribute("title")
+        orc91_antes = documento_orcamento(page, "ORC-91")
+
+        page.context.set_offline(True)
+        aceitar_dialogo(page, dialogos)
+        page.locator("#btn-confirmar-pedido").click()
+        page.wait_for_function("document.getElementById('app-notification').textContent.includes('requer internet')")
+        page.context.set_offline(False)
+        assert documento_orcamento(page, "ORC-91") == orc91_antes
+        assert status.inner_text() == "Em negociação"
+        assert page.locator("#btn-confirmar-pedido").is_enabled()
+
+        # Falha de conexão durante a transação: mesma resposta, sem pedido.
+        page.evaluate(f"() => {firestore_mock}.falharProximaTransacao('unavailable')")
+        aceitar_dialogo(page, dialogos)
+        page.locator("#btn-confirmar-pedido").click()
+        page.wait_for_function("document.getElementById('app-notification').textContent.includes('Sem conexão com a internet')")
+        assert documento_orcamento(page, "ORC-91") == orc91_antes
+        erros_esperados = console_errors[erros_console_antes_das_falhas:]
+        assert [erro.split(':')[0] for erro in erros_esperados] == [
+            'Erro ao salvar orçamento no Firestore', 'Falha ao confirmar o pedido', 'Falha ao confirmar o pedido', 'Falha ao confirmar o pedido'
+        ], erros_esperados
+        assert 'insufficient permissions' in erros_esperados[0]
+        assert 'já foi confirmado' in erros_esperados[1]
+        assert all('requer internet' in erro for erro in erros_esperados[2:])
+        del console_errors[erros_console_antes_das_falhas:]
+
+        aceitar_dialogo(page, dialogos)
+        page.locator("#btn-confirmar-pedido").click()
+        page.wait_for_function("document.getElementById('statusDocumento').textContent.startsWith('Pedido confirmado')")
+        orc91_pedido = documento_orcamento(page, "ORC-91")
+        assert orc91_pedido["pedido"]["versaoSnapshot"] == 2
+        assert pedido_participa_financeiro(page, "ORC-91")
+        # Botão "Transformar em Pedido" permanece bloqueado no pedido.
+        assert page.locator("#btn-confirmar-pedido").is_disabled()
+
+        # D. Cancelamento: motivo obrigatório, operação explícita e definitiva.
+        botao_cancelar = page.locator("#btn-cancelar-pedido")
+        assert botao_cancelar.is_visible()
+        botao_cancelar.click()
+        modal_cancelar = page.locator("#modalCancelarPedido")
+        modal_cancelar.wait_for(state="visible")
+        assert page.locator("#cancelarPedidoId").inner_text() == "ORC-91"
+        page.locator("#btn-confirmar-cancelamento-pedido").click()
+        assert "Informe o motivo" in page.locator("#ajudaMotivoCancelamento").inner_text()
+        assert modal_cancelar.is_visible()
+        assert documento_orcamento(page, "ORC-91") == orc91_pedido
+        # Voltar não cancela.
+        page.locator("#btn-voltar-cancelar-pedido").click()
+        modal_cancelar.wait_for(state="hidden")
+        assert documento_orcamento(page, "ORC-91") == orc91_pedido
+
+        botao_cancelar.click()
+        modal_cancelar.wait_for(state="visible")
+        page.locator("#motivoCancelamentoPedido").fill("Cliente desistiu (teste 3B1)")
+        mensagens_cancelamento = []
+        aceitar_dialogo(page, mensagens_cancelamento)
+        page.locator("#btn-confirmar-cancelamento-pedido").click()
+        page.wait_for_function("document.getElementById('statusDocumento').textContent.startsWith('Pedido cancelado')")
+        modal_cancelar.wait_for(state="hidden")
+        assert "definitivo" in mensagens_cancelamento[0]
+        orc91_cancelado = documento_orcamento(page, "ORC-91")
+        cancelamento = orc91_cancelado["pedido"].pop("cancelamento")
+        assert cancelamento["motivo"] == "Cliente desistiu (teste 3B1)"
+        assert cancelamento["canceladoPor"] == "usuario-teste"
+        assert re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z", cancelamento["canceladoEm"])
+        # Cancelar não apaga nem altera itens e valores congelados.
+        assert orc91_cancelado == orc91_pedido
+        assert not pedido_participa_financeiro(page, "ORC-91")
+        assert status.inner_text() == f"Pedido cancelado em {formatar_data(hoje)}"
+        assert "[CANCELADO]" in seletor.locator("option:checked").inner_text()
+        info_cancelado = texto_visivel(page.locator("#infoPedido"))
+        assert "Motivo: Cliente desistiu (teste 3B1)" in info_cancelado
+        assert "Fora do controle financeiro" in info_cancelado
+        assert "Pedido cancelado: fora do controle financeiro." in page.locator("#resumoInternoComissao").inner_text()
+        assert botao_cancelar.is_hidden()
+        for seletor_bloqueado in ["#btn-confirmar-pedido", "#btn-marcar-perdido", "#btn-excluir-orcamento",
+                                  "#btn-adicionar-item-avulso", "#descontoGlobal", "#percentualComissao"]:
+            assert page.locator(seletor_bloqueado).is_disabled(), seletor_bloqueado
+        for relatorio in ["#btn-baixar-excel-pedido-ao-fornecedor", "#btn-imprimir-instrucoes-ao-instalador"]:
+            assert page.locator(relatorio).is_disabled(), relatorio
+            assert "Pedido cancelado" in page.locator(relatorio).get_attribute("title")
+        # Mesmo com os botões reabilitados à força, nada é refeito nem gerado.
+        planilhas_antes = page.evaluate("window.__planilhas.length")
+        page.locator("#btn-baixar-excel-pedido-ao-fornecedor").evaluate("botao => { botao.disabled = false; botao.click(); }")
+        assert "Pedido cancelado" in notificacao(page)
+        assert page.evaluate("window.__planilhas.length") == planilhas_antes
+        botao_cancelar.evaluate("botao => { botao.hidden = false; botao.disabled = false; botao.click(); }")
+        assert "já foi cancelado" in notificacao(page)
+        assert modal_cancelar.is_hidden()
+        documento_cancelado = documento_orcamento(page, "ORC-91")
+        assert documento_cancelado["pedido"]["cancelamento"] == cancelamento
+        # A aba Proposta mostra a situação, mas não o motivo interno.
+        tabs.nth(2).click()
+        assert page.locator("#statusDocumentoProposta").inner_text() == f"Pedido cancelado em {formatar_data(hoje)}"
+        assert "desistiu" not in normalizar(page.locator("#tab3").text_content())
+        verificar_aba_proposta_sem_dados_internos(page, "aba Proposta de pedido cancelado")
+        tabs.nth(1).click()
+
+        # E. Duplicar o pedido cancelado gera orçamento editável, sem pedido nem cancelamento.
+        page.locator("#btn-duplicar-orcamento").click()
+        page.wait_for_function("document.querySelector('#seletorOrcamento').value === 'ORC-92'")
+        orc92 = documento_orcamento(page, "ORC-92")
+        assert orc92["statusDocumento"] == "orcamento"
+        assert "pedido" not in orc92
+        assert orc92["itens"] == documento_cancelado["itens"]
+        assert status.inner_text() == "Em negociação"
+        assert page.locator("#btn-cancelar-pedido").is_hidden()
+        assert page.locator("#infoPedido").is_hidden()
+        assert page.locator("#btn-confirmar-pedido").is_enabled()
+
+        # F. Pedido v1 existente: operacional, fora do financeiro, cancelável.
+        page.evaluate(f"""async () => {{
+            const {{ obterItensAtuaisDoOrcamento }} = await import('/order-domain.js');
+            const mock = {firestore_mock};
+            const base = mock.lerDiretamente('orcamentos', 'ORC-92');
+            const v1 = {{
+                ...base,
+                id: 'ORC-95',
+                statusDocumento: 'pedido',
+                infoGerais: {{ ...base.infoGerais, nome: 'Orçamento ORC-95', nomeCliente: 'Cliente Pedido Antigo' }},
+                pedido: {{
+                    versaoSnapshot: 1,
+                    orcamentoId: 'ORC-95',
+                    confirmadoEm: '2026-09-12T15:00:00.000Z',
+                    confirmadoPor: 'usuario-antigo',
+                    cliente: {{ nome: 'Cliente Pedido Antigo', endereco: '' }},
+                    costureira: {{ nome: '', enderecoEntrega: '' }},
+                    itens: obterItensAtuaisDoOrcamento(base)
+                }}
+            }};
+            delete v1.infoComercial.percentualComissao;
+            mock.escreverDiretamente('orcamentos', 'ORC-95', v1);
+        }}""")
+        page.wait_for_function("[...document.querySelectorAll('#seletorOrcamento option')].some(opcao => opcao.value === 'ORC-95')")
+        seletor.select_option("ORC-95")
+        assert status.inner_text() == "Pedido confirmado em 12/09/2026"
+        assert "anterior ao controle financeiro (snapshot v1)" in texto_visivel(page.locator("#infoPedido"))
+        assert "Pedido anterior ao controle financeiro" in page.locator("#resumoInternoComissao").inner_text()
+        assert not pedido_participa_financeiro(page, "ORC-95")
+        assert page.locator("#btn-baixar-excel-pedido-ao-fornecedor").is_enabled()
+        page.locator("#btn-baixar-excel-pedido-ao-fornecedor").click()
+        assert page.evaluate("window.__planilhas.length") == planilhas_antes + 1
+        page.locator("#btn-cancelar-pedido").click()
+        page.locator("#modalCancelarPedido").wait_for(state="visible")
+        page.locator("#motivoCancelamentoPedido").fill("Pedido antigo cancelado no teste")
+        aceitar_dialogo(page, dialogos)
+        page.locator("#btn-confirmar-cancelamento-pedido").click()
+        page.wait_for_function("document.getElementById('statusDocumento').textContent.startsWith('Pedido cancelado')")
+        orc95 = documento_orcamento(page, "ORC-95")
+        assert orc95["pedido"]["versaoSnapshot"] == 1
+        assert "financeiro" not in orc95["pedido"]
+        assert orc95["pedido"]["cancelamento"]["motivo"] == "Pedido antigo cancelado no teste"
+
+        # G. Total da proposta fechado em centavos: produto de R$ 10,10 com 5% de desconto e R$ 100 de instalação.
+        page.evaluate(f"""() => {{
+            const mock = {firestore_mock};
+            const base = mock.lerDiretamente('orcamentos', 'ORC-92');
+            mock.escreverDiretamente('orcamentos', 'ORC-96', {{
+                ...base,
+                id: 'ORC-96',
+                infoGerais: {{ ...base.infoGerais, nome: 'Orçamento ORC-96', nomeCliente: 'Cliente Centavo' }},
+                infoComercial: {{ ...base.infoComercial, descontoGlobal: 5, percentualComissao: 0 }},
+                valoresInstalacao: {{ 'Itens Avulsos': 100 }},
+                produtosAcabados: [],
+                itens: [{{
+                    id: 'item-centavo', ambiente: '', categoria: 'Acessórios', codigo: 'CENTAVO', descricao: 'Item centavo',
+                    cor: '-', fornecedor: 'Fornecedor Teste', unidadeMedida: 'Unidade', quantidade: 1, largura: null, altura: null,
+                    quantidadeCompra: 1, precoCompraUnitario: 5.05, custoReal: 5.05, precoUnitarioBase: 10.1,
+                    precoTotalSemComissao: 10.1, precoUnitario: 10.1, precoTotal: 10.1, observacoes: ''
+                }}]
+            }});
+        }}""")
+        page.wait_for_function("[...document.querySelectorAll('#seletorOrcamento option')].some(opcao => opcao.value === 'ORC-96')")
+        seletor.select_option("ORC-96")
+        tabs.nth(2).click()
+        page.locator("#modoProposta").select_option("reduzida")
+        proposta_centavo = normalizar(page.locator("#orcamentoFinal").inner_text())
+        assert "R$ 9,59" in proposta_centavo
+        assert "VALOR TOTAL GERAL DA PROPOSTA:R$ 109,59" in proposta_centavo.replace("\n", "")
+        assert "R$ 109,60" not in proposta_centavo
+
+        # H. Celular e impressão: controles do pedido sem rolagem e fora da impressão.
+        tabs.nth(1).click()
+        seletor.select_option("ORC-04")
+        page.set_viewport_size({"width": 390, "height": 844})
+        page.wait_for_timeout(100)
+        assert sem_rolagem_horizontal(page)
+        page.locator("#btn-cancelar-pedido").click()
+        page.locator("#modalCancelarPedido").wait_for(state="visible")
+        assert sem_rolagem_horizontal(page)
+        # Aguarda a animação de abertura (fadeIn de 0,3 s) antes da captura.
+        page.wait_for_timeout(400)
+        page.locator("#modalCancelarPedido").screenshot(path=str(artifacts / "cancelar-pedido-mobile.png"))
+        page.locator("#btn-voltar-cancelar-pedido").click()
+        page.locator("#modalCancelarPedido").wait_for(state="hidden")
+        assert not pedido_participa_financeiro(page, "ORC-91")
+        assert pedido_participa_financeiro(page, "ORC-04")
+        seletor.select_option("ORC-91")
+        page.wait_for_timeout(100)
+        assert sem_rolagem_horizontal(page)
+        page.locator(".budget-control").screenshot(path=str(artifacts / "pedido-cancelado-mobile.png"))
+        page.emulate_media(media="print")
+        assert page.locator("#infoPedido").evaluate("elemento => elemento.getClientRects().length") == 0
+        assert page.locator("#btn-cancelar-pedido").evaluate("elemento => elemento.getClientRects().length") == 0
+        page.emulate_media(media="screen")
+        page.set_viewport_size({"width": 1440, "height": 1000})
+
         # Celular: controles de comissão e resumo interno sem rolagem horizontal.
         seletor.select_option("ORC-05")
         page.set_viewport_size({"width": 390, "height": 844})
@@ -896,8 +1212,8 @@ def main():
         verificar_impressao_sem_dados_internos(page, "impressão em 390 px", VALORES_INTERNOS_DEZ_PORCENTO)
         page.set_viewport_size({"width": 1440, "height": 1000})
 
-        assert console_errors == []
-        assert request_failures == []
+        assert console_errors == [], console_errors
+        assert request_failures == [], request_failures
         browser.close()
 
     if browser_errors:
@@ -906,7 +1222,8 @@ def main():
     print(
         "Browser smoke test passou: login, prévia com produto válido, salvamento, "
         "duplicação, validade, impressão, proposta detalhada móvel, contatos, WhatsApp, "
-        "follow-ups, status perdido/reaberto, pedido confirmado e comissão configurável validados."
+        "follow-ups, status perdido/reaberto, pedido confirmado, comissão configurável, snapshot v2, "
+        "confirmação transacional e cancelamento validados."
     )
 
 

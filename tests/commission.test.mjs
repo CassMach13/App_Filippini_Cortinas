@@ -573,17 +573,27 @@ test('pedido confirmado grava o percentual e bloqueia a alteração da comissão
     const pedidoAntigo = confirmarOrcamentoComoPedido(antigo, auditoria);
     assert.equal(pedidoAntigo.infoComercial.percentualComissao, 10);
     assert.equal(pedidoAntigo.statusDocumento, 'pedido');
-    assert.equal(pedidoAntigo.pedido.versaoSnapshot, 1);
+    // Novas confirmações sempre geram o snapshot financeiro v2, inclusive para documentos antigos.
+    assert.equal(pedidoAntigo.pedido.versaoSnapshot, 2);
+    assert.equal(pedidoAntigo.pedido.financeiro.percentualComissao, 10);
+    assert.equal(pedidoAntigo.pedido.financeiro.valorComissaoCentavos, 10000);
     assert.equal(pedidoAntigo.pedido.confirmadoEm, auditoria.confirmadoEm);
     assert.equal(pedidoAntigo.pedido.itens[0].precoVendaTotal, 1100);
     assert.equal('percentualComissao' in antigo.infoComercial, false);
     assert.equal(pedidoAntigo.infoGerais.tipoCliente, 'arquiteto');
 
     // Documento antigo de cliente final grava 0%; percentual já gravado não é sobrescrito.
-    assert.equal(confirmarOrcamentoComoPedido(criarOrcamento({ tipoCliente: 'cliente' }), auditoria).infoComercial.percentualComissao, 0);
-    assert.equal(confirmarOrcamentoComoPedido(criarOrcamento({ tipoCliente: 'arquiteto', percentualComissao: 7.5 }), auditoria).infoComercial.percentualComissao, 7.5);
+    const comItem = opcoes => criarOrcamento({ ...opcoes, itens: [criarItemAntigo('a', PRODUTO_UNIDADE, 1, 0, 0, 'cliente')] });
+    assert.equal(confirmarOrcamentoComoPedido(comItem({ tipoCliente: 'cliente' }), auditoria).infoComercial.percentualComissao, 0);
+    assert.equal(confirmarOrcamentoComoPedido(criarOrcamento({
+        tipoCliente: 'arquiteto', percentualComissao: 7.5, itens: [criarItem('a', PRODUTO_UNIDADE, 1, 0, 0, 7.5)]
+    }), auditoria).infoComercial.percentualComissao, 7.5);
     // Percentual gravado inválido é substituído pelo efetivo.
-    assert.equal(confirmarOrcamentoComoPedido(criarOrcamento({ tipoCliente: 'arquiteto', percentualComissao: 150 }), auditoria).infoComercial.percentualComissao, 10);
+    assert.equal(confirmarOrcamentoComoPedido(criarOrcamento({
+        tipoCliente: 'arquiteto', percentualComissao: 150, itens: [criarItemAntigo('a', PRODUTO_UNIDADE, 1, 0, 0, 'arquiteto')]
+    }), auditoria).infoComercial.percentualComissao, 10);
+    // Sem itens não há pedido.
+    assert.throws(() => confirmarOrcamentoComoPedido(criarOrcamento({ tipoCliente: 'cliente' }), auditoria), /pelo menos um item/);
 
     const copiaPedido = structuredClone(pedidoAntigo);
     assert.throws(() => alterarPercentualComissao(pedidoAntigo, 5), /Pedidos confirmados não permitem alterar a comissão/);
