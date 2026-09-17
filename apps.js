@@ -12,19 +12,26 @@ import {
     agruparItensPorFornecedor,
     alterarPercentualComissao,
     calcularIndicadoresDoItem,
+    VERSAO_SNAPSHOT_FINANCEIRO,
+    avaliarRestauracaoOrcamento,
     calcularTotaisOrcamento,
-    confirmarOrcamentoComoPedido,
     criarOrcamentoDuplicado,
     marcarOrcamentoComoPerdido,
+    normalizarMotivoCancelamento,
     obterItensDoPedido,
     obterPercentualComissao,
     obterStatusComercial,
     orcamentoEstaPerdido,
+    pedidoEstaAtivo,
+    pedidoEstaCancelado,
     pedidoEstaConfirmado,
+    pedidoParticipaFinanceiro,
     reabrirNegociacao,
     somarIndicadoresDosItens,
-    validarExclusaoOrcamento
+    validarExclusaoOrcamento,
+    validarSnapshotPedidoV2
 } from './order-domain.js';
+import { cancelarPedidoComTransacao, confirmarPedidoComTransacao } from './order-transactions.js';
 import { formatarCelular, gerarLinkWhatsApp, normalizarCelular } from './contact-domain.js';
 import { converterInstanteParaDataCivil, ehDataCivilValida, obterDataCivilAtual } from './date-domain.js';
 import { listarFollowUps } from './followup-domain.js';
@@ -68,6 +75,8 @@ let estadoOrdenacao = { coluna: 'codigo', direcao: 'asc' };
 const dataVersion = "2.0"; // Versão para controle de backup
 const orcamentosComAlteracoesPendentes = new Set();
 let temporizadorNotificacao = null;
+// Evita confirmações simultâneas do mesmo pedido pela mesma aba enquanto a transação está em curso.
+let confirmacaoDePedidoEmAndamento = false;
 // Campo de celular -> link de WhatsApp e texto de ajuda correspondentes.
 const CONTATOS_WHATSAPP = {
     celularCliente: { link: 'whatsappCliente', ajuda: 'ajudaCelularCliente' },
@@ -140,22 +149,56 @@ function descreverStatusComercial(orcamento) {
     if (status === STATUS_DOCUMENTO.PERDIDO) return 'Perdido / Não fechado';
     if (status !== STATUS_DOCUMENTO.PEDIDO) return 'Em negociação';
 
+    if (pedidoEstaCancelado(orcamento)) {
+        const dataCancelamento = converterInstanteParaDataCivil(orcamento.pedido.cancelamento.canceladoEm);
+        return dataCancelamento ? `Pedido cancelado em ${formatarData(dataCancelamento)}` : 'Pedido cancelado';
+    }
     const dataConfirmacao = converterInstanteParaDataCivil(orcamento.pedido.confirmadoEm);
     return dataConfirmacao ? `Pedido confirmado em ${formatarData(dataConfirmacao)}` : 'Pedido confirmado';
+}
+
+function descreverSituacaoFinanceiraDoPedido(orcamento) {
+    // Texto interno exibido só na aba Lançamento (a barra de controle não é impressa).
+    if (!pedidoEstaConfirmado(orcamento)) return '';
+    const pedido = orcamento.pedido;
+    const partes = [];
+
+    if (pedido.versaoSnapshot === VERSAO_SNAPSHOT_FINANCEIRO) {
+        if (validarSnapshotPedidoV2(pedido).valido) {
+            const dataVenda = formatarData(pedido.financeiro.dataVenda);
+            partes.push(pedidoParticipaFinanceiro(orcamento)
+                ? `Snapshot financeiro v2 · venda de ${dataVenda} · participa do controle financeiro.`
+                : `Snapshot financeiro v2 · venda de ${dataVenda}.`);
+        } else {
+            partes.push('Snapshot financeiro v2 inválido: fora do controle financeiro.');
+        }
+    } else {
+        partes.push('Pedido anterior ao controle financeiro (snapshot v1): não entra no financeiro.');
+    }
+
+    if (pedidoEstaCancelado(orcamento)) {
+        const cancelamento = pedido.cancelamento;
+        const data = converterInstanteParaDataCivil(cancelamento.canceladoEm);
+        partes.push(`Cancelado${data ? ` em ${formatarData(data)}` : ''}. Motivo: ${cancelamento.motivo || 'não informado'}. Fora do controle financeiro e dos relatórios operacionais.`);
+    }
+    return partes.join(' ');
 }
 
 function atualizarInterfacePedido() {
     const orcamento = obterOrcamentoAtual();
     const statusComercial = obterStatusComercial(orcamento);
     const confirmado = statusComercial === STATUS_DOCUMENTO.PEDIDO;
+    const cancelado = pedidoEstaCancelado(orcamento);
     const perdido = statusComercial === STATUS_DOCUMENTO.PERDIDO;
     const emNegociacao = Boolean(orcamento) && statusComercial === STATUS_DOCUMENTO.ORCAMENTO;
     const botaoConfirmar = document.getElementById('btn-confirmar-pedido');
+    const botaoCancelarPedido = document.getElementById('btn-cancelar-pedido');
     const botaoPerdido = document.getElementById('btn-marcar-perdido');
     const botaoReabrir = document.getElementById('btn-reabrir-negociacao');
     const botaoExcluir = document.getElementById('btn-excluir-orcamento');
     const botaoFornecedor = document.getElementById('btn-baixar-excel-pedido-ao-fornecedor');
     const botaoInstalador = document.getElementById('btn-imprimir-instrucoes-ao-instalador');
+    const infoPedido = document.getElementById('infoPedido');
     const possuiItens = Boolean(orcamento) && obterItensDoPedido(orcamento).length > 0;
 
     const textoStatus = descreverStatusComercial(orcamento);
@@ -163,10 +206,16 @@ function atualizarInterfacePedido() {
         const status = document.getElementById(id);
         if (!status) return;
         status.textContent = textoStatus;
-        status.className = `document-status document-status-${statusComercial}`;
+        status.className = `document-status document-status-${cancelado ? 'cancelado' : statusComercial}`;
     });
 
-    if (botaoConfirmar) {
+    if (infoPedido) {
+        const texto = descreverSituacaoFinanceiraDoPedido(orcamento);
+        infoPedido.textContent = texto;
+        infoPedido.hidden = !texto;
+    }
+
+    if (botaoConfirmar && !confirmacaoDePedidoEmAndamento) {
         botaoConfirmar.disabled = !emNegociacao || !possuiItens;
         botaoConfirmar.textContent = confirmado ? '✓ Pedido confirmado' : '✓ Transformar em Pedido';
         botaoConfirmar.title = !orcamento
@@ -177,7 +226,15 @@ function atualizarInterfacePedido() {
                     ? 'Adicione pelo menos um item antes de transformar em pedido.'
                     : confirmado
                         ? 'Este pedido já foi confirmado.'
-                        : '';
+                        : 'Congela itens e valores do pedido. Requer conexão com a internet.';
+    }
+
+    if (botaoCancelarPedido) {
+        botaoCancelarPedido.hidden = !confirmado || cancelado;
+        botaoCancelarPedido.disabled = !confirmado || cancelado;
+        botaoCancelarPedido.title = confirmado && !cancelado
+            ? 'Cancelamento definitivo, com motivo. Requer conexão com a internet.'
+            : '';
     }
 
     if (botaoPerdido) {
@@ -211,12 +268,14 @@ function atualizarInterfacePedido() {
 
     [botaoFornecedor, botaoInstalador].forEach(botao => {
         if (!botao) return;
-        botao.disabled = !confirmado || !possuiItens;
+        botao.disabled = !confirmado || cancelado || !possuiItens;
         botao.title = !confirmado
             ? 'Transforme o orçamento em pedido para liberar este relatório.'
-            : !possuiItens
-                ? 'O pedido não possui itens para este relatório.'
-                : '';
+            : cancelado
+                ? 'Pedido cancelado: relatórios operacionais indisponíveis.'
+                : !possuiItens
+                    ? 'O pedido não possui itens para este relatório.'
+                    : '';
     });
 
     const idsBloqueados = [
@@ -231,7 +290,8 @@ function atualizarInterfacePedido() {
         'observacoesComerciais'
     ];
 
-    // Pedido confirmado mantém o congelamento; orçamento perdido fica somente leitura até ser reaberto.
+    // Pedido confirmado (inclusive cancelado) mantém o congelamento; orçamento perdido fica somente
+    // leitura até ser reaberto.
     const bloqueado = confirmado || perdido;
     idsBloqueados.forEach(id => {
         const elemento = document.getElementById(id);
@@ -242,9 +302,21 @@ function atualizarInterfacePedido() {
         .forEach(botao => { botao.disabled = bloqueado; });
 }
 
+function aplicarPedidoGravadoLocalmente(id, documento) {
+    // Reflete na tela o documento que a transação acabou de gravar; o listener confirma em seguida.
+    const atualizado = { ...structuredClone(documento), firestoreId: orcamentosSalvos[id]?.firestoreId ?? id };
+    orcamentosSalvos[id] = atualizado;
+    orcamentosPersistidos[id] = structuredClone(atualizado);
+    orcamentosComAlteracoesPendentes.delete(id);
+    atualizarStatusSincronizacao('Alterações salvas', 'ok');
+    atualizarSeletoresOrcamento(id);
+    if (id === orcamentoAtualId) preencherInfoOrcamento();
+    renderizarFollowUps();
+}
+
 async function confirmarPedido() {
     const orcamento = obterOrcamentoAtual();
-    if (!orcamento) return;
+    if (!orcamento || confirmacaoDePedidoEmAndamento) return;
     if (pedidoEstaConfirmado(orcamento)) {
         mostrarNotificacao('Este orçamento já foi confirmado como pedido.');
         return;
@@ -266,28 +338,110 @@ async function confirmarPedido() {
         return;
     }
 
-    const confirmado = confirm('Ao transformar em pedido, itens, quantidades e custos serão congelados. Deseja continuar?');
+    const confirmado = confirm('Ao transformar em pedido, itens, quantidades, custos e valores serão congelados. A confirmação precisa de conexão com a internet. Deseja continuar?');
     if (!confirmado) return;
 
-    // A confirmação também registra o percentual de comissão efetivo de documentos antigos.
     const id = orcamentoAtualId;
+    const botao = document.getElementById('btn-confirmar-pedido');
+    confirmacaoDePedidoEmAndamento = true;
+    if (botao) {
+        botao.disabled = true;
+        botao.textContent = 'Confirmando pedido…';
+    }
+    atualizarStatusSincronizacao('Confirmando pedido…', 'carregando');
     try {
-        orcamentosSalvos[id] = confirmarOrcamentoComoPedido(orcamento, {
-            confirmadoEm: new Date().toISOString(),
-            confirmadoPor: auth.currentUser?.uid || null
-        });
+        // Transação: lê a versão mais recente do servidor e só grava se ainda for um orçamento em
+        // negociação. Sem conexão a operação falha, sem fila offline.
+        const pedidoGravado = await confirmarPedidoComTransacao(
+            { db, doc, runTransaction },
+            {
+                id,
+                confirmadoEm: new Date().toISOString(),
+                confirmadoPor: auth.currentUser?.uid || null,
+                online: navigator.onLine,
+                orcamentoExibido: orcamento
+            }
+        );
+        confirmacaoDePedidoEmAndamento = false;
+        aplicarPedidoGravadoLocalmente(id, pedidoGravado);
+        mostrarNotificacao(`Pedido ${id} confirmado com sucesso.`, 'sucesso');
     } catch (error) {
-        mostrarNotificacao(error.message);
+        console.error('Falha ao confirmar o pedido:', error);
+        atualizarStatusSincronizacao('Pedido não confirmado', 'erro');
+        mostrarNotificacao(error.message || 'Não foi possível confirmar o pedido.', 'erro');
+    } finally {
+        confirmacaoDePedidoEmAndamento = false;
+        atualizarInterfacePedido();
+    }
+}
+
+function abrirModalCancelarPedido() {
+    const orcamento = obterOrcamentoAtual();
+    if (!pedidoEstaConfirmado(orcamento)) {
+        mostrarNotificacao('Somente pedidos confirmados podem ser cancelados.');
+        return;
+    }
+    if (pedidoEstaCancelado(orcamento)) {
+        mostrarNotificacao('Este pedido já foi cancelado. O cancelamento não pode ser desfeito nem alterado.');
+        return;
+    }
+    document.getElementById('cancelarPedidoId').textContent = orcamento.id;
+    document.getElementById('motivoCancelamentoPedido').value = '';
+    document.getElementById('ajudaMotivoCancelamento').textContent = '';
+    abrirModal('modalCancelarPedido');
+}
+
+function fecharModalCancelarPedido() {
+    fecharModal('modalCancelarPedido');
+    document.getElementById('motivoCancelamentoPedido').value = '';
+    document.getElementById('ajudaMotivoCancelamento').textContent = '';
+}
+
+async function confirmarCancelamentoDoPedido() {
+    const id = orcamentoAtualId;
+    const campoMotivo = document.getElementById('motivoCancelamentoPedido');
+    const ajuda = document.getElementById('ajudaMotivoCancelamento');
+    const botao = document.getElementById('btn-confirmar-cancelamento-pedido');
+
+    let motivo;
+    try {
+        motivo = normalizarMotivoCancelamento(campoMotivo.value);
+    } catch (error) {
+        ajuda.textContent = error.message;
+        campoMotivo.focus();
+        return;
+    }
+    if (!confirm(`Cancelar o pedido ${id}? O cancelamento é definitivo: o pedido continua congelado, sai do controle financeiro e não pode ser reativado.`)) {
         return;
     }
 
-    const salvou = await salvarOrcamentoAtual(id);
-    if (!salvou) return;
-    atualizarSeletoresOrcamento(id);
-    if (id === orcamentoAtualId) preencherInfoOrcamento();
-    mostrarNotificacao(`Pedido ${orcamento.id} confirmado com sucesso.`, 'sucesso');
+    botao.disabled = true;
+    ajuda.textContent = '';
+    atualizarStatusSincronizacao('Cancelando pedido…', 'carregando');
+    try {
+        const pedidoCancelado = await cancelarPedidoComTransacao(
+            { db, doc, runTransaction },
+            {
+                id,
+                motivo,
+                canceladoEm: new Date().toISOString(),
+                canceladoPor: auth.currentUser?.uid || null,
+                online: navigator.onLine
+            }
+        );
+        fecharModalCancelarPedido();
+        aplicarPedidoGravadoLocalmente(id, pedidoCancelado);
+        mostrarNotificacao(`Pedido ${id} cancelado.`, 'sucesso');
+    } catch (error) {
+        console.error('Falha ao cancelar o pedido:', error);
+        ajuda.textContent = error.message || 'Não foi possível cancelar o pedido.';
+        atualizarStatusSincronizacao('Pedido não cancelado', 'erro');
+        mostrarNotificacao(error.message || 'Não foi possível cancelar o pedido.', 'erro');
+    } finally {
+        botao.disabled = false;
+        atualizarInterfacePedido();
+    }
 }
-
 async function alterarStatusDoOrcamentoAtual(alterarStatus, mensagemSucesso) {
     const id = orcamentoAtualId;
     const orcamento = obterOrcamentoAtual();
@@ -588,6 +742,10 @@ window.addEventListener('beforeunload', (event) => {
         document.getElementById('btn-duplicar-orcamento').addEventListener('click', duplicarOrcamento);
         document.getElementById('btn-excluir-orcamento').addEventListener('click', excluirOrcamento);
         document.getElementById('btn-confirmar-pedido').addEventListener('click', confirmarPedido);
+        document.getElementById('btn-cancelar-pedido').addEventListener('click', abrirModalCancelarPedido);
+        document.getElementById('btn-fechar-cancelar-pedido').addEventListener('click', fecharModalCancelarPedido);
+        document.getElementById('btn-voltar-cancelar-pedido').addEventListener('click', fecharModalCancelarPedido);
+        document.getElementById('btn-confirmar-cancelamento-pedido').addEventListener('click', confirmarCancelamentoDoPedido);
         document.getElementById('btn-marcar-perdido').addEventListener('click', marcarOrcamentoAtualComoPerdido);
         document.getElementById('btn-reabrir-negociacao').addEventListener('click', reabrirNegociacaoAtual);
         document.getElementById('listaFollowUps').addEventListener('click', (event) => {
@@ -1200,8 +1358,59 @@ window.addEventListener('beforeunload', (event) => {
         return '';
     }
 
+    function criarResumoInternoDoSnapshot(orcamento) {
+        // Pedido v2: somente os valores congelados na confirmação, nunca recalculados pelo orçamento vivo.
+        const pedido = orcamento.pedido;
+        const validacao = validarSnapshotPedidoV2(pedido);
+        const cabecalho = `<h4 id="tituloResumoInternoComissao">🔒 Informações internas <small>Não aparecem na proposta nem na impressão. Valores congelados na confirmação do pedido (snapshot v2).</small></h4>`;
+        if (!validacao.valido) {
+            return `
+                <section id="resumoInternoComissao" class="resumo-interno" aria-labelledby="tituloResumoInternoComissao">
+                    ${cabecalho}
+                    <p class="resumo-interno-aviso" role="status">Snapshot financeiro inválido: os valores não são exibidos nem recalculados, e o pedido fica fora do controle financeiro (${escaparHtml(validacao.erros.join(', '))}).</p>
+                </section>
+            `;
+        }
+
+        const financeiro = pedido.financeiro;
+        const moeda = centavos => formatarMoeda(centavos / 100);
+        const margemAntesCentavos = financeiro.subtotalSemComissaoCentavos - financeiro.custoProdutosCentavos;
+        const margemAntesPercentual = financeiro.subtotalSemComissaoCentavos > 0
+            ? (margemAntesCentavos / financeiro.subtotalSemComissaoCentavos) * 100
+            : 0;
+        const margemDepoisPercentual = financeiro.valorLiquidoFilippiniCentavos > 0
+            ? (financeiro.margemCentavos / financeiro.valorLiquidoFilippiniCentavos) * 100
+            : -100;
+        const situacao = pedidoEstaCancelado(orcamento)
+            ? '<p class="resumo-interno-aviso" role="status">Pedido cancelado: fora do controle financeiro.</p>'
+            : '';
+
+        return `
+            <section id="resumoInternoComissao" class="resumo-interno" aria-labelledby="tituloResumoInternoComissao">
+                ${cabecalho}
+                <div class="management-item"><span>Comissão:</span><span data-interno="percentual">${formatarPercentualComissao(financeiro.percentualComissao)}%</span></div>
+                <div class="management-item"><span>Produtos sem comissão:</span><span data-interno="subtotal-sem-comissao">${moeda(financeiro.subtotalSemComissaoCentavos)}</span></div>
+                <div class="management-item"><span>Desconto sobre a base (${escaparHtml(financeiro.descontoPercentual)}%):</span><span data-interno="desconto-base">- ${moeda(financeiro.descontoBaseCentavos)}</span></div>
+                <div class="management-item"><span>Base líquida da comissão:</span><span data-interno="base-liquida">${moeda(financeiro.baseLiquidaCentavos)}</span></div>
+                <div class="management-item"><span>Valor da comissão:</span><span data-interno="valor-comissao">${moeda(financeiro.valorComissaoCentavos)}</span></div>
+                <div class="management-item"><span>Produtos cobrados do cliente (com desconto):</span><span data-interno="produtos-cobrados">${moeda(financeiro.valorProdutosCobradoClienteCentavos)}</span></div>
+                <div class="management-item resumo-interno-destaque"><span>Líquido Filippini:</span><span data-interno="liquido-filippini">${moeda(financeiro.valorLiquidoFilippiniCentavos)}</span></div>
+                <div class="management-item"><span>Custo dos produtos:</span><span data-interno="custo-produtos">${moeda(financeiro.custoProdutosCentavos)}</span></div>
+                <div class="management-item"><span>Margem antes do desconto:</span><span data-interno="margem-antes">${moeda(margemAntesCentavos)} (${truncarDecimal(margemAntesPercentual, 2)}%)</span></div>
+                <div class="management-item resumo-interno-destaque"><span>💎 Margem após o desconto:</span><span data-interno="margem-depois">${moeda(financeiro.margemCentavos)} (${truncarDecimal(margemDepoisPercentual, 2)}% do líquido)</span></div>
+                ${situacao}
+            </section>
+        `;
+    }
+
     function criarResumoInternoComissao(orcamento, totais) {
         // Somente na aba Lançamento, que não é impressa. A proposta ao cliente nunca recebe estes valores.
+        if (pedidoEstaConfirmado(orcamento) && orcamento.pedido.versaoSnapshot === VERSAO_SNAPSHOT_FINANCEIRO) {
+            return criarResumoInternoDoSnapshot(orcamento);
+        }
+        const pedidoAnterior = pedidoEstaConfirmado(orcamento)
+            ? '<p class="resumo-interno-aviso" role="status">Pedido anterior ao controle financeiro (snapshot v1): valores calculados do orçamento congelado, fora do controle financeiro.</p>'
+            : '';
         const origemPercentual = totais.percentualComissaoGravado || totais.percentualComissao === 0
             ? ''
             : '<small>Percentual herdado do tipo de cliente antigo (Arquiteto); será gravado se for alterado ou ao confirmar o pedido.</small>';
@@ -1224,6 +1433,7 @@ window.addEventListener('beforeunload', (event) => {
                 <div class="management-item resumo-interno-destaque"><span>Líquido Filippini:</span><span data-interno="liquido-filippini">${formatarMoeda(totais.liquidoFilippini)}</span></div>
                 <div class="management-item"><span>Margem antes do desconto:</span><span data-interno="margem-antes">${formatarMoeda(totais.margemProdutos)} (${truncarDecimal(totais.margemProdutosPercentual, 2)}%)</span></div>
                 <div class="management-item resumo-interno-destaque"><span>💎 Margem após o desconto:</span><span data-interno="margem-depois">${formatarMoeda(totais.margemComDesconto)} (${truncarDecimal(totais.margemPercentual, 2)}% do líquido)</span></div>
+                ${pedidoAnterior}
                 ${avisos}
             </section>
         `;
@@ -2146,7 +2356,11 @@ window.addEventListener('beforeunload', (event) => {
         const orcamentoFinalDiv = document.getElementById('orcamentoFinal');
         const orcamento = obterOrcamentoAtual();
 
-        if (!orcamento || !pedidoEstaConfirmado(orcamento)) {
+        if (pedidoEstaCancelado(orcamento)) {
+            mostrarNotificacao('Pedido cancelado: o relatório do instalador não está disponível.');
+            return;
+        }
+        if (!orcamento || !pedidoEstaAtivo(orcamento)) {
             mostrarNotificacao('Transforme o orçamento em pedido antes de gerar o relatório do instalador.');
             return;
         }
@@ -2269,15 +2483,30 @@ window.addEventListener('beforeunload', (event) => {
                     documentos.push({ colecao: nomeColecao, id, dados });
                 });
             });
+            const orcamentosIgnorados = [];
             Object.entries(importedData.orcamentosSalvos || {}).forEach(([id, dados]) => {
-                documentos.push({ colecao: 'orcamentos', id, dados: { ...dados, id } });
+                const registro = { ...dados, id };
+                // Pedidos confirmados não são sobrescritos por backup, e registros que as regras do
+                // Firestore recusariam ficam de fora para não derrubar o lote inteiro.
+                const avaliacao = avaliarRestauracaoOrcamento(orcamentosPersistidos[id] || orcamentosSalvos[id] || null, registro);
+                if (!avaliacao.gravar) {
+                    orcamentosIgnorados.push({ id, motivo: avaliacao.motivo });
+                    return;
+                }
+                documentos.push({ colecao: 'orcamentos', id, dados: registro });
             });
+            if (orcamentosIgnorados.length > 0) {
+                console.warn('Orçamentos do backup não restaurados:', orcamentosIgnorados);
+            }
+            const avisoIgnorados = orcamentosIgnorados.length > 0
+                ? ` ${orcamentosIgnorados.length} orçamento(s)/pedido(s) não serão restaurados para preservar pedidos confirmados: ${orcamentosIgnorados.map(item => item.id).join(', ')}.`
+                : '';
 
             if (documentos.length === 0) {
-                throw new Error('O arquivo não contém registros para restaurar.');
+                throw new Error(`O arquivo não contém registros para restaurar.${avisoIgnorados}`);
             }
 
-            const confirmarMesclagem = confirm(`Mesclar ${documentos.length} registro(s) deste backup no Firebase? Registros com o mesmo ID serão atualizados; nenhum registro atual será apagado.`);
+            const confirmarMesclagem = confirm(`Mesclar ${documentos.length} registro(s) deste backup no Firebase? Registros com o mesmo ID serão atualizados; nenhum registro atual será apagado.${avisoIgnorados}`);
             if (!confirmarMesclagem) return;
 
             atualizarStatusSincronizacao('Restaurando backup…', 'loading');
@@ -2300,7 +2529,7 @@ window.addEventListener('beforeunload', (event) => {
             }
 
             atualizarStatusSincronizacao('Backup restaurado', 'ok');
-            mostrarNotificacao(`${documentos.length} registro(s) mesclado(s) com sucesso.`);
+            mostrarNotificacao(`${documentos.length} registro(s) mesclado(s) com sucesso.${avisoIgnorados}`);
         } catch (error) {
             console.error('Erro na restauração do backup:', error);
             atualizarStatusSincronizacao('Falha ao restaurar backup', 'error');
@@ -4747,7 +4976,11 @@ window.addEventListener('beforeunload', (event) => {
 
     function exportarExcel() {
         const orcamento = obterOrcamentoAtual();
-        if (!orcamento || !pedidoEstaConfirmado(orcamento)) {
+        if (pedidoEstaCancelado(orcamento)) {
+            mostrarNotificacao('Pedido cancelado: o relatório para fornecedores não está disponível.');
+            return;
+        }
+        if (!orcamento || !pedidoEstaAtivo(orcamento)) {
             mostrarNotificacao('Transforme o orçamento em pedido antes de gerar o relatório para fornecedores.');
             return;
         }
@@ -4805,7 +5038,9 @@ window.addEventListener('beforeunload', (event) => {
             const nomeBase = orcamento.infoGerais?.nome || `Orçamento ${id}`;
             const nomeCliente = orcamento.infoGerais?.nomeCliente ? ` - ${orcamento.infoGerais.nomeCliente.trim()}` : '';
             const statusComercial = obterStatusComercial(orcamento);
-            const tipoDocumento = statusComercial === STATUS_DOCUMENTO.PEDIDO
+            const tipoDocumento = pedidoEstaCancelado(orcamento)
+                ? '[CANCELADO] '
+                : statusComercial === STATUS_DOCUMENTO.PEDIDO
                 ? '[PEDIDO] '
                 : statusComercial === STATUS_DOCUMENTO.PERDIDO
                     ? '[PERDIDO] '

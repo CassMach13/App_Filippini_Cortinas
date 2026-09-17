@@ -2,10 +2,12 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 
-const [html, appSource, firebaseConfig] = await Promise.all([
+const [html, appSource, firebaseConfig, firestoreRules, packageJson] = await Promise.all([
     readFile(new URL('../index.html', import.meta.url), 'utf8'),
     readFile(new URL('../apps.js', import.meta.url), 'utf8'),
-    readFile(new URL('../firebase.json', import.meta.url), 'utf8').then(JSON.parse)
+    readFile(new URL('../firebase.json', import.meta.url), 'utf8').then(JSON.parse),
+    readFile(new URL('../firestore.rules', import.meta.url), 'utf8'),
+    readFile(new URL('../package.json', import.meta.url), 'utf8').then(JSON.parse)
 ]);
 
 test('todos os IDs acessados diretamente no JavaScript existem no HTML', () => {
@@ -45,8 +47,9 @@ test('abas, modais e ordenação usam controles semânticos', () => {
     // Cinco abas: a aba de Follow-ups foi incluída na Etapa 1.
     assert.equal((html.match(/role=["']tab["']/g) || []).length, 5);
     assert.equal((html.match(/role=["']tabpanel["']/g) || []).length, 5);
-    assert.equal((html.match(/class=["']modal["'][^>]+role=["']dialog["']/g) || []).length, 11);
-    assert.equal((html.match(/class=["']close-button["']/g) || []).length, 11);
+    // Doze modais: o modal de cancelamento de pedido foi incluído na Etapa 3B1.
+    assert.equal((html.match(/class=["']modal["'][^>]+role=["']dialog["']/g) || []).length, 12);
+    assert.equal((html.match(/class=["']close-button["']/g) || []).length, 12);
     assert.doesNotMatch(html, /<span[^>]+class=["']close-button["']/i);
     assert.equal((html.match(/class=["']sort-button["']/g) || []).length, 10);
 });
@@ -223,4 +226,33 @@ test('publicação ignora documentação, testes e arquivos de configuração lo
     assert.ok(ignorados.includes('firebase-config.example.js'));
     assert.ok(ignorados.includes('*.mp4'));
     assert.ok(ignorados.includes('*.log'));
+});
+
+test('cancelamento de pedido exige motivo rotulado e confirmação transacional', () => {
+    const modal = html.match(/<div id=["']modalCancelarPedido["'][\s\S]*?<\/textarea>/i);
+    assert.ok(modal, 'modal de cancelamento não encontrado');
+    assert.match(modal[0], /<label for=["']motivoCancelamentoPedido["']>/);
+    assert.match(modal[0], /<textarea id=["']motivoCancelamentoPedido["'][^>]*maxlength=["']500["'][^>]*required/);
+    assert.match(html, /<button id=["']btn-cancelar-pedido["'][^>]*hidden>/);
+    assert.match(appSource, /cancelarPedidoComTransacao\(/);
+    assert.match(appSource, /confirmarPedidoComTransacao\(/);
+    // A confirmação não volta a regravar o documento inteiro.
+    const confirmar = appSource.slice(appSource.indexOf('async function confirmarPedido()'), appSource.indexOf('function abrirModalCancelarPedido()'));
+    assert.doesNotMatch(confirmar, /salvarOrcamentoAtual\(/);
+});
+
+test('regras do Firestore protegem pedidos sem abrir permissões genéricas em orçamentos', () => {
+    const blocoOrcamentos = firestoreRules.match(/match \/orcamentos\/\{documentId\} \{([\s\S]*?)\n    \}/);
+    assert.ok(blocoOrcamentos, 'regra de orcamentos não encontrada');
+    assert.doesNotMatch(blocoOrcamentos[1], /allow\s+(read,\s*)?write/);
+    assert.match(blocoOrcamentos[1], /allow create: if isSignedIn\(\) && criacaoValida\(documentId\);/);
+    assert.match(blocoOrcamentos[1], /allow delete: if isSignedIn\(\) && \(resource == null \|\| !ehPedido\(resource\.data\)\);/);
+    assert.match(firestoreRules, /pedido\.versaoSnapshot == 2/);
+    assert.match(firestoreRules, /affectedKeys\(\)\.hasOnly\(\['infoGerais', 'apresentacao', 'firestoreId', 'pedido'\]\)/);
+    // As demais coleções não mudaram.
+    ['precos', 'fornecedores', 'categorias', 'unidadesDeMedida', 'contadores'].forEach(colecao => {
+        assert.match(firestoreRules, new RegExp(`match /${colecao}/\\{documentId\\} \\{\\s*allow read, write: if isSignedIn\\(\\);\\s*\\}`));
+    });
+    // Os testes das regras rodam só no emulador, com um projeto demo que nunca aponta para produção.
+    assert.match(packageJson.scripts['test:rules'], /--only firestore --project demo-/);
 });

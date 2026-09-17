@@ -9,6 +9,7 @@ const filesToPublish = [
     '404.html',
     'apps.js',
     'order-domain.js',
+    'order-transactions.js',
     'pricing-domain.js',
     'date-domain.js',
     'contact-domain.js',

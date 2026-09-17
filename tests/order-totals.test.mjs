@@ -3,7 +3,8 @@ import test from 'node:test';
 
 import {
     calcularTotaisOrcamento,
-    criarSnapshotPedido,
+    confirmarOrcamentoComoPedido,
+    obterItensAtuaisDoOrcamento,
     obterTotaisDoPedido
 } from '../order-domain.js';
 import {
@@ -21,9 +22,18 @@ const CAMPOS_TOTAIS_PEDIDO = [
     'descontoPercentual',
     'descontoValor',
     'totalProdutos',
-    'totalInstalacao',
-    'totalGeral'
+    'totalInstalacao'
 ];
+
+function verificarTotalGeralFechado(totais, anterior, contexto) {
+    // O total da proposta passou a ser produtos cobrados + instalação em centavos. A soma antiga
+    // de floats podia diferir 1 centavo; nunca mais do que isso.
+    assert.equal(totais.centavos.totalGeral, totais.centavos.totalProdutos + totais.centavos.totalInstalacao, contexto);
+    assert.equal(totais.totalGeral, totais.centavos.totalGeral / 100, contexto);
+    const diferenca = Math.abs(totais.centavos.totalGeral - converterValorParaCentavos(anterior.totalGeral));
+    assert.ok(diferenca <= 1, contexto);
+    return diferenca;
+}
 
 // Reprodução literal da regra de item anterior à comissão configurável (calcularDetalhesItem com
 // tipoCliente), usada para gerar documentos antigos como os que existem no Firestore.
@@ -207,14 +217,22 @@ function gerarOrcamentos(quantidade, semente) {
     return Array.from({ length: quantidade }, (_, indice) => gerarOrcamentoAleatorio(aleatorio, indice));
 }
 
-function confirmarComoPedido(orcamento) {
+// Pedido no formato histórico v1, como os pedidos confirmados antes da Etapa 3. O sistema não cria mais
+// v1: o formato existe só para garantir que esses pedidos continuam operacionais.
+function confirmarComoPedidoV1(orcamento) {
+    const infoGerais = orcamento.infoGerais || {};
     return {
         ...structuredClone(orcamento),
         statusDocumento: 'pedido',
-        pedido: criarSnapshotPedido(orcamento, {
+        pedido: {
+            versaoSnapshot: 1,
+            orcamentoId: orcamento.id || '',
             confirmadoEm: '2026-09-16T15:00:00.000Z',
-            confirmadoPor: 'usuario-teste'
-        })
+            confirmadoPor: 'usuario-teste',
+            cliente: { nome: infoGerais.nomeCliente || '', endereco: infoGerais.enderecoCliente || '' },
+            costureira: { nome: infoGerais.nomeCostureira || '', enderecoEntrega: infoGerais.enderecoCostureira || '' },
+            itens: obterItensAtuaisDoOrcamento(orcamento)
+        }
     };
 }
 
@@ -247,13 +265,15 @@ test('documentos antigos mantêm exatamente os valores exibidos ao cliente', () 
     let comDesconto = 0;
     let comInstalacao = 0;
     let deArquiteto = 0;
+    let totalGeralAjustado = 0;
 
     orcamentos.forEach(orcamento => {
         const anterior = calcularComoInterfaceAnterior(orcamento);
         const totais = calcularTotaisOrcamento(orcamento);
 
-        // Subtotal, desconto, total de produtos, instalação e total da proposta idênticos.
+        // Subtotal, desconto, total de produtos e instalação idênticos; total da proposta fechado em centavos.
         assert.deepEqual(selecionarCampos(totais, CAMPOS_TOTAIS_PEDIDO), selecionarCampos(anterior, CAMPOS_TOTAIS_PEDIDO), orcamento.id);
+        if (verificarTotalGeralFechado(totais, anterior, orcamento.id) > 0) totalGeralAjustado++;
         assert.deepEqual(totais.avisos, [], orcamento.id);
 
         if (orcamento.infoGerais.tipoCliente === 'arquiteto') {
@@ -275,6 +295,8 @@ test('documentos antigos mantêm exatamente os valores exibidos ao cliente', () 
     assert.ok(comDesconto > 500, 'a amostra precisa exercitar descontos');
     assert.ok(comInstalacao > 500, 'a amostra precisa exercitar instalação');
     assert.ok(deArquiteto > 500, 'a amostra precisa exercitar documentos antigos de arquiteto');
+    // A amostra reproduz a antiga diferença de 1 centavo, agora corrigida.
+    assert.ok(totalGeralAjustado > 0, 'a amostra precisa exercitar o fechamento do total da proposta');
 });
 
 test('calcula o exemplo completo com produtos acabados, itens avulsos, instalação e desconto', () => {
@@ -411,18 +433,16 @@ test('pedido versão 1 calcula os mesmos totais exibidos no momento da confirma�
     assert.ok(orcamentos.length > 1000);
 
     orcamentos.forEach(orcamento => {
-        const pedido = confirmarComoPedido(orcamento);
+        const pedido = confirmarComoPedidoV1(orcamento);
         const totais = obterTotaisDoPedido(pedido);
 
         assert.equal(pedido.pedido.versaoSnapshot, 1);
         assert.equal(totais.origem, 'derivado');
         assert.equal(totais.versaoSnapshot, 1);
         assert.equal(totais.quantidadeItens, calcularTotaisOrcamento(orcamento).quantidadeItens);
-        assert.deepEqual(
-            selecionarCampos(totais, CAMPOS_TOTAIS_PEDIDO),
-            selecionarCampos(calcularComoInterfaceAnterior(orcamento), CAMPOS_TOTAIS_PEDIDO),
-            orcamento.id
-        );
+        const anterior = calcularComoInterfaceAnterior(orcamento);
+        assert.deepEqual(selecionarCampos(totais, CAMPOS_TOTAIS_PEDIDO), selecionarCampos(anterior, CAMPOS_TOTAIS_PEDIDO), orcamento.id);
+        verificarTotalGeralFechado(totais, anterior, orcamento.id);
     });
 });
 
@@ -442,7 +462,7 @@ test('pedido versão 1 soma primeiro os itens avulsos para não mudar o centavo 
             ]
         }]
     };
-    const pedido = confirmarComoPedido(orcamento);
+    const pedido = confirmarComoPedidoV1(orcamento);
     const somaNaOrdemDoSnapshot = pedido.pedido.itens.reduce((soma, item) => soma + item.precoVendaTotal, 0);
     const totalNaOrdemDoSnapshot = somaNaOrdemDoSnapshot - somaNaOrdemDoSnapshot * 0.05;
 
@@ -452,7 +472,7 @@ test('pedido versão 1 soma primeiro os itens avulsos para não mudar o centavo 
 });
 
 test('alterações posteriores no catálogo não mudam os totais do pedido confirmado', () => {
-    const pedido = confirmarComoPedido(criarOrcamentoExemplo());
+    const pedido = confirmarComoPedidoV1(criarOrcamentoExemplo());
     const totaisNaConfirmacao = obterTotaisDoPedido(pedido);
 
     // Simula um recálculo dos itens a partir de novos preços do catálogo.
@@ -467,34 +487,43 @@ test('alterações posteriores no catálogo não mudam os totais do pedido confi
     assert.equal(totaisNaConfirmacao.totalGeral, 352.95);
 });
 
-test('snapshots futuros com totais armazenados prevalecem sobre o cálculo derivado', () => {
-    const pedido = confirmarComoPedido(criarOrcamentoExemplo());
-    pedido.pedido.versaoSnapshot = 2;
-    pedido.pedido.totais = {
-        subtotalProdutos: 1000,
-        descontoPercentual: 5,
-        descontoValor: 50,
-        totalProdutos: 950,
-        totalInstalacao: 200,
-        totalGeral: 1150
-    };
+test('pedido v2 lê somente os valores congelados e ignora o antigo caminho reservado de totais', () => {
+    const orcamento = criarOrcamentoExemplo();
+    const pedido = confirmarOrcamentoComoPedido(orcamento, { confirmadoEm: '2026-09-16T15:00:00.000Z', confirmadoPor: 'usuario-teste' });
+    const congelados = obterTotaisDoPedido(pedido);
+    assert.equal(congelados.origem, 'snapshot');
+    assert.equal(congelados.versaoSnapshot, 2);
+    assert.equal(congelados.cancelado, false);
+    assert.equal(congelados.totalProdutos, 202.95);
+    assert.equal(congelados.totalInstalacao, 150);
+    assert.equal(congelados.totalGeral, 352.95);
+    assert.deepEqual(congelados.centavos, { totalProdutos: 20295, totalInstalacao: 15000, totalGeral: 35295 });
 
-    const totais = obterTotaisDoPedido(pedido);
-    assert.equal(totais.origem, 'snapshot');
-    assert.equal(totais.versaoSnapshot, 2);
-    assert.equal(totais.totalGeral, 1150);
-    assert.deepEqual(totais.centavos, {
-        subtotalProdutos: 100000,
-        descontoValor: 5000,
-        totalProdutos: 95000,
-        totalInstalacao: 20000,
-        totalGeral: 115000
+    // O campo reservado da Etapa 0 nunca foi gravado e não é mais lido.
+    pedido.pedido.totais = { subtotalProdutos: 1000, totalProdutos: 950, totalInstalacao: 200, totalGeral: 1150 };
+    // Nem o orçamento vivo nem o catálogo alteram um pedido v2.
+    pedido.infoComercial.descontoGlobal = 50;
+    pedido.valoresInstalacao.Sala = 999;
+    pedido.itens[0].precoTotal = 9999;
+    const semTotaisReservados = structuredClone(pedido);
+    delete semTotaisReservados.pedido.totais;
+    assert.deepEqual(obterTotaisDoPedido(semTotaisReservados), congelados);
+
+    // Snapshot v2 inválido não produz valores, nem por cálculo alternativo.
+    const invalido = structuredClone(semTotaisReservados);
+    invalido.pedido.financeiro.valorComissaoCentavos += 1;
+    const leituraInvalida = obterTotaisDoPedido(invalido);
+    assert.equal(leituraInvalida.origem, 'snapshot-invalido');
+    assert.equal('totalGeral' in leituraInvalida, false);
+    assert.ok(leituraInvalida.erros.length > 0);
+    // O campo desconhecido "totais" também invalida o contrato v2.
+    assert.equal(obterTotaisDoPedido(pedido).origem, 'snapshot-invalido');
+
+    const versaoDesconhecida = structuredClone(semTotaisReservados);
+    versaoDesconhecida.pedido.versaoSnapshot = 3;
+    assert.deepEqual(obterTotaisDoPedido(versaoDesconhecida), {
+        origem: 'versao-desconhecida', versaoSnapshot: 3, quantidadeItens: 3, cancelado: false
     });
-
-    pedido.pedido.totais = { totalGeral: 1150 };
-    const incompletos = obterTotaisDoPedido(pedido);
-    assert.equal(incompletos.origem, 'derivado');
-    assert.equal(incompletos.totalGeral, 352.95);
 });
 
 test('converte valores para centavos com o mesmo arredondamento da exibição em moeda', () => {

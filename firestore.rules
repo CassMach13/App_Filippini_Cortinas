@@ -6,6 +6,160 @@ service cloud.firestore {
       return request.auth != null;
     }
 
+    // --- Pedidos (coleção orcamentos) ---
+    // Um documento é pedido quando statusDocumento == 'pedido'. Depois da confirmação, os itens,
+    // as condições comerciais, a instalação e o snapshot ficam imutáveis; o único acréscimo permitido
+    // ao snapshot é o registro de cancelamento, uma única vez. Documentos sem statusDocumento são
+    // orçamentos antigos em negociação.
+
+    function ehPedido(dados) {
+      return dados.get('statusDocumento', 'orcamento') == 'pedido';
+    }
+
+    function instanteIsoUtc(valor) {
+      // Exatamente o formato de Date.prototype.toISOString().
+      return valor is string
+        && valor.matches('^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}[.][0-9]{3}Z$');
+    }
+
+    function dataCivil(valor) {
+      // A coerência com confirmadoEm (fuso de Brasília) é validada no domínio; aqui, o formato.
+      return valor is string && valor.matches('^[0-9]{4}-[0-9]{2}-[0-9]{2}$');
+    }
+
+    function textoOuNulo(valor) {
+      return valor == null || valor is string;
+    }
+
+    function centavosNaoNegativos(valor) {
+      return valor is int && valor >= 0;
+    }
+
+    function percentual(valor) {
+      return valor is number && valor >= 0 && valor <= 100;
+    }
+
+    function percentualComissaoValido(valor) {
+      return percentual(valor) && math.abs(valor * 100 - math.round(valor * 100)) < 0.000001;
+    }
+
+    function textos(mapa, campos) {
+      return mapa is map && mapa.keys().hasAll(campos) && mapa.keys().hasOnly(campos)
+        && mapa[campos[0]] is string && mapa[campos[1]] is string;
+    }
+
+    function financeiroValido(f) {
+      let campos = ['dataVenda', 'descontoPercentual', 'percentualComissao',
+        'subtotalSemComissaoCentavos', 'descontoBaseCentavos', 'baseLiquidaCentavos',
+        'valorComissaoCentavos', 'valorProdutosCobradoClienteCentavos', 'valorLiquidoFilippiniCentavos',
+        'custoProdutosCentavos', 'margemCentavos'];
+      return f is map && f.keys().hasAll(campos) && f.keys().hasOnly(campos)
+        && dataCivil(f.dataVenda)
+        && percentual(f.descontoPercentual)
+        && percentualComissaoValido(f.percentualComissao)
+        && centavosNaoNegativos(f.subtotalSemComissaoCentavos)
+        && centavosNaoNegativos(f.descontoBaseCentavos)
+        && centavosNaoNegativos(f.baseLiquidaCentavos)
+        && centavosNaoNegativos(f.valorComissaoCentavos)
+        && centavosNaoNegativos(f.valorProdutosCobradoClienteCentavos)
+        && centavosNaoNegativos(f.valorLiquidoFilippiniCentavos)
+        && centavosNaoNegativos(f.custoProdutosCentavos)
+        && f.margemCentavos is int
+        // Relações exatas em centavos inteiros.
+        && f.descontoBaseCentavos == f.subtotalSemComissaoCentavos - f.baseLiquidaCentavos
+        && f.valorLiquidoFilippiniCentavos == f.valorProdutosCobradoClienteCentavos - f.valorComissaoCentavos
+        && f.margemCentavos == f.valorLiquidoFilippiniCentavos - f.custoProdutosCentavos
+        // Comissão = percentual × base líquida, meio centavo para cima (calcularPercentualEmCentavos).
+        && f.valorComissaoCentavos
+          == math.floor((f.baseLiquidaCentavos * math.round(f.percentualComissao * 100) * 2 + 10000) / 20000);
+    }
+
+    function propostaValida(p, f) {
+      let campos = ['totalInstalacaoCentavos', 'totalPropostaClienteCentavos'];
+      return p is map && p.keys().hasAll(campos) && p.keys().hasOnly(campos)
+        && centavosNaoNegativos(p.totalInstalacaoCentavos)
+        && centavosNaoNegativos(p.totalPropostaClienteCentavos)
+        && p.totalPropostaClienteCentavos == f.valorProdutosCobradoClienteCentavos + p.totalInstalacaoCentavos;
+    }
+
+    function cancelamentoValido(c) {
+      let campos = ['canceladoEm', 'canceladoPor', 'motivo'];
+      return c is map && c.keys().hasAll(campos) && c.keys().hasOnly(campos)
+        && instanteIsoUtc(c.canceladoEm)
+        && textoOuNulo(c.canceladoPor)
+        && c.motivo is string && c.motivo.trim().size() > 0 && c.motivo.size() <= 2000;
+    }
+
+    function snapshotV2Valido(pedido, documentId) {
+      let obrigatorios = ['versaoSnapshot', 'orcamentoId', 'confirmadoEm', 'confirmadoPor',
+        'cliente', 'costureira', 'comissionado', 'itens', 'financeiro', 'proposta'];
+      return pedido is map
+        && pedido.keys().hasAll(obrigatorios)
+        && pedido.keys().hasOnly(obrigatorios.concat(['cancelamento']))
+        && pedido.versaoSnapshot is int && pedido.versaoSnapshot == 2
+        && pedido.orcamentoId == documentId
+        && instanteIsoUtc(pedido.confirmadoEm)
+        && textoOuNulo(pedido.confirmadoPor)
+        && textos(pedido.cliente, ['nome', 'endereco'])
+        && textos(pedido.costureira, ['nome', 'enderecoEntrega'])
+        && textos(pedido.comissionado, ['nome', 'celular'])
+        && pedido.itens is list && pedido.itens.size() > 0
+        && financeiroValido(pedido.financeiro)
+        && propostaValida(pedido.proposta, pedido.financeiro)
+        && (!('cancelamento' in pedido) || cancelamentoValido(pedido.cancelamento));
+    }
+
+    function snapshotV1Restauravel(pedido) {
+      // Exceção documentada: somente a criação direta (restauração de backup histórico) aceita v1.
+      // A confirmação de um documento existente (update) nunca aceita v1.
+      return pedido is map
+        && pedido.versaoSnapshot is int && pedido.versaoSnapshot == 1
+        && instanteIsoUtc(pedido.confirmadoEm)
+        && pedido.itens is list
+        && !('financeiro' in pedido)
+        && !('proposta' in pedido)
+        && (!('cancelamento' in pedido) || cancelamentoValido(pedido.cancelamento));
+    }
+
+    function criacaoValida(documentId) {
+      let dados = request.resource.data;
+      return !ehPedido(dados)
+        || ('pedido' in dados
+          && (snapshotV1Restauravel(dados.pedido) || snapshotV2Valido(dados.pedido, documentId)));
+    }
+
+    function confirmacaoValida(documentId) {
+      // Orçamento em negociação → pedido, feito pela transação de confirmação.
+      let antes = resource.data;
+      let depois = request.resource.data;
+      return antes.get('statusDocumento', 'orcamento') == 'orcamento'
+        && depois.diff(antes).affectedKeys().hasOnly(['statusDocumento', 'pedido', 'infoComercial'])
+        && snapshotV2Valido(depois.pedido, documentId)
+        && !('cancelamento' in depois.pedido)
+        && depois.pedido.confirmadoPor == request.auth.uid
+        && depois.infoComercial.diff(antes.get('infoComercial', {})).affectedKeys().hasOnly(['percentualComissao'])
+        && depois.infoComercial.percentualComissao == depois.pedido.financeiro.percentualComissao;
+    }
+
+    function pedidoPreservadoOuCancelado() {
+      let antes = resource.data.pedido;
+      let depois = request.resource.data.pedido;
+      return depois == antes
+        || (!('cancelamento' in antes)
+          && depois.diff(antes).affectedKeys().hasOnly(['cancelamento'])
+          && cancelamentoValido(depois.cancelamento)
+          && depois.cancelamento.canceladoPor == request.auth.uid);
+    }
+
+    function atualizacaoDePedidoValida() {
+      // Continuam editáveis depois da confirmação, como na interface atual: dados gerais e contatos
+      // (infoGerais), apresentação da proposta e o campo técnico firestoreId.
+      let depois = request.resource.data;
+      return ehPedido(depois)
+        && depois.diff(resource.data).affectedKeys().hasOnly(['infoGerais', 'apresentacao', 'firestoreId', 'pedido'])
+        && pedidoPreservadoOuCancelado();
+    }
+
     match /precos/{documentId} {
       allow read, write: if isSignedIn();
     }
@@ -23,7 +177,15 @@ service cloud.firestore {
     }
 
     match /orcamentos/{documentId} {
-      allow read, write: if isSignedIn();
+      allow read: if isSignedIn();
+      allow create: if isSignedIn() && criacaoValida(documentId);
+      allow update: if isSignedIn() && (
+        ehPedido(resource.data)
+          ? atualizacaoDePedidoValida()
+          : (!ehPedido(request.resource.data) || confirmacaoValida(documentId))
+      );
+      // Pedidos (v1 ou v2, cancelados ou não) preservam o histórico e não são excluídos.
+      allow delete: if isSignedIn() && (resource == null || !ehPedido(resource.data));
     }
 
     match /contadores/{documentId} {

@@ -267,6 +267,12 @@
             border: 1px solid #6B8E6B;
         }
 
+        .document-status-cancelado {
+            color: #3A3A3A;
+            background: #ECECEC;
+            border: 1px solid #9E9E9E;
+        }
+
         .document-status-perdido {
             color: #7A2E2E;
             background: #F8E1E1;
@@ -563,6 +569,34 @@
 
         .btn-perdido:hover {
             background-color: #F8E1E1;
+        }
+
+        .btn-cancelar-pedido {
+            background-color: #FFFEF7;
+            color: #4A4A4A;
+            border: 2px solid #6B6B6B;
+        }
+
+        .btn-cancelar-pedido:hover {
+            background-color: #ECECEC;
+        }
+
+        .info-pedido {
+            flex-basis: 100%;
+            margin: 0;
+            padding: 8px 12px;
+            /* Fundo próprio: a barra de controle pode ficar sobre o fundo escuro da página. */
+            background: #FFFEF7;
+            border: 1px solid #C9C2B0;
+            border-radius: 8px;
+            color: #2C2C2C;
+            font-size: 0.9em;
+            overflow-wrap: anywhere;
+        }
+
+        .aviso-cancelamento {
+            margin: 0 0 15px;
+            color: #4A4A4A;
         }
         
         .table-container {
@@ -1987,6 +2021,8 @@
                 <button id="btn-confirmar-pedido" class="btn btn-success" type="button">✓ Transformar em Pedido</button>
                 <button id="btn-marcar-perdido" class="btn btn-perdido" type="button">Marcar como perdido</button>
                 <button id="btn-reabrir-negociacao" class="btn btn-secondary" type="button" hidden>Reabrir negociação</button>
+                <button id="btn-cancelar-pedido" class="btn btn-cancelar-pedido" type="button" hidden>Cancelar pedido</button>
+                <p id="infoPedido" class="info-pedido" aria-live="polite" hidden></p>
                 <div class="budget-report-actions" style="flex: 1;">
                     <label for="mostrarCustosFornecedor" class="checkbox-inline">
                         <input type="checkbox" id="mostrarCustosFornecedor">
@@ -2570,6 +2606,22 @@
                     <div style="text-align: right;">
                         <button id="btn-cancelar-edicao-categoria" class="btn btn-secondary" type="button">Cancelar</button>
                         <button id="btn-salvar-edicao-categoria" class="btn btn-primary" type="button">Salvar Alterações</button>
+                    </div>
+                </div>
+            </div>
+            <div id="modalCancelarPedido" class="modal" role="dialog" aria-modal="true">
+                <div class="modal-content" style="max-width: 520px;">
+                    <button id="btn-fechar-cancelar-pedido" class="close-button" type="button" aria-label="Fechar janela">&times;</button>
+                    <h2 class="section-title" style="margin-top: 0;">Cancelar pedido <span id="cancelarPedidoId"></span></h2>
+                    <p class="aviso-cancelamento">O cancelamento é definitivo: o pedido continua congelado, com itens e valores preservados, sai do controle financeiro e não pode ser reativado. Para refazer a venda, duplique o pedido.</p>
+                    <div class="form-group" style="margin-bottom: 20px;">
+                        <label for="motivoCancelamentoPedido">Motivo do cancelamento (obrigatório):</label>
+                        <textarea id="motivoCancelamentoPedido" rows="3" maxlength="500" required aria-describedby="ajudaMotivoCancelamento" placeholder="Ex.: cliente desistiu da compra"></textarea>
+                        <small id="ajudaMotivoCancelamento" class="campo-ajuda" aria-live="polite"></small>
+                    </div>
+                    <div style="text-align: right;">
+                        <button id="btn-voltar-cancelar-pedido" class="btn btn-secondary" type="button">Voltar</button>
+                        <button id="btn-confirmar-cancelamento-pedido" class="btn btn-danger" type="button">Cancelar pedido</button>
                     </div>
                 </div>
             </div>
