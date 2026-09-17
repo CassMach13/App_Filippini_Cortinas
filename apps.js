@@ -35,6 +35,7 @@ import { cancelarPedidoComTransacao, confirmarPedidoComTransacao } from './order
 import { formatarCelular, gerarLinkWhatsApp, normalizarCelular } from './contact-domain.js';
 import { converterInstanteParaDataCivil, ehDataCivilValida, obterDataCivilAtual } from './date-domain.js';
 import { listarFollowUps } from './followup-domain.js';
+import { gerarRelatorioVendas } from './sales-report-domain.js';
 import {
     arredondamentoFinanceiro,
     calcularDetalhesItem,
@@ -312,6 +313,7 @@ function aplicarPedidoGravadoLocalmente(id, documento) {
     atualizarSeletoresOrcamento(id);
     if (id === orcamentoAtualId) preencherInfoOrcamento();
     renderizarFollowUps();
+    renderizarFinanceiro();
 }
 
 async function confirmarPedido() {
@@ -465,6 +467,7 @@ async function alterarStatusDoOrcamentoAtual(alterarStatus, mensagemSucesso) {
     atualizarSeletoresOrcamento(id);
     atualizarInterfacePedido();
     renderizarFollowUps();
+    renderizarFinanceiro();
     mostrarNotificacao(mensagemSucesso, 'sucesso');
     return true;
 }
@@ -575,6 +578,7 @@ function escutarOrcamentos() {
         atualizarSeletoresOrcamento();
         preencherInfoOrcamento(); // Atualiza a tela de orçamento com os novos dados
         renderizarFollowUps();
+        renderizarFinanceiro();
         if (orcamentosComAlteracoesPendentes.size === 0) {
             atualizarStatusSincronizacao('Dados sincronizados', 'ok');
         }
@@ -749,6 +753,14 @@ window.addEventListener('beforeunload', (event) => {
         document.getElementById('btn-marcar-perdido').addEventListener('click', marcarOrcamentoAtualComoPerdido);
         document.getElementById('btn-reabrir-negociacao').addEventListener('click', reabrirNegociacaoAtual);
         document.getElementById('listaFollowUps').addEventListener('click', (event) => {
+            const botaoAbrir = event.target.closest('.btn-abrir-orcamento');
+            if (botaoAbrir) abrirOrcamentoDoFollowUp(botaoAbrir.dataset.orcamentoId);
+        });
+        document.getElementById('financeiroDataInicial').addEventListener('change', renderizarFinanceiro);
+        document.getElementById('financeiroDataFinal').addEventListener('change', renderizarFinanceiro);
+        document.getElementById('btn-financeiro-este-mes').addEventListener('click', () => aplicarAtalhoPeriodoFinanceiro('esteMes'));
+        document.getElementById('btn-financeiro-mes-anterior').addEventListener('click', () => aplicarAtalhoPeriodoFinanceiro('mesAnterior'));
+        document.getElementById('financeiroTabelaContainer').addEventListener('click', (event) => {
             const botaoAbrir = event.target.closest('.btn-abrir-orcamento');
             if (botaoAbrir) abrirOrcamentoDoFollowUp(botaoAbrir.dataset.orcamentoId);
         });
@@ -1012,6 +1024,8 @@ window.addEventListener('beforeunload', (event) => {
             atualizarPropostaCliente();
         } else if (painelAtivo?.id === 'tab-followups') {
             renderizarFollowUps();
+        } else if (painelAtivo?.id === 'tab-financeiro') {
+            renderizarFinanceiro();
         }
     }
 
@@ -2736,6 +2750,152 @@ window.addEventListener('beforeunload', (event) => {
         const indiceLancamento = [...document.querySelectorAll('.tab-content')].findIndex(painel => painel.id === 'tab2');
         showTab(indiceLancamento, true);
     }
+
+    // --- INÍCIO: ABA FINANCEIRO (ETAPA 3B2) ---
+    // A aba é inteiramente interna: fonte única o snapshot v2 (gerarRelatorioVendas), nunca o
+    // orçamento vivo. Nada aqui é escrito no Firestore; os filtros são estado só da tela.
+
+    function primeiroDiaDoMesCivil(dataCivil) {
+        return `${dataCivil.slice(0, 7)}-01`;
+    }
+
+    function mesAnteriorCivil(dataCivil) {
+        const [ano, mes] = dataCivil.split('-').map(Number);
+        const mesAnterior = mes === 1 ? 12 : mes - 1;
+        const anoDoMesAnterior = mes === 1 ? ano - 1 : ano;
+        return `${anoDoMesAnterior}-${String(mesAnterior).padStart(2, '0')}-01`;
+    }
+
+    function ultimoDiaDoMesCivil(primeiroDiaDoMes) {
+        const [ano, mes] = primeiroDiaDoMes.split('-').map(Number);
+        const ultimoDia = new Date(Date.UTC(ano, mes, 0)).getUTCDate(); // dia 0 do mês seguinte
+        return `${ano}-${String(mes).padStart(2, '0')}-${String(ultimoDia).padStart(2, '0')}`;
+    }
+
+    function aplicarAtalhoPeriodoFinanceiro(atalho) {
+        const hoje = obterDataCivilAtual();
+        const campoInicial = document.getElementById('financeiroDataInicial');
+        const campoFinal = document.getElementById('financeiroDataFinal');
+        if (atalho === 'esteMes') {
+            campoInicial.value = primeiroDiaDoMesCivil(hoje);
+            campoFinal.value = hoje;
+        } else if (atalho === 'mesAnterior') {
+            const inicioMesAnterior = mesAnteriorCivil(hoje);
+            campoInicial.value = inicioMesAnterior;
+            campoFinal.value = ultimoDiaDoMesCivil(inicioMesAnterior);
+        }
+        renderizarFinanceiro();
+    }
+
+    function garantirFiltroFinanceiroPadrao() {
+        // Padrão ao abrir: do primeiro dia do mês atual até hoje, em Brasília. Só preenche campos
+        // vazios; não sobrescreve um período que o usuário já escolheu.
+        const campoInicial = document.getElementById('financeiroDataInicial');
+        const campoFinal = document.getElementById('financeiroDataFinal');
+        if (!campoInicial.value || !campoFinal.value) {
+            const hoje = obterDataCivilAtual();
+            campoInicial.value = campoInicial.value || primeiroDiaDoMesCivil(hoje);
+            campoFinal.value = campoFinal.value || hoje;
+        }
+    }
+
+    function criarCardFinanceiro(chave, rotulo, valor) {
+        return `
+            <div class="financeiro-card">
+                <span class="financeiro-card-rotulo">${escaparHtml(rotulo)}</span>
+                <span class="financeiro-card-valor" data-financeiro="${chave}">${valor}</span>
+            </div>`;
+    }
+
+    function criarLinhaFinanceira(venda) {
+        return `
+            <tr>
+                <td data-label="Data" class="followup-sem-quebra">${escaparHtml(formatarData(venda.dataVenda))}</td>
+                <td data-label="Pedido" class="followup-sem-quebra">${escaparHtml(venda.orcamentoId)}</td>
+                <td data-label="Cliente">${escaparHtml(venda.clienteNome || 'Não informado')}</td>
+                <td data-label="Produtos cobrados" class="followup-sem-quebra">${formatarMoeda(venda.produtosCobradoClienteCentavos / 100)}</td>
+                <td data-label="Comissão" class="followup-sem-quebra">${formatarMoeda(venda.comissaoCentavos / 100)}</td>
+                <td data-label="Líquido Filippini" class="followup-sem-quebra">${formatarMoeda(venda.liquidoFilippiniCentavos / 100)}</td>
+                <td data-label="Ação">
+                    <button type="button" class="btn btn-secondary btn-sm btn-abrir-orcamento" data-orcamento-id="${escaparHtml(venda.orcamentoId)}">Abrir</button>
+                </td>
+            </tr>`;
+    }
+
+    function renderizarFinanceiro() {
+        const cardsContainer = document.getElementById('financeiroCards');
+        const tabelaContainer = document.getElementById('financeiroTabelaContainer');
+        const vazio = document.getElementById('financeiroVazio');
+        const avisoInconsistencias = document.getElementById('financeiroAvisoInconsistencias');
+        const infoV1 = document.getElementById('financeiroInfoV1');
+        const infoCancelados = document.getElementById('financeiroInfoCancelados');
+        if (!cardsContainer || !tabelaContainer) return;
+
+        garantirFiltroFinanceiroPadrao();
+        const dataInicial = document.getElementById('financeiroDataInicial').value;
+        const dataFinal = document.getElementById('financeiroDataFinal').value;
+
+        let relatorio;
+        try {
+            relatorio = gerarRelatorioVendas(orcamentosSalvos, { dataInicial, dataFinal });
+        } catch (error) {
+            cardsContainer.innerHTML = '';
+            tabelaContainer.innerHTML = '';
+            avisoInconsistencias.hidden = true;
+            infoV1.hidden = true;
+            infoCancelados.hidden = true;
+            vazio.textContent = error.message;
+            vazio.hidden = false;
+            return;
+        }
+
+        cardsContainer.innerHTML = [
+            criarCardFinanceiro('pedidos', 'Pedidos', String(relatorio.totais.quantidadePedidos)),
+            criarCardFinanceiro('cobrado', 'Produtos cobrados dos clientes', formatarMoeda(relatorio.totais.valorProdutosCobradoClienteCentavos / 100)),
+            criarCardFinanceiro('comissao', 'Comissões', formatarMoeda(relatorio.totais.valorComissaoCentavos / 100)),
+            criarCardFinanceiro('liquido', 'Líquido Filippini', formatarMoeda(relatorio.totais.valorLiquidoFilippiniCentavos / 100))
+        ].join('');
+
+        avisoInconsistencias.hidden = relatorio.inconsistencias.length === 0;
+        avisoInconsistencias.textContent = relatorio.inconsistencias.length > 0
+            ? `Há ${relatorio.inconsistencias.length} pedido(s) com inconsistência financeira que não foram incluídos.`
+            : '';
+
+        infoV1.hidden = relatorio.quantidadePedidosV1 === 0;
+        infoV1.textContent = relatorio.quantidadePedidosV1 > 0
+            ? `Existem ${relatorio.quantidadePedidosV1} pedido(s) histórico(s) anteriores ao módulo financeiro e eles não entram neste relatório.`
+            : '';
+
+        infoCancelados.hidden = relatorio.quantidadeCanceladosNoPeriodo === 0;
+        infoCancelados.textContent = relatorio.quantidadeCanceladosNoPeriodo > 0
+            ? `${relatorio.quantidadeCanceladosNoPeriodo} pedido(s) cancelado(s) no período (não entram nos totais).`
+            : '';
+
+        if (relatorio.vendas.length === 0) {
+            tabelaContainer.innerHTML = '';
+            vazio.textContent = 'Nenhuma venda registrada neste período.';
+            vazio.hidden = false;
+            return;
+        }
+
+        vazio.hidden = true;
+        tabelaContainer.innerHTML = `
+            <table class="followups-table financeiro-tabela">
+                <thead>
+                    <tr>
+                        <th scope="col">Data</th>
+                        <th scope="col">Pedido</th>
+                        <th scope="col">Cliente</th>
+                        <th scope="col">Produtos cobrados</th>
+                        <th scope="col">Comissão</th>
+                        <th scope="col">Líquido Filippini</th>
+                        <th scope="col">Ação</th>
+                    </tr>
+                </thead>
+                <tbody>${relatorio.vendas.map(criarLinhaFinanceira).join('')}</tbody>
+            </table>`;
+    }
+    // --- FIM: ABA FINANCEIRO (ETAPA 3B2) ---
 
     function inicializarSelectInteligente(inputId) {
         const input = document.getElementById(inputId);
