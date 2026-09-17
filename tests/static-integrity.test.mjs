@@ -45,9 +45,9 @@ test('login usa formulário semântico e metadados de autenticação', () => {
 });
 
 test('abas, modais e ordenação usam controles semânticos', () => {
-    // Cinco abas: a aba de Follow-ups foi incluída na Etapa 1.
-    assert.equal((html.match(/role=["']tab["']/g) || []).length, 5);
-    assert.equal((html.match(/role=["']tabpanel["']/g) || []).length, 5);
+    // Seis abas: Follow-ups (Etapa 1) e Financeiro (Etapa 3B2).
+    assert.equal((html.match(/role=["']tab["']/g) || []).length, 6);
+    assert.equal((html.match(/role=["']tabpanel["']/g) || []).length, 6);
     // Doze modais: o modal de cancelamento de pedido foi incluído na Etapa 3B1.
     assert.equal((html.match(/class=["']modal["'][^>]+role=["']dialog["']/g) || []).length, 12);
     assert.equal((html.match(/class=["']close-button["']/g) || []).length, 12);
@@ -84,7 +84,7 @@ test('impressão esconde todas as abas, exceto a proposta', () => {
     const paineis = [...html.matchAll(/<div id=["']([^"']+)["'] class=["'][^"']*\btab-content\b[^"']*["'] role=["']tabpanel["']/g)]
         .map(match => match[1]);
 
-    assert.deepEqual(paineis, ['tab1', 'tab2', 'tab3', 'tab-followups', 'tab4']);
+    assert.deepEqual(paineis, ['tab1', 'tab2', 'tab3', 'tab-followups', 'tab-financeiro', 'tab4']);
     paineis.filter(id => id !== 'tab3').forEach(id => assert.ok(seletores.includes(`#${id}`), `#${id} deve ficar fora da impressão`));
     assert.equal(seletores.includes('#tab3'), false);
     // Notificações podem conter mensagens internas (ex.: alteração da comissão).

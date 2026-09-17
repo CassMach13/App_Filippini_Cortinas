@@ -249,7 +249,7 @@ def main():
         assert unlabeled_controls == []
 
         tabs = page.get_by_role("tab")
-        assert tabs.count() == 5
+        assert tabs.count() == 6
         tabs.nth(0).focus()
         page.keyboard.press("ArrowRight")
         assert tabs.nth(1).get_attribute("aria-selected") == "true"
@@ -1212,6 +1212,176 @@ def main():
         verificar_impressao_sem_dados_internos(page, "impressão em 390 px", VALORES_INTERNOS_DEZ_PORCENTO)
         page.set_viewport_size({"width": 1440, "height": 1000})
 
+        # Etapa 3B2: aba Financeiro / relatório de vendas.
+        dia_menos_2 = data_civil_brasilia(page, -2)
+        dia_menos_5 = data_civil_brasilia(page, -5)
+        dia_menos_8 = data_civil_brasilia(page, -8)
+        dia_menos_20 = data_civil_brasilia(page, -20)
+        dia_menos_10 = data_civil_brasilia(page, -10)
+        dia_menos_1 = data_civil_brasilia(page, -1)
+        primeiro_dia_do_mes_atual = f"{hoje[:8]}01"
+
+        # A aba Financeiro existe e é inteiramente interna (não é a Proposta Cliente).
+        assert page.locator("#btn-tab-financeiro").is_visible()
+        tabs.nth(4).click()
+        assert page.locator("#tab-financeiro").is_visible()
+        page.locator("#financeiroDataInicial").fill("2000-01-01")
+        page.locator("#financeiroDataFinal").fill(hoje)
+        page.wait_for_timeout(50)
+        info_v1_antes = texto_visivel(page.locator("#financeiroInfoV1"))
+        v1_antes = int(re.search(r"\d+", info_v1_antes).group()) if info_v1_antes else 0
+
+        page.evaluate(f"""async () => {{
+            const {{ confirmarOrcamentoComoPedido, cancelarPedido, obterItensAtuaisDoOrcamento }} = await import('/order-domain.js');
+            const mock = {firestore_mock};
+
+            const itemPadrao = () => ({{
+                id: 'item-financeiro', ambiente: '', categoria: 'Acessórios', codigo: 'TEST-UNIT',
+                descricao: 'Produto válido para teste de navegador', cor: 'Branco', fornecedor: 'Fornecedor Teste',
+                unidadeMedida: 'Unidade', quantidade: 1, largura: null, altura: null, quantidadeCompra: 1,
+                precoCompraUnitario: 100, custoReal: 100, precoUnitarioBase: 200, precoTotalSemComissao: 200,
+                precoUnitario: 220, precoTotal: 220, observacoes: ''
+            }});
+            const baseOrcamento = (id, nomeCliente) => ({{
+                id, statusDocumento: 'orcamento',
+                apresentacao: {{ modo: 'reduzida', mostrarValoresItens: false, mostrarCustosFornecedor: false }},
+                infoGerais: {{ nome: `Orçamento ${{id}}`, nomeCliente, celularCliente: '', nomeComissionado: '' }},
+                infoComercial: {{ condicaoPagamento: 'À vista', formaPagamento: 'PIX', descontoGlobal: 0, percentualComissao: 10 }},
+                valoresInstalacao: {{}},
+                itens: [itemPadrao()],
+                produtosAcabados: []
+            }});
+
+            // Pedido v1 (histórico, fora do financeiro), confirmado há 20 dias.
+            const baseV1 = baseOrcamento('ORC-150', 'Cliente Financeiro Histórico');
+            const v1 = {{
+                ...baseV1,
+                statusDocumento: 'pedido',
+                pedido: {{
+                    versaoSnapshot: 1, orcamentoId: 'ORC-150', confirmadoEm: '{dia_menos_20}T15:00:00.000Z', confirmadoPor: 'usuario-antigo',
+                    cliente: {{ nome: baseV1.infoGerais.nomeCliente, endereco: '' }}, costureira: {{ nome: '', enderecoEntrega: '' }},
+                    itens: obterItensAtuaisDoOrcamento(baseV1)
+                }}
+            }};
+            mock.escreverDiretamente('orcamentos', 'ORC-150', v1);
+
+            // Pedido v2 válido, mais antigo dos dois ativos (há 8 dias).
+            const v2Antigo = confirmarOrcamentoComoPedido(baseOrcamento('ORC-151', 'Cliente Financeiro A'), {{
+                confirmadoEm: '{dia_menos_8}T15:00:00.000Z', confirmadoPor: 'usuario-teste'
+            }});
+            mock.escreverDiretamente('orcamentos', 'ORC-151', v2Antigo);
+
+            // Pedido v2 cancelado (venda há 5 dias, cancelado há 4): fora dos totais, contado à parte.
+            const v2ParaCancelar = confirmarOrcamentoComoPedido(baseOrcamento('ORC-152', 'Cliente Financeiro Cancelado'), {{
+                confirmadoEm: '{dia_menos_5}T15:00:00.000Z', confirmadoPor: 'usuario-teste'
+            }});
+            const v2Cancelado = cancelarPedido(v2ParaCancelar, {{
+                motivo: 'Cliente desistiu (fixture financeiro)', canceladoEm: '{dia_menos_2}T10:00:00.000Z', canceladoPor: 'usuario-teste'
+            }});
+            mock.escreverDiretamente('orcamentos', 'ORC-152', v2Cancelado);
+
+            // Pedido v2 válido, mais recente dos dois ativos (há 2 dias).
+            const v2Recente = confirmarOrcamentoComoPedido(baseOrcamento('ORC-153', 'Cliente Financeiro B'), {{
+                confirmadoEm: '{dia_menos_2}T15:00:00.000Z', confirmadoPor: 'usuario-teste'
+            }});
+            mock.escreverDiretamente('orcamentos', 'ORC-153', v2Recente);
+
+            // Orçamento comum, sem pedido: precisa ficar de fora.
+            mock.escreverDiretamente('orcamentos', 'ORC-154', baseOrcamento('ORC-154', 'Cliente Sem Pedido'));
+        }}""")
+        page.wait_for_function("[...document.querySelectorAll('#seletorOrcamento option')].some(opcao => opcao.value === 'ORC-154')")
+
+        # Filtros: padrão é do primeiro dia do mês atual até hoje, em Brasília. Reabrir a aba
+        # restaura o comportamento de "campo vazio recebe o padrão" (o teste tinha usado o filtro
+        # amplo acima só para medir a linha de base de pedidos v1 históricos).
+        campo_inicial = page.locator("#financeiroDataInicial")
+        campo_final = page.locator("#financeiroDataFinal")
+        campo_inicial.fill("")
+        campo_final.fill("")
+        tabs.nth(1).click()
+        tabs.nth(4).click()
+        assert campo_inicial.input_value() == primeiro_dia_do_mes_atual
+        assert campo_final.input_value() == hoje
+
+        # Período explícito cobrindo as duas vendas ativas e o cancelamento, mas não o histórico v1
+        # nem os pedidos v2 de outras seções deste teste (todos confirmados "hoje").
+        page.locator("#financeiroDataInicial").fill(dia_menos_10)
+        page.locator("#financeiroDataInicial").dispatch_event("change")
+        page.locator("#financeiroDataFinal").fill(dia_menos_1)
+        page.locator("#financeiroDataFinal").dispatch_event("change")
+        page.wait_for_function("document.querySelector('[data-financeiro=\"pedidos\"]').textContent === '2'")
+
+        # Cards: 2 pedidos ativos, R$ 440,00 cobrados, R$ 40,00 de comissão, R$ 400,00 líquidos.
+        assert page.locator('[data-financeiro="pedidos"]').inner_text() == "2"
+        assert normalizar(page.locator('[data-financeiro="cobrado"]').inner_text()) == "R$ 440,00"
+        assert normalizar(page.locator('[data-financeiro="comissao"]').inner_text()) == "R$ 40,00"
+        assert normalizar(page.locator('[data-financeiro="liquido"]').inner_text()) == "R$ 400,00"
+
+        # Tabela: só os dois pedidos v2 ativos, mais recente primeiro; v1 e cancelado ficam de fora.
+        linhas_financeiro = page.locator("#financeiroTabelaContainer tbody tr")
+        assert linhas_financeiro.count() == 2
+        assert linhas_financeiro.nth(0).locator('[data-label="Pedido"]').inner_text() == "ORC-153"
+        assert linhas_financeiro.nth(1).locator('[data-label="Pedido"]').inner_text() == "ORC-151"
+        assert "ORC-150" not in normalizar(page.locator("#financeiroTabelaContainer").inner_text())
+        assert "ORC-152" not in normalizar(page.locator("#financeiroTabelaContainer").inner_text())
+        assert linhas_financeiro.nth(0).locator('[data-label="Cliente"]').inner_text() == "Cliente Financeiro B"
+        assert normalizar(linhas_financeiro.nth(0).locator('[data-label="Produtos cobrados"]').inner_text()) == "R$ 220,00"
+        assert normalizar(linhas_financeiro.nth(0).locator('[data-label="Comissão"]').inner_text()) == "R$ 20,00"
+        assert normalizar(linhas_financeiro.nth(0).locator('[data-label="Líquido Filippini"]').inner_text()) == "R$ 200,00"
+
+        # Excluídos, mas informados: histórico v1 (total, não por período) e cancelado no período.
+        v1_depois = v1_antes + 1
+        assert f"{v1_depois} pedido(s) histórico(s)" in texto_visivel(page.locator("#financeiroInfoV1"))
+        assert "não entram neste relatório" in texto_visivel(page.locator("#financeiroInfoV1"))
+        assert "1 pedido(s) cancelado(s) no período" in texto_visivel(page.locator("#financeiroInfoCancelados"))
+        assert page.locator("#financeiroAvisoInconsistencias").is_hidden()
+        assert page.locator("#financeiroVazio").is_hidden()
+
+        # Botão "Abrir" seleciona o orçamento e leva à aba Lançamento, como em Follow-ups.
+        linhas_financeiro.nth(0).locator(".btn-abrir-orcamento").click()
+        assert page.locator("#tab2").is_visible()
+        assert page.locator("#orcamentoId").inner_text() == "ORC-153"
+        tabs.nth(4).click()
+
+        # Estado vazio: período sem nenhuma venda v2 (mas o aviso de histórico v1 continua, pois não é por período).
+        page.locator("#financeiroDataInicial").fill(data_civil_brasilia(page, -40))
+        page.locator("#financeiroDataInicial").dispatch_event("change")
+        page.locator("#financeiroDataFinal").fill(data_civil_brasilia(page, -30))
+        page.locator("#financeiroDataFinal").dispatch_event("change")
+        page.wait_for_function("document.getElementById('financeiroVazio').hidden === false")
+        assert texto_visivel(page.locator("#financeiroVazio")) == "Nenhuma venda registrada neste período."
+        assert page.locator('[data-financeiro="pedidos"]').inner_text() == "0"
+        assert normalizar(page.locator('[data-financeiro="cobrado"]').inner_text()) == "R$ 0,00"
+        assert page.locator("#financeiroTabelaContainer tbody").count() == 0
+        assert f"{v1_depois} pedido(s) histórico(s)" in texto_visivel(page.locator("#financeiroInfoV1"))
+        assert page.locator("#financeiroInfoCancelados").is_hidden()
+
+        # Atalho "Este mês": data final volta a hoje e a inicial ao primeiro dia do mês atual.
+        page.locator("#btn-financeiro-este-mes").click()
+        page.wait_for_function("document.getElementById('financeiroDataFinal').value !== ''")
+        assert campo_inicial.input_value() == primeiro_dia_do_mes_atual
+        assert campo_final.input_value() == hoje
+
+        # Privacidade: nada disso vaza para a Proposta Cliente, impressão, instalador ou fornecedor.
+        page.locator("#financeiroDataInicial").fill(dia_menos_10)
+        page.locator("#financeiroDataInicial").dispatch_event("change")
+        tabs.nth(2).click()
+        verificar_aba_proposta_sem_dados_internos(page, "aba Proposta com vendas no financeiro")
+
+        # Impressão: a aba Financeiro fica escondida, como Lançamento e Follow-ups.
+        tabs.nth(4).click()
+        page.emulate_media(media="print")
+        assert page.locator("#tab-financeiro").evaluate("elemento => getComputedStyle(elemento).display") == "none"
+        page.emulate_media(media="screen")
+
+        # 390 px: filtros, cards e tabela (em cartões) sem rolagem horizontal.
+        page.set_viewport_size({"width": 390, "height": 844})
+        page.wait_for_timeout(100)
+        assert sem_rolagem_horizontal(page)
+        page.locator("#financeiroCards").screenshot(path=str(artifacts / "financeiro-cards-mobile.png"))
+        page.set_viewport_size({"width": 1440, "height": 1000})
+        tabs.nth(1).click()
+
         assert console_errors == [], console_errors
         assert request_failures == [], request_failures
         browser.close()
@@ -1223,7 +1393,7 @@ def main():
         "Browser smoke test passou: login, prévia com produto válido, salvamento, "
         "duplicação, validade, impressão, proposta detalhada móvel, contatos, WhatsApp, "
         "follow-ups, status perdido/reaberto, pedido confirmado, comissão configurável, snapshot v2, "
-        "confirmação transacional e cancelamento validados."
+        "confirmação transacional, cancelamento e relatório financeiro de vendas validados."
     )
 
 

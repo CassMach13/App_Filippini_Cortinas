@@ -413,6 +413,62 @@
             color: #5F5F5F;
         }
 
+        .financeiro-filtros {
+            align-items: flex-end;
+        }
+
+        .financeiro-atalhos-grupo {
+            flex: 0 0 auto;
+        }
+
+        .financeiro-atalhos-rotulo {
+            display: block;
+            font-weight: 600;
+            margin-bottom: 6px;
+            color: #4A4A4A;
+        }
+
+        .financeiro-atalhos {
+            display: flex;
+            gap: 8px;
+        }
+
+        .financeiro-cards {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+            gap: 15px;
+            margin: 20px 0;
+        }
+
+        .financeiro-card {
+            background: linear-gradient(135deg, #F5F1E8 0%, #FFFEF7 100%);
+            border: 2px solid #D4AF37;
+            border-radius: 16px;
+            padding: 18px;
+            box-shadow: 0 6px 20px rgba(212, 175, 55, 0.15);
+        }
+
+        .financeiro-card-rotulo {
+            display: block;
+            color: #4A4A4A;
+            font-weight: 600;
+            margin-bottom: 8px;
+        }
+
+        .financeiro-card-valor {
+            display: block;
+            font-size: 1.4em;
+            font-weight: 700;
+            color: #D4AF37;
+            overflow-wrap: anywhere;
+        }
+
+        .financeiro-info {
+            margin: 0 0 12px;
+            color: #5F5F5F;
+            font-size: 0.9em;
+        }
+
         /* Deixa aparecer o fundo escuro previsto para thead, em vez da cor de linha alternada. */
         .followups-table thead tr {
             background-color: transparent;
@@ -1231,7 +1287,7 @@
 
             /* Esconde todos os elementos da interface que não devem ser impressos.
                A notificação flutuante pode conter mensagens internas, como a alteração da comissão. */
-            .header, .tab-container, .form-container, .section-title, .budget-control, #tab1, #tab2, #tab-followups, #tab4, .btn-print, .app-notification {
+            .header, .tab-container, .form-container, .section-title, .budget-control, #tab1, #tab2, #tab-followups, #tab-financeiro, #tab4, .btn-print, .app-notification {
                 display: none !important;
             }
 
@@ -1896,6 +1952,7 @@
                     <button id="btn-tab-1" class="tab" type="button" role="tab" aria-selected="false" aria-controls="tab2" tabindex="-1"><span aria-hidden="true">💰</span> Lançamento de Orçamento</button>
                     <button id="btn-tab-2" class="tab" type="button" role="tab" aria-selected="false" aria-controls="tab3" tabindex="-1"><span aria-hidden="true">📄</span> Proposta Cliente</button>
                     <button id="btn-tab-followups" class="tab" type="button" role="tab" aria-selected="false" aria-controls="tab-followups" tabindex="-1"><span aria-hidden="true">📅</span> Follow-ups</button>
+                    <button id="btn-tab-financeiro" class="tab" type="button" role="tab" aria-selected="false" aria-controls="tab-financeiro" tabindex="-1"><span aria-hidden="true">💰</span> Financeiro</button>
                     <button id="btn-tab-3" class="tab" type="button" role="tab" aria-selected="false" aria-controls="tab4" tabindex="-1"><span aria-hidden="true">⚙️</span> Configurações</button>
                 </div>
 
@@ -2270,6 +2327,40 @@
                 <p class="followups-intro">Orçamentos em negociação com próximo contato agendado. As datas seguem o horário de Brasília.</p>
                 <p id="followupsResumo" class="followups-resumo" aria-live="polite"></p>
                 <div id="listaFollowUps"></div>
+            </div>
+        </div>
+
+        <div id="tab-financeiro" class="tab-content" role="tabpanel" aria-labelledby="btn-tab-financeiro" tabindex="0">
+            <div class="card-container">
+                <div class="section-title">Financeiro</div>
+                <p class="followups-intro">Vendas confirmadas pelo controle financeiro (pedidos v2), por período. Informação interna: não faz parte da proposta ao cliente.</p>
+
+                <div class="form-row financeiro-filtros">
+                    <div class="form-group">
+                        <label for="financeiroDataInicial">Data inicial:</label>
+                        <input type="date" id="financeiroDataInicial" class="campo-curto">
+                    </div>
+                    <div class="form-group">
+                        <label for="financeiroDataFinal">Data final:</label>
+                        <input type="date" id="financeiroDataFinal" class="campo-curto">
+                    </div>
+                    <div class="form-group financeiro-atalhos-grupo">
+                        <span class="financeiro-atalhos-rotulo">Atalhos:</span>
+                        <div class="financeiro-atalhos">
+                            <button id="btn-financeiro-este-mes" class="btn btn-secondary btn-sm" type="button">Este mês</button>
+                            <button id="btn-financeiro-mes-anterior" class="btn btn-secondary btn-sm" type="button">Mês anterior</button>
+                        </div>
+                    </div>
+                </div>
+
+                <div id="financeiroCards" class="financeiro-cards"></div>
+
+                <p id="financeiroAvisoInconsistencias" class="resumo-interno-aviso" role="status" hidden></p>
+                <p id="financeiroInfoV1" class="financeiro-info" hidden></p>
+                <p id="financeiroInfoCancelados" class="financeiro-info" hidden></p>
+
+                <div id="financeiroTabelaContainer"></div>
+                <p id="financeiroVazio" class="followup-vazio" hidden>Nenhuma venda registrada neste período.</p>
             </div>
         </div>
 
