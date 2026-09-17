@@ -308,6 +308,65 @@
             min-width: 0;
         }
 
+        .comissao-controles {
+            align-items: center;
+        }
+
+        .comissao-controles .comissao-ativa {
+            flex: 0 1 auto;
+            justify-content: center;
+            min-height: 48px;
+        }
+
+        .campo-percentual {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .campo-percentual input {
+            text-align: right;
+        }
+
+        .resumo-interno {
+            margin: 12px 0;
+            padding: 14px;
+            border: 2px dashed #8B9C8E;
+            border-radius: 10px;
+            background: #F4F7F4;
+        }
+
+        .resumo-interno h4 {
+            margin: 0 0 8px;
+            color: #2C2C2C;
+        }
+
+        .resumo-interno h4 small {
+            display: block;
+            font-weight: normal;
+            color: #4A4A4A;
+        }
+
+        .resumo-interno .management-item {
+            flex-wrap: wrap;
+            gap: 4px 12px;
+            padding: 6px 4px;
+        }
+
+        .resumo-interno-destaque {
+            font-weight: bold;
+            color: #1B5E20;
+        }
+
+        .resumo-interno-aviso {
+            margin: 8px 0 0;
+            padding: 8px 10px;
+            border-radius: 8px;
+            background: #FFF3CD;
+            color: #5E4A00;
+            font-size: 0.9em;
+        }
+
         .campo-ajuda {
             min-height: 1.2em;
             margin-top: 4px;
@@ -1136,8 +1195,9 @@
                 print-color-adjust: exact;
             }
 
-            /* Esconde todos os elementos da interface que não devem ser impressos */
-            .header, .tab-container, .form-container, .section-title, .budget-control, #tab1, #tab2, #tab-followups, #tab4, .btn-print {
+            /* Esconde todos os elementos da interface que não devem ser impressos.
+               A notificação flutuante pode conter mensagens internas, como a alteração da comissão. */
+            .header, .tab-container, .form-container, .section-title, .budget-control, #tab1, #tab2, #tab-followups, #tab4, .btn-print, .app-notification {
                 display: none !important;
             }
 
@@ -1943,13 +2003,6 @@
                         <label>ID do Orçamento:</label>
                         <span id="orcamentoId" style="font-weight: bold; padding: 10px; background: #eee; border-radius: 5px;"></span>
                     </div>
-                    <div class="form-group">
-                        <label for="tipoCliente">Tipo de Cliente:</label>
-                        <select id="tipoCliente" class="campo-curto">
-                            <option value="cliente">Cliente Final</option>
-                            <option value="arquiteto">Arquiteto</option>
-                        </select>
-                    </div>
                     <div class="form-group" style="flex: 3;">
                         <label for="nomeCliente">Nome do Cliente:</label>
                         <input type="text" id="nomeCliente" placeholder="Nome Completo">
@@ -1983,6 +2036,22 @@
                                 <a id="whatsappComissionado" class="btn btn-whatsapp" target="_blank" rel="noopener noreferrer" aria-disabled="true" aria-describedby="ajudaCelularComissionado">WhatsApp</a>
                             </div>
                             <small id="ajudaCelularComissionado" class="campo-ajuda" aria-live="polite"></small>
+                        </div>
+                    </div>
+                    <div class="form-row comissao-controles">
+                        <div class="form-group comissao-ativa">
+                            <label for="vendaComComissao" class="checkbox-inline">
+                                <input type="checkbox" id="vendaComComissao">
+                                <span>Venda com comissão</span>
+                            </label>
+                        </div>
+                        <div class="form-group">
+                            <label for="percentualComissao">Percentual da comissão:</label>
+                            <div class="campo-percentual">
+                                <input type="text" id="percentualComissao" class="campo-curto" inputmode="decimal" autocomplete="off" value="0,00" aria-describedby="ajudaComissao">
+                                <span aria-hidden="true">%</span>
+                            </div>
+                            <small id="ajudaComissao" class="campo-ajuda" aria-live="polite"></small>
                         </div>
                     </div>
                 </fieldset>
@@ -2123,8 +2192,6 @@
                         <div class="form-group">
                             <label for="descontoGlobal">Desconto Global (%):</label>
                             <input type="number" id="descontoGlobal" value="0" min="0" max="100" step="0.5">
-                            <span>Margem com Desconto (%):</span>
-                            <span id="margemComDesconto" style="font-weight: bold; padding: 10px; background: #eee; border-radius: 5px;">0%</span>
                         </div>
                     </div>
                     <div class="form-row">

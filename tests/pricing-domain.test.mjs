@@ -15,37 +15,38 @@ test('calcula e arredonda o preço final do catálogo', () => {
     assert.equal(arredondamentoFinanceiro(58.095), 58.10);
 });
 
-test('calcula item por unidade para cliente final', () => {
+test('calcula item por unidade sem comissão', () => {
     const resultado = calcularDetalhesItem(
         { unidadeMedida: 'Unidade', precoCompra: 10, markup: 2 },
         3,
         0,
         0,
-        'cliente'
+        0
     );
 
     assert.equal(resultado.quantidadeCompra, 3);
+    assert.equal(resultado.precoUnitarioBase, 20);
+    assert.equal(resultado.precoTotalSemComissao, 60);
     assert.equal(resultado.precoUnitario, 20);
     assert.equal(resultado.precoTotal, 60);
     assert.equal(resultado.custoReal, 30);
-    assert.equal(resultado.valorComissao, 0);
-    assert.equal(resultado.margemLiquida, 30);
-    assert.equal(resultado.margemPercentual, 50);
 });
 
-test('calcula comissão de arquiteto preservando a margem líquida atual', () => {
+test('embute a comissão por fora sem gravar comissão ou margem no item', () => {
     const resultado = calcularDetalhesItem(
         { unidadeMedida: 'Unidade', precoCompra: 10, markup: 2 },
         3,
         0,
         0,
-        'arquiteto'
+        10
     );
 
+    assert.equal(resultado.precoUnitarioBase, 20);
+    assert.equal(resultado.precoTotalSemComissao, 60);
     assert.equal(resultado.precoUnitario, 22);
     assert.equal(resultado.precoTotal, 66);
-    assert.equal(resultado.valorComissao, 6);
-    assert.equal(resultado.margemLiquida, 30);
+    // Comissão e margem são derivadas no orçamento; o item não carrega esses valores.
+    ['valorComissao', 'margemLiquida', 'margemPercentual'].forEach(campo => assert.equal(campo in resultado, false, campo));
 });
 
 test('calcula metro linear e preserva a largura padrão do material', () => {
@@ -54,7 +55,7 @@ test('calcula metro linear e preserva a largura padrão do material', () => {
         7.5,
         0,
         0,
-        'cliente'
+        0
     );
 
     assert.equal(resultado.quantidadeCompra, 7.5);
@@ -108,13 +109,13 @@ test('calcula metro quadrado multiplicando medidas e peças', () => {
         2,
         3.5,
         2.85,
-        'cliente'
+        0
     );
 
     assert.equal(resultado.quantidadeCompra, 19.95);
+    assert.equal(resultado.precoTotalSemComissao, 399);
     assert.equal(resultado.precoTotal, 399);
     assert.equal(resultado.custoReal, 199.5);
-    assert.equal(resultado.margemLiquida, 199.5);
 });
 
 test('rejeita quantidade inválida também para metro quadrado', () => {

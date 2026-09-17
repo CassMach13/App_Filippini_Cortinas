@@ -8,24 +8,14 @@ import {
 } from '../order-domain.js';
 import {
     arredondamentoFinanceiro,
-    calcularDetalhesItem,
+    calcularPrecoFinal,
     calcularTotaisProposta,
-    converterValorParaCentavos
+    converterValorParaCentavos,
+    normalizarUnidadeMedida
 } from '../pricing-domain.js';
 
 const formatadorMoeda = new Intl.NumberFormat('pt-BR', { style: 'currency', currency: 'BRL' });
-const CAMPOS_TOTAIS_ORCAMENTO = [
-    'subtotalProdutos',
-    'margemProdutos',
-    'margemProdutosPercentual',
-    'descontoPercentual',
-    'descontoValor',
-    'totalProdutos',
-    'totalInstalacao',
-    'totalGeral',
-    'margemComDesconto',
-    'margemPercentual'
-];
+// Valores que o cliente vê na proposta; não podem mudar para documentos antigos.
 const CAMPOS_TOTAIS_PEDIDO = [
     'subtotalProdutos',
     'descontoPercentual',
@@ -35,9 +25,35 @@ const CAMPOS_TOTAIS_PEDIDO = [
     'totalGeral'
 ];
 
-// Reprodução literal do cálculo atual da interface em apps.js, usada como referência de equivalência:
-// renderizarItensOrcamento, calcularTotalInstalacao, preencherInfoOrcamento e atualizarPropostaCliente.
-function calcularComoInterfaceAtual(orcamento) {
+// Reprodução literal da regra de item anterior à comissão configurável (calcularDetalhesItem com
+// tipoCliente), usada para gerar documentos antigos como os que existem no Firestore.
+function calcularItemComoRegraAntiga(produtoBase, quantidade, largura, altura, tipoCliente = 'cliente') {
+    let quantidadeCompra = quantidade;
+    let larguraSalva = null;
+    let alturaSalva = null;
+    if (normalizarUnidadeMedida(produtoBase.unidadeMedida) === 'MetroLinear') {
+        alturaSalva = produtoBase.alturaPadrao ?? null;
+    } else if (normalizarUnidadeMedida(produtoBase.unidadeMedida) === 'MetroQuadrado') {
+        quantidadeCompra = largura * altura * quantidade;
+        larguraSalva = largura;
+        alturaSalva = altura;
+    }
+
+    const precoUnitarioBase = calcularPrecoFinal(produtoBase.precoCompra, produtoBase.markup);
+    const percentualComissao = tipoCliente === 'arquiteto' ? 0.10 : 0;
+    const precoUnitario = arredondamentoFinanceiro(precoUnitarioBase * (1 + percentualComissao), 2);
+    const precoTotal = arredondamentoFinanceiro(precoUnitario * quantidadeCompra, 2);
+    const custoReal = produtoBase.precoCompra * quantidadeCompra;
+    const valorComissao = precoUnitarioBase * percentualComissao * quantidadeCompra;
+    const margemLiquida = precoTotal - custoReal - valorComissao;
+    const margemPercentual = precoTotal > 0 ? (margemLiquida / precoTotal) * 100 : 0;
+
+    return { quantidadeCompra, larguraSalva, alturaSalva, precoUnitario, precoTotal, custoReal, valorComissao, margemLiquida, margemPercentual };
+}
+
+// Reprodução literal do cálculo da interface antes da comissão configurável, usada como referência de
+// equivalência: renderizarItensOrcamento, calcularTotalInstalacao, preencherInfoOrcamento e atualizarPropostaCliente.
+function calcularComoInterfaceAnterior(orcamento) {
     const todosOsItens = [...(orcamento.itens || []), ...(orcamento.produtosAcabados || []).flatMap(p => p.itens || [])];
     const totalOrcamento = todosOsItens.reduce((sum, item) => sum + (item.precoTotal || 0), 0);
     const totalMargemProposta = todosOsItens.reduce((sum, item) => sum + (item.margemLiquida || 0), 0);
@@ -119,7 +135,7 @@ function gerarOrcamentoAleatorio(aleatorio, indice) {
             alturaPadrao: 2.8
         };
         const quantidade = unidadeMedida === 'MetroLinear' ? inteiro(500, 30000) / 1000 : inteiro(1, 6);
-        const detalhes = calcularDetalhesItem(produto, quantidade, inteiro(30, 400) / 100, inteiro(30, 320) / 100, tipoCliente);
+        const detalhes = calcularItemComoRegraAntiga(produto, quantidade, inteiro(30, 400) / 100, inteiro(30, 320) / 100, tipoCliente);
 
         return {
             id: `item-${indice}-${numero}`,
@@ -226,22 +242,39 @@ function criarOrcamentoExemplo() {
     };
 }
 
-test('totais do orçamento reproduzem exatamente o cálculo atual da interface', () => {
+test('documentos antigos mantêm exatamente os valores exibidos ao cliente', () => {
     const orcamentos = gerarOrcamentos(2000, 20260916);
     let comDesconto = 0;
     let comInstalacao = 0;
+    let deArquiteto = 0;
 
     orcamentos.forEach(orcamento => {
-        const esperado = calcularComoInterfaceAtual(orcamento);
+        const anterior = calcularComoInterfaceAnterior(orcamento);
         const totais = calcularTotaisOrcamento(orcamento);
 
-        assert.deepEqual(selecionarCampos(totais, CAMPOS_TOTAIS_ORCAMENTO), esperado, orcamento.id);
+        // Subtotal, desconto, total de produtos, instalação e total da proposta idênticos.
+        assert.deepEqual(selecionarCampos(totais, CAMPOS_TOTAIS_PEDIDO), selecionarCampos(anterior, CAMPOS_TOTAIS_PEDIDO), orcamento.id);
+        assert.deepEqual(totais.avisos, [], orcamento.id);
+
+        if (orcamento.infoGerais.tipoCliente === 'arquiteto') {
+            deArquiteto++;
+            // Comissão oficial: 10% da base líquida, calculada no orçamento.
+            assert.equal(totais.percentualComissao, 10);
+            assert.equal(totais.centavos.valorComissao, converterValorParaCentavos(totais.centavos.baseLiquida / 1000), orcamento.id);
+        } else {
+            // Sem comissão a margem é a mesma de antes, a menos do arredondamento do total em centavos.
+            assert.equal(totais.percentualComissao, 0);
+            assert.equal(totais.valorComissao, 0);
+            assert.ok(Math.abs(totais.margemProdutos - anterior.margemProdutos) < 1e-6, orcamento.id);
+            assert.ok(Math.abs(totais.margemComDesconto - anterior.margemComDesconto) <= 0.0051, orcamento.id);
+        }
         if (totais.descontoValor > 0) comDesconto++;
         if (totais.totalInstalacao > 0) comInstalacao++;
     });
 
     assert.ok(comDesconto > 500, 'a amostra precisa exercitar descontos');
     assert.ok(comInstalacao > 500, 'a amostra precisa exercitar instalação');
+    assert.ok(deArquiteto > 500, 'a amostra precisa exercitar documentos antigos de arquiteto');
 });
 
 test('calcula o exemplo completo com produtos acabados, itens avulsos, instalação e desconto', () => {
@@ -255,13 +288,20 @@ test('calcula o exemplo completo com produtos acabados, itens avulsos, instalaç
     assert.equal(totais.totalProdutos, 202.95);
     assert.equal(totais.totalInstalacao, 150);
     assert.equal(totais.totalGeral, 352.95);
-    assert.equal(totais.margemComDesconto, 106.7);
+    assert.equal(totais.custoTotal, 96.25);
+    assert.ok(Math.abs(totais.margemComDesconto - 106.7) < 1e-9);
     assert.deepEqual(totais.centavos, {
         subtotalProdutos: 22550,
         descontoValor: 2255,
         totalProdutos: 20295,
         totalInstalacao: 15000,
-        totalGeral: 35295
+        totalGeral: 35295,
+        subtotalSemComissao: 22550,
+        descontoBase: 2255,
+        baseLiquida: 20295,
+        valorComissao: 0,
+        liquidoFilippini: 20295,
+        residuo: 0
     });
 });
 
@@ -318,7 +358,7 @@ test('lê documentos antigos sem campos opcionais e não grava valores padrão',
     assert.equal(vazio.totalGeral, 0);
     assert.deepEqual(calcularTotaisOrcamento(null), vazio);
 
-    const somenteAvulsos = calcularTotaisOrcamento({ itens: [{ precoTotal: 80, margemLiquida: 40 }] });
+    const somenteAvulsos = calcularTotaisOrcamento({ itens: [{ precoTotal: 80, custoReal: 40 }] });
     assert.equal(somenteAvulsos.subtotalProdutos, 80);
     assert.equal(somenteAvulsos.margemProdutosPercentual, 50);
 
@@ -380,7 +420,7 @@ test('pedido versão 1 calcula os mesmos totais exibidos no momento da confirma�
         assert.equal(totais.quantidadeItens, calcularTotaisOrcamento(orcamento).quantidadeItens);
         assert.deepEqual(
             selecionarCampos(totais, CAMPOS_TOTAIS_PEDIDO),
-            selecionarCampos(calcularComoInterfaceAtual(orcamento), CAMPOS_TOTAIS_PEDIDO),
+            selecionarCampos(calcularComoInterfaceAnterior(orcamento), CAMPOS_TOTAIS_PEDIDO),
             orcamento.id
         );
     });
@@ -406,7 +446,7 @@ test('pedido versão 1 soma primeiro os itens avulsos para não mudar o centavo 
     const somaNaOrdemDoSnapshot = pedido.pedido.itens.reduce((soma, item) => soma + item.precoVendaTotal, 0);
     const totalNaOrdemDoSnapshot = somaNaOrdemDoSnapshot - somaNaOrdemDoSnapshot * 0.05;
 
-    assert.equal(exibirMoeda(calcularComoInterfaceAtual(orcamento).totalProdutos), 'R$ 1.295,51');
+    assert.equal(exibirMoeda(calcularComoInterfaceAnterior(orcamento).totalProdutos), 'R$ 1.295,51');
     assert.equal(exibirMoeda(totalNaOrdemDoSnapshot), 'R$ 1.295,52');
     assert.equal(obterTotaisDoPedido(pedido).centavos.totalProdutos, 129551);
 });
