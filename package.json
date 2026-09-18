@@ -5,7 +5,7 @@
   "scripts": {
     "build:hosting": "node scripts/build-hosting.mjs",
     "test": "node --test tests/*.test.mjs",
-    "test:syntax": "node --check apps.js && node --check order-domain.js && node --check order-transactions.js && node --check sales-report-domain.js && node --check pricing-domain.js && node --check date-domain.js && node --check contact-domain.js && node --check followup-domain.js",
+    "test:syntax": "node --check apps.js && node --check order-domain.js && node --check order-transactions.js && node --check sales-report-domain.js && node --check payments-domain.js && node --check payment-transactions.js && node --check pricing-domain.js && node --check date-domain.js && node --check contact-domain.js && node --check followup-domain.js",
     "test:rules": "firebase emulators:exec --only firestore --project demo-filippini-regras \"node --test tests/rules/*.test.mjs\""
   },
   "devDependencies": {

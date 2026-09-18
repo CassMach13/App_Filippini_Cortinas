@@ -183,6 +183,232 @@ service cloud.firestore {
         && pedidoPreservadoOuCancelado();
     }
 
+    // --- Movimentos financeiros (subcoleção pagamentos) ---
+    // Recebimentos e reembolsos vivem em documentos próprios, fora do documento do orçamento: o
+    // salvamento geral regrava o documento inteiro e apagaria lançamentos feitos em outro dispositivo.
+    // A elegibilidade do pedido é conferida aqui no servidor, com get() do pai, e não só no cliente.
+
+    function formaPagamentoValida(valor) {
+      return valor in ['PIX', 'Dinheiro', 'Cartão de débito', 'Cartão de crédito', 'Transferência', 'Boleto', 'Outro'];
+    }
+
+    function cancelamentoDeMovimentoValido(m) {
+      return instanteIsoUtc(m.canceladoEm)
+        && textoOuNulo(m.canceladoPor)
+        && m.motivoCancelamento is string
+        && m.motivoCancelamento == m.motivoCancelamento.trim()
+        && m.motivoCancelamento.size() > 0
+        && m.motivoCancelamento.size() <= 500;
+    }
+
+    function movimentoValido(m) {
+      let obrigatorios = ['tipo', 'dataMovimento', 'valorCentavos', 'formaPagamento', 'observacao',
+        'status', 'versao', 'ultimoEventoId', 'criadoEm', 'criadoPor', 'atualizadoEm', 'atualizadoPor'];
+      let doCancelamento = ['canceladoEm', 'canceladoPor', 'motivoCancelamento'];
+      return m is map
+        && m.keys().hasAll(obrigatorios)
+        && m.keys().hasOnly(obrigatorios.concat(doCancelamento))
+        && m.tipo in ['recebimento', 'reembolso']
+        // O fuso de Brasília e a proibição de data futura são validados no domínio; aqui, o formato.
+        && dataCivil(m.dataMovimento)
+        && m.valorCentavos is int && m.valorCentavos > 0
+        && formaPagamentoValida(m.formaPagamento)
+        && m.observacao is string && m.observacao.size() <= 500
+        && m.status in ['ativo', 'cancelado']
+        && m.versao is int && m.versao >= 1
+        && m.ultimoEventoId is string && m.ultimoEventoId.size() > 0
+        && instanteIsoUtc(m.criadoEm) && textoOuNulo(m.criadoPor)
+        && instanteIsoUtc(m.atualizadoEm) && textoOuNulo(m.atualizadoPor)
+        && (m.status == 'cancelado'
+          ? (m.keys().hasAll(doCancelamento) && cancelamentoDeMovimentoValido(m))
+          : !m.keys().hasAny(doCancelamento));
+    }
+
+    function paiAceitaMovimento(orcamentoId, tipo) {
+      // ATENÇÃO: esta função NÃO é um segundo validador completo do snapshot. Ela pode ser enxuta
+      // porque depende de invariantes garantidas em outro lugar:
+      //   a) o contrato v2 completo é validado na criação/confirmação do pedido (criacaoValida e
+      //      confirmacaoValida, que chamam snapshotV2Valido);
+      //   b) depois da confirmação o bloco `pedido` é imutável — atualizacaoDePedidoValida e
+      //      pedidoPreservadoOuCancelado só admitem acrescentar `cancelamento`;
+      //   c) essas invariantes seguem protegidas pelas regras históricas da 3B1 e seus 13 testes.
+      // Quem for "simplificar" as regras de /orcamentos no futuro precisa saber que os pagamentos
+      // dependem delas. Reexecutar snapshotV2Valido aqui não é opção: somado às checagens de
+      // auditoria, estoura o limite de 1000 expressões por avaliação das regras.
+      //
+      // Uma leitura do pai por avaliação. Pai inexistente falha fechado; há teste explícito no emulador.
+      let documentoPai = get(/databases/$(database)/documents/orcamentos/$(orcamentoId));
+      let pai = documentoPai != null ? documentoPai.data : null;
+      let pedido = (pai != null && 'pedido' in pai) ? pai.pedido : null;
+      return pai != null
+        // O pai precisa ser pedido: um orçamento em negociação não movimenta dinheiro nem que
+        // carregue, por qualquer motivo, uma estrutura de pedido com aparência válida.
+        && ehPedido(pai)
+        && pedido != null
+        // Pedido v1 nunca movimenta dinheiro: não tem snapshot financeiro.
+        && pedido.versaoSnapshot == 2
+        && pedido.orcamentoId == orcamentoId
+        // Recebível presente e coerente em centavos inteiros.
+        && pedido.financeiro.valorProdutosCobradoClienteCentavos is int
+        && pedido.financeiro.valorProdutosCobradoClienteCentavos
+          == pedido.financeiro.valorLiquidoFilippiniCentavos + pedido.financeiro.valorComissaoCentavos
+        // Recebimento exige pedido não cancelado; reembolso vale com o pedido ativo ou cancelado,
+        // porque o dinheiro entrou de verdade e pode voltar.
+        && (tipo == 'reembolso' || !('cancelamento' in pedido));
+    }
+
+    // A trilha de auditoria é obrigatória, não opcional: o evento desta versão precisa existir no
+    // estado PÓS-COMMIT (getAfter), o que só acontece se pagamento e evento forem escritos na mesma
+    // operação atômica. São dois acessos por escrita de movimento (o pai e este evento), sem nunca
+    // percorrer a trilha inteira.
+    function eventoDaVersao(orcamentoId, pagamentoId, eventoId) {
+      return getAfter(/databases/$(database)/documents/orcamentos/$(orcamentoId)/pagamentos/$(pagamentoId)/auditoria/$(eventoId));
+    }
+
+    // estadoAnterior/estadoNovo são o ESTADO DE NEGÓCIO do movimento, não um snapshot do documento:
+    // exatamente tipo, dataMovimento, valorCentavos, formaPagamento, observacao e status. Campos
+    // técnicos (versao, ultimoEventoId, criadoEm/Por, atualizadoEm/Por) e os de cancelamento ficam
+    // fora do mapa e são preservados nos campos próprios do evento e do próprio documento.
+    function estadoConfere(estado, movimento) {
+      let campos = ['tipo', 'dataMovimento', 'valorCentavos', 'formaPagamento', 'observacao', 'status'];
+      return estado is map
+        && estado.keys().hasAll(campos) && estado.keys().hasOnly(campos)
+        && estado.tipo == movimento.tipo
+        && estado.dataMovimento == movimento.dataMovimento
+        && estado.valorCentavos == movimento.valorCentavos
+        && estado.formaPagamento == movimento.formaPagamento
+        && estado.observacao == movimento.observacao
+        && estado.status == movimento.status;
+    }
+
+    function criacaoDeMovimentoComAuditoria(orcamentoId, pagamentoId) {
+      // Um lançamento sempre nasce na versão 1, ativo, com o evento de criação gravado junto. A 4B1
+      // NÃO abre exceção de restauração (versao > 1): enquanto o backup da aplicação não gravar
+      // pagamentos e auditoria, aceitar história pronta permitiria uma trilha truncada (v1..vN com
+      // buracos). A exceção será desenhada na 4B2, junto com o round-trip do backup.
+      let novo = request.resource.data;
+      let evento = eventoDaVersao(orcamentoId, pagamentoId, novo.ultimoEventoId);
+      return novo.versao == 1
+        // O id do evento é derivado da versão: "v" + versao. Imposto no servidor, não só no domínio.
+        && novo.ultimoEventoId == 'v' + string(novo.versao)
+        && novo.status == 'ativo'
+        // Movimento novo tem autor: nasce com o usuário autenticado, nunca anônimo nem de terceiro.
+        && novo.criadoPor == request.auth.uid
+        && novo.atualizadoPor == request.auth.uid
+        && novo.criadoEm == novo.atualizadoEm
+        && evento != null
+        && evento.data.evento == 'criacao'
+        && evento.data.versaoAnterior == null
+        && evento.data.versaoNova == 1
+        && evento.data.estadoAnterior == null
+        && evento.data.motivo == null
+        && evento.data.registradoPor == request.auth.uid
+        && evento.data.registradoEm == novo.criadoEm
+        && estadoConfere(evento.data.estadoNovo, novo);
+    }
+
+    function camposAlteradosDoMovimento() {
+      return request.resource.data.diff(resource.data).affectedKeys();
+    }
+
+    function correcaoDeMovimentoValida(evento) {
+      // Correção mexe só no que é erro de digitação. Não muda tipo, não cancela, não reativa, não
+      // troca a autoria da criação e não introduz campos de cancelamento.
+      let antes = resource.data;
+      let depois = request.resource.data;
+      let doCancelamento = ['canceladoEm', 'canceladoPor', 'motivoCancelamento'];
+      return antes.status == 'ativo' && depois.status == 'ativo'
+        && camposAlteradosDoMovimento().hasOnly(['dataMovimento', 'valorCentavos', 'formaPagamento',
+          'observacao', 'versao', 'ultimoEventoId', 'atualizadoEm', 'atualizadoPor'])
+        && !antes.keys().hasAny(doCancelamento)
+        && !depois.keys().hasAny(doCancelamento)
+        && evento.data.evento == 'correcao'
+        && evento.data.motivo == null;
+    }
+
+    function cancelamentoLogicoDeMovimentoValido(evento) {
+      // Cancelar não é oportunidade de corrigir: valores e datas do movimento ficam exatamente como
+      // estavam. A operação híbrida "cancela e de quebra muda o valor" é recusada pelo hasOnly.
+      let depois = request.resource.data;
+      return resource.data.status == 'ativo' && depois.status == 'cancelado'
+        && camposAlteradosDoMovimento().hasOnly(['status', 'versao', 'ultimoEventoId', 'atualizadoEm',
+          'atualizadoPor', 'canceladoEm', 'canceladoPor', 'motivoCancelamento'])
+        && depois.canceladoPor == request.auth.uid
+        && evento.data.evento == 'cancelamento'
+        // O evento preserva, sem ambiguidade, motivo, usuário e instante do cancelamento.
+        && evento.data.motivo == depois.motivoCancelamento
+        && evento.data.registradoEm == depois.canceladoEm;
+    }
+
+    function atualizacaoDeMovimentoValida(orcamentoId, pagamentoId) {
+      // Correção e cancelamento acontecem no próprio documento, com versão incrementada. Cancelado é
+      // terminal: não se corrige nem se cancela de novo. O pai não é reconsultado: um pedido cancelado
+      // não recebe mais, mas continua podendo ter um erro de digitação corrigido no histórico.
+      let antes = resource.data;
+      let depois = request.resource.data;
+      let evento = eventoDaVersao(orcamentoId, pagamentoId, depois.ultimoEventoId);
+      return antes.status == 'ativo'
+        && depois.tipo == antes.tipo
+        && depois.criadoEm == antes.criadoEm
+        && depois.criadoPor == antes.criadoPor
+        && depois.versao == antes.versao + 1
+        && depois.atualizadoPor == request.auth.uid
+        && depois.ultimoEventoId != antes.ultimoEventoId
+        // Mesmo contrato da criação: o id do evento é "v" + versao, imposto no servidor.
+        && depois.ultimoEventoId == 'v' + string(depois.versao)
+        && evento != null
+        && evento.data.versaoAnterior == antes.versao
+        && evento.data.versaoNova == depois.versao
+        && evento.data.registradoPor == request.auth.uid
+        && evento.data.registradoEm == depois.atualizadoEm
+        && estadoConfere(evento.data.estadoAnterior, antes)
+        && estadoConfere(evento.data.estadoNovo, depois)
+        // Exatamente uma das duas operações, nunca um híbrido das duas.
+        && (correcaoDeMovimentoValida(evento) || cancelamentoLogicoDeMovimentoValido(evento));
+    }
+
+    function auditoriaAcompanhaTransicaoDoMovimento(orcamentoId, pagamentoId, eventoId) {
+      // Mão dupla: o movimento já não muda sem evento, e o evento não nasce sem que o movimento tenha
+      // transitado na MESMA operação atômica. Uma escrita solta em .../auditoria/v999 é recusada
+      // porque o estado antes e depois do pagamento seria idêntico.
+      // Custo: só o pagamento correspondente, antes e depois. A trilha nunca é percorrida.
+      let caminho = /databases/$(database)/documents/orcamentos/$(orcamentoId)/pagamentos/$(pagamentoId);
+      let documentoAntes = get(caminho);
+      let documentoDepois = getAfter(caminho);
+      let antes = documentoAntes != null ? documentoAntes.data : null;
+      let depois = documentoDepois != null ? documentoDepois.data : null;
+      let e = request.resource.data;
+      return depois != null
+        && depois.ultimoEventoId == eventoId
+        && depois.versao == e.versaoNova
+        && estadoConfere(e.estadoNovo, depois)
+        && e.registradoPor == request.auth.uid
+        && e.registradoEm == depois.atualizadoEm
+        && (e.evento == 'criacao'
+          // Criação: o movimento não existia antes desta operação e nasce na versão 1.
+          ? (antes == null && e.versaoNova == 1 && e.estadoAnterior == null)
+          // Correção/cancelamento: o movimento existia e avançou exatamente uma versão.
+          : (antes != null
+            && depois.versao == antes.versao + 1
+            && e.versaoAnterior == antes.versao
+            && estadoConfere(e.estadoAnterior, antes)));
+    }
+
+    function eventoDeAuditoriaValido(e) {
+      let campos = ['evento', 'versaoAnterior', 'versaoNova', 'estadoAnterior', 'estadoNovo',
+        'motivo', 'registradoEm', 'registradoPor'];
+      return e is map
+        && e.keys().hasAll(campos) && e.keys().hasOnly(campos)
+        && e.evento in ['criacao', 'correcao', 'cancelamento']
+        && (e.versaoAnterior == null || e.versaoAnterior is int)
+        && e.versaoNova is int && e.versaoNova >= 1
+        && (e.estadoAnterior == null || e.estadoAnterior is map)
+        && e.estadoNovo is map
+        && textoOuNulo(e.motivo)
+        && instanteIsoUtc(e.registradoEm)
+        && textoOuNulo(e.registradoPor);
+    }
+
     match /precos/{documentId} {
       allow read, write: if isSignedIn();
     }
@@ -211,6 +437,30 @@ service cloud.firestore {
       );
       // Pedidos (v1 ou v2, cancelados ou não) preservam o histórico e não são excluídos.
       allow delete: if isSignedIn() && (resource == null || !ehPedido(resource.data));
+
+      match /pagamentos/{pagamentoId} {
+        allow read: if isSignedIn();
+        // Na 4B1, create representa exclusivamente movimento novo: versão 1, ativo e com evento v1.
+        // Restauração histórica será aberta somente na 4B2, junto ao backup real.
+        allow create: if isSignedIn()
+          && movimentoValido(request.resource.data)
+          && paiAceitaMovimento(documentId, request.resource.data.tipo)
+          && criacaoDeMovimentoComAuditoria(documentId, pagamentoId);
+        allow update: if isSignedIn()
+          && movimentoValido(request.resource.data)
+          && atualizacaoDeMovimentoValida(documentId, pagamentoId);
+        // Dinheiro não se apaga: corrigir ou cancelar deixa rastro, excluir não deixaria.
+        allow delete: if false;
+
+        match /auditoria/{eventoId} {
+          allow read: if isSignedIn();
+          allow create: if isSignedIn()
+            && eventoDeAuditoriaValido(request.resource.data)
+            && auditoriaAcompanhaTransicaoDoMovimento(documentId, pagamentoId, eventoId);
+          // A trilha é imutável.
+          allow update, delete: if false;
+        }
+      }
     }
 
     match /contadores/{documentId} {
