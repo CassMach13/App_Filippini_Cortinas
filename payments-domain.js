@@ -309,7 +309,7 @@ export function calcularSituacaoFinanceira(orcamento, movimentos = []) {
 // NOVO agora?" (e recusa recebimento em pedido cancelado); esta função responde "posso RESTAURAR este
 // movimento histórico?". Liberar a restauração aqui não abre nada nas Firestore Rules: o create
 // server-side continua exclusivamente versão 1, movimento novo e evento v1, até a 4B2.
-export function avaliarRestauracaoMovimento(existente, candidato, orcamentoPai) {
+export function avaliarRestauracaoMovimento(existente, candidato, orcamentoPai, { hoje = obterDataCivilAtual() } = {}) {
     // Backup nunca sobrescreve movimento existente nem cria movimento órfão: restaurar uma versão
     // antiga por cima da atual desfaria silenciosamente uma correção já feita.
     if (existente) return { gravar: false, motivo: 'movimento-ja-existe' };
@@ -320,8 +320,12 @@ export function avaliarRestauracaoMovimento(existente, candidato, orcamentoPai) 
     // depois foi cancelado precisa poder ter esse recebimento restaurado — o cancelamento posterior
     // não transforma em inexistente o dinheiro que entrou antes dele.
     if (!pedidoTemSnapshotV2Valido(orcamentoPai)) return { gravar: false, motivo: 'pedido-sem-snapshot-v2-valido' };
-    // A restauração aceita movimentos cancelados e versões maiores que 1: é história, não lançamento novo.
-    const validacao = validarMovimento(candidato, { hoje: candidato?.dataMovimento });
+    // A restauração aceita movimentos cancelados e versões maiores que 1: é história, não lançamento
+    // novo. O que ela NÃO relaxa é a validade temporal: o relógio de referência é o `hoje` da
+    // restauração, nunca a própria dataMovimento — usar a data do candidato como relógio tornaria
+    // qualquer movimento futuro automaticamente "não futuro". Ser backup não transforma um movimento
+    // com data futura em fato ocorrido.
+    const validacao = validarMovimento(candidato, { hoje });
     if (!validacao.valido) return { gravar: false, motivo: `movimento-invalido:${validacao.erros.join(',')}` };
     return { gravar: true, motivo: null };
 }

@@ -363,6 +363,40 @@ test('BLOQUEADOR DE DEPLOY: o backup ainda não cobre pagamentos, então nenhum 
     assert.ok(!fonteApps.includes('avaliarRestauracaoMovimento'), 'importarDados ainda não restaura pagamentos');
 });
 
+test('a restauração preserva a validade temporal: data futura é recusada', () => {
+    // Relógio explícito: o teste não depende da data real da execução.
+    const restauracao = { hoje: '2026-09-18' };
+    const pedidoAtivo = criarPedidoV2();
+
+    const ontem = criar({ dataMovimento: '2026-09-17' });
+    const hojeMesmo = criar({ dataMovimento: '2026-09-18' });
+    const amanha = { ...criar(), dataMovimento: '2026-09-19' };
+
+    assert.equal(avaliarRestauracaoMovimento(null, ontem, pedidoAtivo, restauracao).gravar, true, 'data passada');
+    assert.equal(avaliarRestauracaoMovimento(null, hojeMesmo, pedidoAtivo, restauracao).gravar, true, 'data de hoje');
+
+    const futuro = avaliarRestauracaoMovimento(null, amanha, pedidoAtivo, restauracao);
+    assert.equal(futuro.gravar, false, 'data futura');
+    assert.equal(futuro.motivo, 'movimento-invalido:dataMovimento-futura');
+});
+
+test('ignorar o cancelamento do pai não significa ignorar a validade temporal do movimento', () => {
+    // O pai cancelado deixa de bloquear a restauração do histórico, mas um movimento com data futura
+    // continua impossível: ser backup não transforma o que não aconteceu em fato ocorrido.
+    const restauracao = { hoje: '2026-09-18' };
+    const pedidoCancelado = cancelarPedido(criarPedidoV2(), CANCELAMENTO_PEDIDO);
+
+    assert.equal(
+        avaliarRestauracaoMovimento(null, criar({ dataMovimento: '2026-09-17' }), pedidoCancelado, restauracao).gravar,
+        true,
+        'recebimento histórico sob pai cancelado continua restaurável'
+    );
+
+    const futuro = avaliarRestauracaoMovimento(null, { ...criar(), dataMovimento: '2099-01-01' }, pedidoCancelado, restauracao);
+    assert.equal(futuro.gravar, false, 'movimento futuro sob pai cancelado');
+    assert.equal(futuro.motivo, 'movimento-invalido:dataMovimento-futura');
+});
+
 test('backup recusa movimento estruturalmente inválido', () => {
     const corrompido = { ...criar(), valorCentavos: -1 };
     const avaliacao = avaliarRestauracaoMovimento(null, corrompido, criarPedidoV2());
