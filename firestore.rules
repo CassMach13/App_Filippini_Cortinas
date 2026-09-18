@@ -236,7 +236,7 @@ service cloud.firestore {
       // dependem delas. Reexecutar snapshotV2Valido aqui não é opção: somado às checagens de
       // auditoria, estoura o limite de 1000 expressões por avaliação das regras.
       //
-      // Uma leitura do pai por avaliação; get() já devolve null quando o documento não existe.
+      // Uma leitura do pai por avaliação. Pai inexistente falha fechado; há teste explícito no emulador.
       let documentoPai = get(/databases/$(database)/documents/orcamentos/$(orcamentoId));
       let pai = documentoPai != null ? documentoPai.data : null;
       let pedido = (pai != null && 'pedido' in pai) ? pai.pedido : null;
@@ -289,15 +289,21 @@ service cloud.firestore {
       let novo = request.resource.data;
       let evento = eventoDaVersao(orcamentoId, pagamentoId, novo.ultimoEventoId);
       return novo.versao == 1
-        && novo.ultimoEventoId == 'v1'
+        // O id do evento é derivado da versão: "v" + versao. Imposto no servidor, não só no domínio.
+        && novo.ultimoEventoId == 'v' + string(novo.versao)
         && novo.status == 'ativo'
+        // Movimento novo tem autor: nasce com o usuário autenticado, nunca anônimo nem de terceiro.
+        && novo.criadoPor == request.auth.uid
+        && novo.atualizadoPor == request.auth.uid
+        && novo.criadoEm == novo.atualizadoEm
         && evento != null
         && evento.data.evento == 'criacao'
         && evento.data.versaoAnterior == null
         && evento.data.versaoNova == 1
         && evento.data.estadoAnterior == null
         && evento.data.motivo == null
-        && evento.data.registradoEm == novo.atualizadoEm
+        && evento.data.registradoPor == request.auth.uid
+        && evento.data.registradoEm == novo.criadoEm
         && estadoConfere(evento.data.estadoNovo, novo);
     }
 
@@ -348,6 +354,8 @@ service cloud.firestore {
         && depois.versao == antes.versao + 1
         && depois.atualizadoPor == request.auth.uid
         && depois.ultimoEventoId != antes.ultimoEventoId
+        // Mesmo contrato da criação: o id do evento é "v" + versao, imposto no servidor.
+        && depois.ultimoEventoId == 'v' + string(depois.versao)
         && evento != null
         && evento.data.versaoAnterior == antes.versao
         && evento.data.versaoNova == depois.versao
@@ -357,6 +365,33 @@ service cloud.firestore {
         && estadoConfere(evento.data.estadoNovo, depois)
         // Exatamente uma das duas operações, nunca um híbrido das duas.
         && (correcaoDeMovimentoValida(evento) || cancelamentoLogicoDeMovimentoValido(evento));
+    }
+
+    function auditoriaAcompanhaTransicaoDoMovimento(orcamentoId, pagamentoId, eventoId) {
+      // Mão dupla: o movimento já não muda sem evento, e o evento não nasce sem que o movimento tenha
+      // transitado na MESMA operação atômica. Uma escrita solta em .../auditoria/v999 é recusada
+      // porque o estado antes e depois do pagamento seria idêntico.
+      // Custo: só o pagamento correspondente, antes e depois. A trilha nunca é percorrida.
+      let caminho = /databases/$(database)/documents/orcamentos/$(orcamentoId)/pagamentos/$(pagamentoId);
+      let documentoAntes = get(caminho);
+      let documentoDepois = getAfter(caminho);
+      let antes = documentoAntes != null ? documentoAntes.data : null;
+      let depois = documentoDepois != null ? documentoDepois.data : null;
+      let e = request.resource.data;
+      return depois != null
+        && depois.ultimoEventoId == eventoId
+        && depois.versao == e.versaoNova
+        && estadoConfere(e.estadoNovo, depois)
+        && e.registradoPor == request.auth.uid
+        && e.registradoEm == depois.atualizadoEm
+        && (e.evento == 'criacao'
+          // Criação: o movimento não existia antes desta operação e nasce na versão 1.
+          ? (antes == null && e.versaoNova == 1 && e.estadoAnterior == null)
+          // Correção/cancelamento: o movimento existia e avançou exatamente uma versão.
+          : (antes != null
+            && depois.versao == antes.versao + 1
+            && e.versaoAnterior == antes.versao
+            && estadoConfere(e.estadoAnterior, antes)));
     }
 
     function eventoDeAuditoriaValido(e) {
@@ -405,9 +440,8 @@ service cloud.firestore {
 
       match /pagamentos/{pagamentoId} {
         allow read: if isSignedIn();
-        // A criação também é o caminho da restauração de backup, que traz movimentos já cancelados e
-        // com versão maior que 1; por isso não se exige versao == 1 nem criadoPor == auth.uid aqui.
-        // O que nunca é dispensado é o evento de auditoria daquela versão (getAfter).
+        // Na 4B1, create representa exclusivamente movimento novo: versão 1, ativo e com evento v1.
+        // Restauração histórica será aberta somente na 4B2, junto ao backup real.
         allow create: if isSignedIn()
           && movimentoValido(request.resource.data)
           && paiAceitaMovimento(documentId, request.resource.data.tipo)
@@ -420,7 +454,9 @@ service cloud.firestore {
 
         match /auditoria/{eventoId} {
           allow read: if isSignedIn();
-          allow create: if isSignedIn() && eventoDeAuditoriaValido(request.resource.data);
+          allow create: if isSignedIn()
+            && eventoDeAuditoriaValido(request.resource.data)
+            && auditoriaAcompanhaTransicaoDoMovimento(documentId, pagamentoId, eventoId);
           // A trilha é imutável.
           allow update, delete: if false;
         }

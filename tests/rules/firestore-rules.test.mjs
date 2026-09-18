@@ -972,6 +972,107 @@ test('movimento financeiro nunca é excluído', async () => {
     );
 });
 
+test('evento de auditoria não nasce sozinho: exige transição do movimento na mesma operação', async () => {
+    await limpar();
+    await semearPedidoV2('ORC-86');
+    const original = movimento();
+
+    // Evento de criação solto, antes de existir qualquer pagamento.
+    const soltoEm = (pagamentoId, eventoId, dados) =>
+        commitAtomico(USUARIO, [escrita(caminhoAud('ORC-86', pagamentoId, eventoId), dados)]);
+
+    assert.equal(
+        (await soltoEm('pag-1', 'v1', eventoDe(original))).permitido,
+        false,
+        'evento de criação v1 solto, antes do pagamento'
+    );
+
+    // Agora o pagamento existe, gravado junto com o evento v1.
+    assert.equal((await lancar(USUARIO, 'ORC-86', 'pag-1', original)).permitido, true, 'pagamento + evento v1 no mesmo commit');
+
+    const corrigido = { ...original, valorCentavos: 40000, versao: 2, ultimoEventoId: 'v2', atualizadoEm: '2026-09-19T09:00:00.000Z' };
+    assert.equal(
+        (await soltoEm('pag-1', 'v2', eventoDe(corrigido, { evento: 'correcao', anterior: original }))).permitido,
+        false,
+        'evento v2 solto sob pagamento existente, sem o pagamento mudar'
+    );
+    assert.equal(
+        (await soltoEm('pag-1', 'v999', eventoDe(corrigido, { evento: 'correcao', anterior: original }))).permitido,
+        false,
+        'evento arbitrário v999 solto'
+    );
+
+    // Com o pagamento transicionando junto, a correção passa.
+    assert.equal(
+        (await lancar(USUARIO, 'ORC-86', 'pag-1', corrigido, { evento: 'correcao', anterior: original }, { existe: true })).permitido,
+        true,
+        'correção + evento v2 no mesmo commit'
+    );
+
+    const cancelado = { ...corrigido, ...CANCELAMENTO_MOVIMENTO, versao: 3, ultimoEventoId: 'v3', atualizadoEm: CANCELAMENTO_MOVIMENTO.canceladoEm };
+    const eventoCancelamento = { evento: 'cancelamento', anterior: corrigido, motivo: CANCELAMENTO_MOVIMENTO.motivoCancelamento };
+    assert.equal(
+        (await soltoEm('pag-1', 'v3', eventoDe(cancelado, eventoCancelamento))).permitido,
+        false,
+        'evento de cancelamento solto'
+    );
+    assert.equal(
+        (await lancar(USUARIO, 'ORC-86', 'pag-1', cancelado, eventoCancelamento, { existe: true })).permitido,
+        true,
+        'cancelamento + evento vN no mesmo commit'
+    );
+});
+
+test('criação financeira exige autoria do usuário autenticado', async () => {
+    await limpar();
+    await semearPedidoV2('ORC-87');
+
+    const recusados = [
+        ['criadoPor nulo', movimento({ criadoPor: null })],
+        ['atualizadoPor nulo', movimento({ atualizadoPor: null })],
+        ['criadoPor de outro usuário', movimento({ criadoPor: OUTRO_USUARIO })],
+        ['atualizadoPor de outro usuário', movimento({ atualizadoPor: OUTRO_USUARIO })],
+        ['criadoEm diferente de atualizadoEm', movimento({ atualizadoEm: '2026-09-19T08:00:00.000Z' })]
+    ];
+    for (const [indice, [nome, dados]] of recusados.entries()) {
+        assert.equal((await lancar(USUARIO, 'ORC-87', `pag-a${indice}`, dados)).permitido, false, nome);
+    }
+
+    assert.equal(
+        (await lancar(USUARIO, 'ORC-87', 'pag-registrador', movimento(), { registradoPor: OUTRO_USUARIO })).permitido,
+        false,
+        'registradoPor do evento de criação precisa ser o usuário autenticado'
+    );
+    assert.equal((await lancar(USUARIO, 'ORC-87', 'pag-ok', movimento())).permitido, true, 'criação com autoria correta');
+});
+
+test('o id do evento é derivado da versão: "v" + versao, imposto pelo servidor', async () => {
+    await limpar();
+    await semearPedidoV2('ORC-88');
+    const original = movimento();
+
+    assert.equal(
+        (await lancar(USUARIO, 'ORC-88', 'pag-id', movimento({ ultimoEventoId: 'evento-inicial' }))).permitido,
+        false,
+        'criação com id fora do padrão'
+    );
+    assert.equal((await lancar(USUARIO, 'ORC-88', 'pag-1', original)).permitido, true);
+
+    const corrigido = { ...original, valorCentavos: 40000, versao: 2, atualizadoEm: '2026-09-19T09:00:00.000Z' };
+    assert.equal(
+        (await lancar(USUARIO, 'ORC-88', 'pag-1', { ...corrigido, ultimoEventoId: 'v7' },
+            { evento: 'correcao', anterior: original }, { existe: true })).permitido,
+        false,
+        'update com id que não corresponde à versão'
+    );
+    assert.equal(
+        (await lancar(USUARIO, 'ORC-88', 'pag-1', { ...corrigido, ultimoEventoId: 'v2' },
+            { evento: 'correcao', anterior: original }, { existe: true })).permitido,
+        true,
+        'update com id derivado da versão'
+    );
+});
+
 test('a trilha de auditoria é imutável depois de gravada', async () => {
     await limpar();
     await semearPedidoV2('ORC-78');

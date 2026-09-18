@@ -243,10 +243,10 @@ test('offline não enfileira dinheiro: nenhuma das três operações grava', asy
     for (const [rotulo, chamada] of [
         ['registro', () => registrarMovimentoComTransacao(firestore, argumentosRecebimento({ pagamentoId: 'pag-2', online: false }))],
         ['correção', () => corrigirMovimentoComTransacao(firestore, {
-            orcamentoId: 'ORC-90', pagamentoId: 'pag-1', versaoEsperada: 1, valorCentavos: 1, corrigidoEm: AGORA, hoje: HOJE, online: false
+            orcamentoId: 'ORC-90', pagamentoId: 'pag-1', versaoEsperada: 1, valorCentavos: 1, corrigidoEm: AGORA, corrigidoPor: 'usuario-teste', hoje: HOJE, online: false
         })],
         ['cancelamento', () => cancelarMovimentoComTransacao(firestore, {
-            orcamentoId: 'ORC-90', pagamentoId: 'pag-1', versaoEsperada: 1, motivo: 'Teste', canceladoEm: AGORA, online: false
+            orcamentoId: 'ORC-90', pagamentoId: 'pag-1', versaoEsperada: 1, motivo: 'Teste', canceladoEm: AGORA, canceladoPor: 'usuario-teste', online: false
         })]
     ]) {
         const erro = await capturarErro(chamada());
@@ -265,6 +265,34 @@ test('queda de conexão durante a transação vira erro de conexão, sem gravar'
     const erro = await capturarErro(registrarMovimentoComTransacao(firestore, argumentosRecebimento()));
     assert.equal(erro.codigo, 'sem-conexao');
     assert.equal(ler(caminhoPagamento()), undefined);
+});
+
+// --- Ator obrigatório ---------------------------------------------------------------------------
+
+test('operação sem ator falha antes de abrir transação', async () => {
+    const { firestore, estado, ler } = ambiente();
+    await registrarMovimentoComTransacao(firestore, argumentosRecebimento());
+    const transacoesApos = estado.transacoes;
+
+    const semAtor = [
+        ['registro sem registradoPor', () => registrarMovimentoComTransacao(firestore, argumentosRecebimento({ pagamentoId: 'pag-2', registradoPor: null }))],
+        ['registro com ator vazio', () => registrarMovimentoComTransacao(firestore, argumentosRecebimento({ pagamentoId: 'pag-3', registradoPor: '   ' }))],
+        ['correção sem corrigidoPor', () => corrigirMovimentoComTransacao(firestore, {
+            orcamentoId: 'ORC-90', pagamentoId: 'pag-1', versaoEsperada: 1, valorCentavos: 1, corrigidoEm: AGORA, hoje: HOJE
+        })],
+        ['cancelamento sem canceladoPor', () => cancelarMovimentoComTransacao(firestore, {
+            orcamentoId: 'ORC-90', pagamentoId: 'pag-1', versaoEsperada: 1, motivo: 'Teste', canceladoEm: AGORA
+        })]
+    ];
+
+    for (const [rotulo, chamada] of semAtor) {
+        const erro = await capturarErro(chamada());
+        assert.equal(erro.codigo, 'sem-ator', rotulo);
+    }
+
+    assert.equal(estado.transacoes, transacoesApos, 'nenhuma transação foi aberta sem ator');
+    assert.equal(ler(caminhoPagamento('pag-2')), undefined);
+    assert.equal(ler(caminhoPagamento()).versao, 1, 'o lançamento existente ficou intacto');
 });
 
 // --- Concorrência -------------------------------------------------------------------------------
@@ -301,7 +329,7 @@ test('cliente desatualizado não apaga a correção feita em outro dispositivo',
     });
 
     const erro = await capturarErro(corrigirMovimentoComTransacao(firestore, {
-        orcamentoId: 'ORC-90', pagamentoId: 'pag-1', versaoEsperada: 1, valorCentavos: 10, corrigidoEm: AGORA, hoje: HOJE
+        orcamentoId: 'ORC-90', pagamentoId: 'pag-1', versaoEsperada: 1, valorCentavos: 10, corrigidoEm: AGORA, corrigidoPor: 'usuario-teste', hoje: HOJE
     }));
 
     assert.equal(erro.codigo, 'conflito');
@@ -316,12 +344,12 @@ test('correção concorrente na mesma versão: só uma conclui', async () => {
     // A segunda correção entra depois da leitura da primeira e antes do commit dela.
     estado.antesDoCommit = async () => {
         await corrigirMovimentoComTransacao(firestore, {
-            orcamentoId: 'ORC-90', pagamentoId: 'pag-1', versaoEsperada: 1, valorCentavos: 11111, corrigidoEm: AGORA, hoje: HOJE
+            orcamentoId: 'ORC-90', pagamentoId: 'pag-1', versaoEsperada: 1, valorCentavos: 11111, corrigidoEm: AGORA, corrigidoPor: 'usuario-teste', hoje: HOJE
         });
     };
 
     const erro = await capturarErro(corrigirMovimentoComTransacao(firestore, {
-        orcamentoId: 'ORC-90', pagamentoId: 'pag-1', versaoEsperada: 1, valorCentavos: 22222, corrigidoEm: AGORA, hoje: HOJE
+        orcamentoId: 'ORC-90', pagamentoId: 'pag-1', versaoEsperada: 1, valorCentavos: 22222, corrigidoEm: AGORA, corrigidoPor: 'usuario-teste', hoje: HOJE
     }));
 
     // A transação repete, relê a versão 2 e a versão esperada deixa de bater.
@@ -336,12 +364,12 @@ test('cancelar enquanto outro corrige: só uma operação vence aquela versão',
 
     estado.antesDoCommit = async () => {
         await cancelarMovimentoComTransacao(firestore, {
-            orcamentoId: 'ORC-90', pagamentoId: 'pag-1', versaoEsperada: 1, motivo: 'Lançado em duplicidade', canceladoEm: AGORA
+            orcamentoId: 'ORC-90', pagamentoId: 'pag-1', versaoEsperada: 1, motivo: 'Lançado em duplicidade', canceladoEm: AGORA, canceladoPor: 'usuario-teste'
         });
     };
 
     const erro = await capturarErro(corrigirMovimentoComTransacao(firestore, {
-        orcamentoId: 'ORC-90', pagamentoId: 'pag-1', versaoEsperada: 1, valorCentavos: 33333, corrigidoEm: AGORA, hoje: HOJE
+        orcamentoId: 'ORC-90', pagamentoId: 'pag-1', versaoEsperada: 1, valorCentavos: 33333, corrigidoEm: AGORA, corrigidoPor: 'usuario-teste', hoje: HOJE
     }));
 
     assert.equal(erro.codigo, 'conflito');
@@ -415,7 +443,7 @@ test('cancelar lançamento é terminal, deixa auditoria e sai das somas', async 
     assert.equal(evento.estadoAnterior.status, STATUS_MOVIMENTO.ATIVO);
 
     const erro = await capturarErro(corrigirMovimentoComTransacao(firestore, {
-        orcamentoId: 'ORC-90', pagamentoId: 'pag-1', versaoEsperada: 2, valorCentavos: 100, corrigidoEm: AGORA, hoje: HOJE
+        orcamentoId: 'ORC-90', pagamentoId: 'pag-1', versaoEsperada: 2, valorCentavos: 100, corrigidoEm: AGORA, corrigidoPor: 'usuario-teste', hoje: HOJE
     }));
     assert.equal(erro.codigo, 'movimento-cancelado');
 });
@@ -423,7 +451,7 @@ test('cancelar lançamento é terminal, deixa auditoria e sai das somas', async 
 test('cancelar lançamento inexistente é recusado', async () => {
     const { firestore } = ambiente();
     const erro = await capturarErro(cancelarMovimentoComTransacao(firestore, {
-        orcamentoId: 'ORC-90', pagamentoId: 'pag-fantasma', versaoEsperada: 1, motivo: 'Teste', canceladoEm: AGORA
+        orcamentoId: 'ORC-90', pagamentoId: 'pag-fantasma', versaoEsperada: 1, motivo: 'Teste', canceladoEm: AGORA, canceladoPor: 'usuario-teste'
     }));
     assert.equal(erro.codigo, 'nao-encontrado');
 });
@@ -498,7 +526,7 @@ test('correção é recusada quando o snapshot do pai deixou de ser válido', as
     ambienteCorrompido.escrever(caminhoPagamento(), { ...argumentosRecebimento(), versao: 1, status: 'ativo', tipo: 'recebimento' });
 
     const erro = await capturarErro(corrigirMovimentoComTransacao(ambienteCorrompido.firestore, {
-        orcamentoId: 'ORC-90', pagamentoId: 'pag-1', versaoEsperada: 1, valorCentavos: 1, corrigidoEm: AGORA, hoje: HOJE
+        orcamentoId: 'ORC-90', pagamentoId: 'pag-1', versaoEsperada: 1, valorCentavos: 1, corrigidoEm: AGORA, corrigidoPor: 'usuario-teste', hoje: HOJE
     }));
     assert.equal(erro.codigo, 'pedido-nao-elegivel');
 });
@@ -512,13 +540,13 @@ test('cada operação aponta ultimoEventoId para o evento daquela versão', asyn
     assert.equal(ler(caminhoAuditoria(1)).versaoNova, 1);
 
     await corrigirMovimentoComTransacao(firestore, {
-        orcamentoId: 'ORC-90', pagamentoId: 'pag-1', versaoEsperada: 1, valorCentavos: 40000, corrigidoEm: AGORA, hoje: HOJE
+        orcamentoId: 'ORC-90', pagamentoId: 'pag-1', versaoEsperada: 1, valorCentavos: 40000, corrigidoEm: AGORA, corrigidoPor: 'usuario-teste', hoje: HOJE
     });
     assert.equal(ler(caminhoPagamento()).ultimoEventoId, 'v2');
     assert.equal(ler(caminhoAuditoria(2)).versaoAnterior, 1);
 
     await cancelarMovimentoComTransacao(firestore, {
-        orcamentoId: 'ORC-90', pagamentoId: 'pag-1', versaoEsperada: 2, motivo: 'Duplicado', canceladoEm: AGORA
+        orcamentoId: 'ORC-90', pagamentoId: 'pag-1', versaoEsperada: 2, motivo: 'Duplicado', canceladoEm: AGORA, canceladoPor: 'usuario-teste'
     });
     const final = ler(caminhoPagamento());
     assert.equal(final.ultimoEventoId, 'v3');

@@ -60,6 +60,17 @@ function traduzirErro(erro, operacao) {
     return new ErroOperacaoMovimento('desconhecido', `Não foi possível concluir: ${operacao}.`, erro);
 }
 
+function exigirAtor(uid, operacao) {
+    // Toda escrita financeira normal tem autor, e as regras exigem que ele seja o usuário autenticado.
+    // Falhar aqui evita que a interface descubra isso só como um permission-denied opaco do servidor.
+    if (typeof uid !== 'string' || uid.trim() === '') {
+        throw new ErroOperacaoMovimento(
+            'sem-ator',
+            `Sessão sem usuário identificado: ${operacao} exige um usuário autenticado. Nada foi alterado.`
+        );
+    }
+}
+
 function exigirConexao(online, operacao) {
     if (online === false) {
         throw new ErroOperacaoMovimento(
@@ -145,6 +156,7 @@ export async function registrarMovimentoComTransacao(firestore, {
     if (!orcamentoId) throw new TypeError('O ID do pedido é obrigatório para registrar o movimento.');
     if (!pagamentoId) throw new TypeError('O ID do movimento é obrigatório para registrar o movimento.');
     const operacao = tipo === TIPOS_MOVIMENTO.REEMBOLSO ? 'registrar reembolso' : 'registrar recebimento';
+    exigirAtor(registradoPor, operacao);
 
     // O movimento é montado e validado antes de qualquer acesso ao servidor.
     let movimento;
@@ -195,6 +207,7 @@ export async function corrigirMovimentoComTransacao(firestore, {
 } = {}) {
     if (!orcamentoId || !pagamentoId) throw new TypeError('Pedido e movimento são obrigatórios para a correção.');
     const operacao = 'corrigir lançamento';
+    exigirAtor(corrigidoPor, operacao);
     exigirConexao(online, operacao);
 
     const referencia = referenciaPagamento(firestore, orcamentoId, pagamentoId);
@@ -232,6 +245,7 @@ export async function cancelarMovimentoComTransacao(firestore, {
 } = {}) {
     if (!orcamentoId || !pagamentoId) throw new TypeError('Pedido e movimento são obrigatórios para o cancelamento.');
     const operacao = 'cancelar lançamento';
+    exigirAtor(canceladoPor, operacao);
     exigirConexao(online, operacao);
 
     const referencia = referenciaPagamento(firestore, orcamentoId, pagamentoId);
