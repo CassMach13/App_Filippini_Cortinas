@@ -304,13 +304,22 @@ export function calcularSituacaoFinanceira(orcamento, movimentos = []) {
 // pagamentoId, estado atual, versao, status, movimentos cancelados, reembolsos, todos os eventos de
 // auditoria e os IDs desses eventos; e a restauração nunca pode sobrescrever pagamento existente.
 // A função abaixo é só a regra de decisão por documento: sozinha, ela NÃO é o backup completo.
+//
+// Atenção ao par de perguntas distintas: pedidoAceitaMovimento() responde "posso criar um movimento
+// NOVO agora?" (e recusa recebimento em pedido cancelado); esta função responde "posso RESTAURAR este
+// movimento histórico?". Liberar a restauração aqui não abre nada nas Firestore Rules: o create
+// server-side continua exclusivamente versão 1, movimento novo e evento v1, até a 4B2.
 export function avaliarRestauracaoMovimento(existente, candidato, orcamentoPai) {
     // Backup nunca sobrescreve movimento existente nem cria movimento órfão: restaurar uma versão
     // antiga por cima da atual desfaria silenciosamente uma correção já feita.
     if (existente) return { gravar: false, motivo: 'movimento-ja-existe' };
     if (!orcamentoPai) return { gravar: false, motivo: 'pedido-inexistente' };
     if (orcamentoPai.pedido?.versaoSnapshot === 1) return { gravar: false, motivo: 'pedido-v1' };
-    if (!pedidoAceitaMovimento(orcamentoPai, candidato?.tipo)) return { gravar: false, motivo: 'pedido-nao-elegivel' };
+    // Restaurar história NÃO é a mesma pergunta que "posso lançar agora?": por isso aqui vale o
+    // snapshot financeiro do pai, e não pedidoAceitaMovimento. Um pedido que recebeu dinheiro e só
+    // depois foi cancelado precisa poder ter esse recebimento restaurado — o cancelamento posterior
+    // não transforma em inexistente o dinheiro que entrou antes dele.
+    if (!pedidoTemSnapshotV2Valido(orcamentoPai)) return { gravar: false, motivo: 'pedido-sem-snapshot-v2-valido' };
     // A restauração aceita movimentos cancelados e versões maiores que 1: é história, não lançamento novo.
     const validacao = validarMovimento(candidato, { hoje: candidato?.dataMovimento });
     if (!validacao.valido) return { gravar: false, motivo: `movimento-invalido:${validacao.erros.join(',')}` };

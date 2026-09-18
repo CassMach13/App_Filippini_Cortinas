@@ -298,11 +298,15 @@ test('a situação não muta os movimentos nem o pedido recebidos', () => {
 
 // --- Restauração de backup ----------------------------------------------------------------------
 
-test('backup não restaura movimento para pedido inexistente, v1 ou não elegível', () => {
+test('backup não restaura movimento sem um pedido v2 íntegro por trás', () => {
     const movimento = criar();
+    const snapshotInvalido = criarPedidoV2();
+    snapshotInvalido.pedido.financeiro.valorComissaoCentavos += 1;
+
     assert.equal(avaliarRestauracaoMovimento(null, movimento, null).motivo, 'pedido-inexistente');
     assert.equal(avaliarRestauracaoMovimento(null, movimento, criarPedidoV1()).motivo, 'pedido-v1');
-    assert.equal(avaliarRestauracaoMovimento(null, movimento, criarOrcamento()).motivo, 'pedido-nao-elegivel');
+    assert.equal(avaliarRestauracaoMovimento(null, movimento, criarOrcamento()).motivo, 'pedido-sem-snapshot-v2-valido');
+    assert.equal(avaliarRestauracaoMovimento(null, movimento, snapshotInvalido).motivo, 'pedido-sem-snapshot-v2-valido');
 });
 
 test('backup nunca sobrescreve movimento existente', () => {
@@ -313,18 +317,39 @@ test('backup nunca sobrescreve movimento existente', () => {
     assert.equal(avaliacao.motivo, 'movimento-ja-existe');
 });
 
-test('backup restaura movimento cancelado e versão maior que 1, preservando a história', () => {
-    const cancelado = cancelarMovimento(criar(), { motivo: 'Duplicado', canceladoEm: '2026-09-19T10:00:00.000Z' });
-    assert.equal(cancelado.versao, 2);
-    const avaliacao = avaliarRestauracaoMovimento(null, cancelado, criarPedidoV2());
-    assert.equal(avaliacao.gravar, true, JSON.stringify(avaliacao));
+test('backup restaura toda a história financeira de pedido posteriormente cancelado', () => {
+    // O pedido recebeu dinheiro e só depois foi cancelado. O cancelamento não torna inexistente o que
+    // entrou antes dele, então a história inteira precisa voltar num restore.
+    const pedidoCancelado = cancelarPedido(criarPedidoV2(), CANCELAMENTO_PEDIDO);
+
+    const recebimentoAtivo = criar();
+    const recebimentoCancelado = cancelarMovimento(criar(), { motivo: 'Lançado em duplicidade' });
+    const reembolso = criar({ tipo: TIPOS_MOVIMENTO.REEMBOLSO });
+
+    assert.equal(avaliarRestauracaoMovimento(null, recebimentoAtivo, pedidoCancelado).gravar, true, 'recebimento ativo histórico');
+    assert.equal(avaliarRestauracaoMovimento(null, recebimentoCancelado, pedidoCancelado).gravar, true, 'recebimento cancelado logicamente');
+    assert.equal(avaliarRestauracaoMovimento(null, reembolso, pedidoCancelado).gravar, true, 'reembolso histórico');
 });
 
-test('backup restaura reembolso de pedido já cancelado, mas recusa recebimento novo nele', () => {
+test('restaurar história e lançar movimento novo são perguntas diferentes', () => {
+    // Operacional: pedidoAceitaMovimento responde "posso lançar agora?".
     const pedidoCancelado = cancelarPedido(criarPedidoV2(), CANCELAMENTO_PEDIDO);
-    const reembolso = criar({ tipo: TIPOS_MOVIMENTO.REEMBOLSO });
-    assert.equal(avaliarRestauracaoMovimento(null, reembolso, pedidoCancelado).gravar, true);
-    assert.equal(avaliarRestauracaoMovimento(null, criar(), pedidoCancelado).motivo, 'pedido-nao-elegivel');
+    assert.equal(pedidoAceitaMovimento(pedidoCancelado, TIPOS_MOVIMENTO.RECEBIMENTO), false, 'recebimento novo é recusado');
+    assert.equal(pedidoAceitaMovimento(pedidoCancelado, TIPOS_MOVIMENTO.REEMBOLSO), true, 'reembolso novo é permitido');
+
+    // Restauração: a mesma situação aceita de volta o recebimento histórico.
+    assert.equal(avaliarRestauracaoMovimento(null, criar(), pedidoCancelado).gravar, true, 'recebimento histórico é restaurável');
+});
+
+test('backup restaura recebimento, reembolso, cancelado e versão > 1 sob pedido ativo', () => {
+    const pedidoAtivo = criarPedidoV2();
+    const cancelado = cancelarMovimento(criar(), { motivo: 'Erro de digitação' });
+
+    assert.equal(avaliarRestauracaoMovimento(null, criar(), pedidoAtivo).gravar, true, 'recebimento');
+    assert.equal(avaliarRestauracaoMovimento(null, criar({ tipo: TIPOS_MOVIMENTO.REEMBOLSO }), pedidoAtivo).gravar, true, 'reembolso');
+    assert.equal(avaliarRestauracaoMovimento(null, cancelado, pedidoAtivo).gravar, true, 'movimento logicamente cancelado');
+    assert.equal(cancelado.versao, 2);
+    assert.equal(avaliarRestauracaoMovimento(null, cancelado, pedidoAtivo).gravar, true, 'versão > 1 é permitida no domínio');
 });
 
 test('BLOQUEADOR DE DEPLOY: o backup ainda não cobre pagamentos, então nenhum write financeiro pode ir a produção', () => {
