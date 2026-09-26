@@ -97,8 +97,21 @@ const controle = {
     colecoesPendentes: new Set(),
     offline: false,
     falhaProximaTransacao: null,
-    regraDeEscrita: null
+    regraDeEscrita: null,
+    // Trecho de caminho cuja LEITURA (getDocs) deve falhar, para simular uma subcoleção inacessível.
+    falhaDeLeitura: null
 };
+
+// Contagem de assinaturas por coleção e último callback registrado: existem só para o teste provar que
+// não há churn de listener e que um callback atrasado não escreve na interface.
+const assinaturas = new Map();
+const ultimoCallbackPorColecao = new Map();
+
+function contarAssinatura(name, campo) {
+    const atual = assinaturas.get(name) || { subscribes: 0, unsubscribes: 0 };
+    atual[campo] += 1;
+    assinaturas.set(name, atual);
+}
 
 function erroFirestore(code, message) {
     return Object.assign(new Error(message), { code, name: 'FirebaseError' });
@@ -196,6 +209,23 @@ globalThis.__firestoreMock = {
     lerDiretamente(colecao, id) {
         const dados = collectionStore(colecao).get(id);
         return dados === undefined ? null : clone(dados);
+    },
+    falharLeituraDe(trechoDoCaminho) {
+        // Toda getDocs cujo caminho contenha este trecho passa a rejeitar. Serve para provar que uma
+        // subcoleção ilegível derruba a operação inteira em vez de virar "zero documentos".
+        controle.falhaDeLeitura = trechoDoCaminho || null;
+    },
+    estatisticasDeAssinatura(colecao) {
+        return { ...(assinaturas.get(colecao) || { subscribes: 0, unsubscribes: 0 }) };
+    },
+    dispararCallbackTardioDe(colecao) {
+        // Invoca o último callback registrado nesta coleção IGNORANDO o unsubscribe, simulando um
+        // callback que já estava enfileirado quando a assinatura foi encerrada. O SDK real não promete
+        // que isso nunca aconteça, então a aplicação precisa se proteger sozinha.
+        const callback = ultimoCallbackPorColecao.get(colecao);
+        if (!callback) return false;
+        callback(querySnapshot(colecao));
+        return true;
     }
 };
 
@@ -211,15 +241,27 @@ export function persistentMultipleTabManager() {
     return {};
 }
 
-export function collection(_db, name) {
-    return { kind: 'collection', collection: name };
+// Caminhos com vários segmentos (subcoleções, ex.: 'orcamentos', id, 'pagamentos', pagamentoId) viram
+// uma única chave de coleção plana, unida por '/'. Continua compatível com o uso de nível único já
+// existente: collection(db, 'orcamentos') e doc(db, 'orcamentos', id) não mudam de comportamento.
+function caminhoDe(segmentos) {
+    return segmentos.join('/');
 }
 
-export function doc(_db, collectionName, id) {
+export function collection(_db, ...segmentos) {
+    return { kind: 'collection', collection: caminhoDe(segmentos) };
+}
+
+export function doc(_db, ...segmentos) {
+    const id = segmentos.at(-1);
+    const collectionName = caminhoDe(segmentos.slice(0, -1));
     return { kind: 'document', collection: collectionName, id };
 }
 
 export async function getDocs(reference) {
+    if (controle.falhaDeLeitura && reference.collection.includes(controle.falhaDeLeitura)) {
+        throw erroFirestore('unavailable', `Leitura simulada indisponível em ${reference.collection}.`);
+    }
     return querySnapshot(reference.collection);
 }
 
@@ -227,8 +269,13 @@ export function onSnapshot(reference, onNext) {
     const name = reference.collection;
     if (!listeners.has(name)) listeners.set(name, new Set());
     listeners.get(name).add(onNext);
+    contarAssinatura(name, 'subscribes');
+    ultimoCallbackPorColecao.set(name, onNext);
     onNext(querySnapshot(name));
-    return () => listeners.get(name)?.delete(onNext);
+    return () => {
+        contarAssinatura(name, 'unsubscribes');
+        listeners.get(name)?.delete(onNext);
+    };
 }
 
 export async function setDoc(reference, data, options) {

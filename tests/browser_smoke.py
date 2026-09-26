@@ -1,3 +1,4 @@
+import json
 import re
 import sys
 import unicodedata
@@ -8,7 +9,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 FIREBASE_MOCKS = PROJECT_ROOT / "tests" / "mocks"
 sys.path.insert(0, str(PROJECT_ROOT / ".testdeps"))
 
-from playwright.sync_api import sync_playwright
+from playwright.sync_api import TimeoutError as PlaywrightTimeoutError, sync_playwright
 
 CAMPOS_NOVOS_INFO_GERAIS = [
     "celularCliente",
@@ -237,8 +238,8 @@ def main():
         page.locator("#app-container").wait_for(state="visible")
         page.locator("#sync-status").wait_for(state="visible")
 
-        assert page.locator('.modal[role="dialog"][aria-modal="true"][aria-labelledby]').count() == 12
-        assert page.locator('button.close-button[aria-label]').count() == 12
+        assert page.locator('.modal[role="dialog"][aria-modal="true"][aria-labelledby]').count() == 14
+        assert page.locator('button.close-button[aria-label]').count() == 14
         unlabeled_controls = page.evaluate("""() => [...document.querySelectorAll('input:not([type="hidden"]), select, textarea')]
             .filter(element => {
                 const labels = element.labels ? [...element.labels] : [];
@@ -1286,6 +1287,17 @@ def main():
             }});
             mock.escreverDiretamente('orcamentos', 'ORC-153', v2Recente);
 
+            // Terceiro pedido v2 participante, confirmado hoje (fora do período do relatório de vendas
+            // usado acima, mas dentro de Contas a Receber, que não tem filtro de período). Existe para
+            // que a falha de leitura seja testada com três participantes, falhando no do meio.
+            // Instalação de R$ 300,00 de propósito: instalação NUNCA entra no recebível, então este
+            // pedido deve aparecer com R$ 220,00 a receber (só produtos, comissão inclusa).
+            const baseComInstalacao = {{ ...baseOrcamento('ORC-155', 'Cliente Financeiro C'), valoresInstalacao: {{ Sala: 300 }} }};
+            const v2SemMovimento = confirmarOrcamentoComoPedido(baseComInstalacao, {{
+                confirmadoEm: '{hoje}T15:00:00.000Z', confirmadoPor: 'usuario-teste'
+            }});
+            mock.escreverDiretamente('orcamentos', 'ORC-155', v2SemMovimento);
+
             // Orçamento comum, sem pedido: precisa ficar de fora.
             mock.escreverDiretamente('orcamentos', 'ORC-154', baseOrcamento('ORC-154', 'Cliente Sem Pedido'));
         }}""")
@@ -1382,6 +1394,477 @@ def main():
         page.set_viewport_size({"width": 1440, "height": 1000})
         tabs.nth(1).click()
 
+        # --- Etapa 4B2A: pagamentos do pedido e Contas a Receber -------------------------------------
+        # Termos específicos do financeiro de pagamentos, não os genéricos já usados por outras telas
+        # (ex.: "Situação:" já existe na Proposta para o status comercial do pedido, sem ser um leak).
+        VALORES_PAGAMENTO = [
+            "100,00", "120,00", "80,00", "30,00", "outro-dispositivo", "lançado em duplicidade",
+            "registrar recebimento", "registrar reembolso", "contas a receber", "cancelar lançamento",
+            "total recebido", "total reembolsado", "valor a receber",
+        ]
+
+        # A. Pedido v1 não mostra o bloco financeiro; pedido cancelado mostra, mas só aceita reembolso.
+        seletor.select_option("ORC-150")
+        assert page.locator("#financeiroPedidoCardContainer").is_hidden()
+        seletor.select_option("ORC-152")
+        assert page.locator("#financeiroPedidoCardContainer").is_visible()
+        assert page.locator("#btn-registrar-recebimento").is_disabled()
+        assert page.locator("#btn-registrar-reembolso").is_enabled()
+        assert "não aceita novo recebimento" in texto_visivel(page.locator("#financeiroPedidoConteudo"))
+
+        # B. Pedido v2 ativo: valor a receber vem do snapshot, nada recebido ainda.
+        seletor.select_option("ORC-151")
+        assert page.locator("#financeiroPedidoCardContainer").is_visible()
+        assert normalizar(page.locator('[data-financeiro-pedido="valorReceber"]').inner_text()) == "R$ 220,00"
+        assert normalizar(page.locator('[data-financeiro-pedido="totalRecebido"]').inner_text()) == "R$ 0,00"
+        assert "Em aberto" in texto_visivel(page.locator('[data-financeiro-pedido="situacao"]'))
+        assert page.locator("#financeiroPedidoConteudo").get_by_text("Nenhum lançamento registrado ainda.").is_visible()
+
+        def registrar_movimento(valor, forma="PIX", observacao=""):
+            page.locator("#movimentoValor").fill(valor)
+            if forma:
+                page.locator("#movimentoForma").select_option(forma)
+            if observacao:
+                page.locator("#movimentoObservacao").fill(observacao)
+            page.locator("#btn-confirmar-movimento-financeiro").click()
+            page.wait_for_function("document.getElementById('modalMovimentoFinanceiro').classList.contains('active') === false")
+
+        # C. Recebimento parcial: R$100,00 de R$220,00 devidos.
+        page.locator("#btn-registrar-recebimento").click()
+        page.locator("#modalMovimentoFinanceiro").wait_for(state="visible")
+        assert page.locator("#tituloMovimentoFinanceiro").inner_text() == "Registrar recebimento"
+        assert page.locator("#movimentoData").input_value() == hoje
+        assert page.locator("#movimentoData").get_attribute("max") == hoje
+        registrar_movimento("100.00", observacao="Sinal")
+        page.wait_for_function("document.querySelector('[data-financeiro-pedido=\"totalRecebido\"]').textContent.includes('100,00')")
+        assert "Parcialmente pago" in texto_visivel(page.locator('[data-financeiro-pedido="situacao"]'))
+        assert page.locator("#financeiroPedidoConteudo tbody tr").count() == 1
+
+        # D. Quitação exata: mais R$120,00 fecha o saldo em zero.
+        page.locator("#btn-registrar-recebimento").click()
+        page.locator("#modalMovimentoFinanceiro").wait_for(state="visible")
+        registrar_movimento("120.00")
+        page.wait_for_function("document.querySelector('[data-financeiro-pedido=\"situacao\"]').textContent.includes('Quitado')")
+        assert normalizar(page.locator('[data-financeiro-pedido="saldo"]').inner_text()) == "R$ 0,00"
+
+        # E. Excedente: R$50,00 além do valor do pedido pede confirmação explícita, sem bloquear.
+        aceitar_dialogo(page, dialogos)
+        page.locator("#btn-registrar-recebimento").click()
+        page.locator("#modalMovimentoFinanceiro").wait_for(state="visible")
+        registrar_movimento("50.00")
+        page.wait_for_function("document.querySelector('[data-financeiro-pedido=\"situacao\"]').textContent.includes('Excedente')")
+        assert "50,00" in dialogos[-1] and "além do valor do pedido" in dialogos[-1]
+        assert "50,00" in normalizar(page.locator('[data-financeiro-pedido="saldo"]').inner_text())
+
+        # F. Editar o lançamento do excedente (ainda gera excedente, então confirma de novo).
+        # A tabela ordena por dataMovimento desc e depois criadoEm desc: o lançamento mais recente
+        # (o excedente de R$50,00, registrado por último) é a primeira linha.
+        linhas_movimento = page.locator("#financeiroPedidoConteudo tbody tr")
+        assert linhas_movimento.count() == 3
+        linhas_movimento.first.locator(".btn-editar-movimento").click()
+        page.locator("#modalMovimentoFinanceiro").wait_for(state="visible")
+        assert page.locator("#tituloMovimentoFinanceiro").inner_text() == "Editar recebimento"
+        assert page.locator("#movimentoValor").input_value() == "50.00"
+        aceitar_dialogo(page, dialogos)
+        registrar_movimento("30.00")
+        page.wait_for_function("document.querySelector('[data-financeiro-pedido=\"totalRecebido\"]').textContent.includes('250,00')")
+        assert "Excedente" in texto_visivel(page.locator('[data-financeiro-pedido="situacao"]'))
+
+        # G. Reembolso: dinheiro devolvido ao cliente, sem confirmação de excedente (não é recebimento).
+        page.locator("#btn-registrar-reembolso").click()
+        page.locator("#modalMovimentoFinanceiro").wait_for(state="visible")
+        assert page.locator("#tituloMovimentoFinanceiro").inner_text() == "Registrar reembolso"
+        assert "devolvido ao cliente" in texto_visivel(page.locator("#avisoTipoMovimentoFinanceiro"))
+        registrar_movimento("30.00")
+        page.wait_for_function("document.querySelector('[data-financeiro-pedido=\"situacao\"]').textContent.includes('Quitado')")
+        assert normalizar(page.locator('[data-financeiro-pedido="totalReembolsado"]').inner_text()) == "R$ 30,00"
+
+        # H. Cancelar lançamento: exige motivo, sai dos totais, mas continua no histórico como leitura.
+        # O recebimento de R$100,00 foi o primeiro criado, então é o mais antigo: última linha da tabela.
+        linhas_movimento = page.locator("#financeiroPedidoConteudo tbody tr")
+        linha_r100 = linhas_movimento.last
+        assert "R$ 100,00" in normalizar(linha_r100.inner_text())
+        linha_r100.locator(".btn-cancelar-movimento").click()
+        page.locator("#modalCancelarMovimento").wait_for(state="visible")
+        page.locator("#btn-confirmar-cancelamento-movimento").click()
+        page.wait_for_function("document.getElementById('ajudaMotivoCancelamentoMovimento').textContent.includes('Informe o motivo')")
+        page.locator("#motivoCancelamentoMovimento").fill("Lançado em duplicidade")
+        page.locator("#btn-confirmar-cancelamento-movimento").click()
+        page.wait_for_function("document.getElementById('modalCancelarMovimento').classList.contains('active') === false")
+        page.wait_for_function("document.querySelector('[data-financeiro-pedido=\"totalRecebido\"]').textContent.includes('150,00')")
+        assert normalizar(page.locator('[data-financeiro-pedido="saldo"]').inner_text()) == "R$ 100,00"
+        assert "Parcialmente pago" in texto_visivel(page.locator('[data-financeiro-pedido="situacao"]'))
+        linha_cancelada = page.locator("#financeiroPedidoConteudo tbody tr").filter(has_text="Cancelado")
+        assert linha_cancelada.count() == 1
+        assert "Lançado em duplicidade" in normalizar(linha_cancelada.inner_text())
+        assert linha_cancelada.locator(".btn-editar-movimento").count() == 0
+        assert linha_cancelada.locator(".btn-cancelar-movimento").count() == 0
+
+        # I. Conflito: outro dispositivo corrige o mesmo lançamento enquanto o modal de edição está aberto.
+        seletor.select_option("ORC-153")
+        page.locator("#btn-registrar-recebimento").click()
+        page.locator("#modalMovimentoFinanceiro").wait_for(state="visible")
+        registrar_movimento("50.00")
+        page.wait_for_function("document.querySelector('[data-financeiro-pedido=\"totalRecebido\"]').textContent.includes('50,00')")
+
+        botao_editar_conflito = page.locator(".btn-editar-movimento").first
+        pagamento_id_conflito = botao_editar_conflito.get_attribute("data-pagamento-id")
+        botao_editar_conflito.click()
+        page.locator("#modalMovimentoFinanceiro").wait_for(state="visible")
+
+        page.evaluate(f"""async (pagamentoId) => {{
+            const {{ corrigirMovimento, criarEventoAuditoria }} = await import('/payments-domain.js');
+            const mock = {firestore_mock};
+            const colecao = 'orcamentos/ORC-153/pagamentos';
+            const atual = mock.lerDiretamente(colecao, pagamentoId);
+            const corrigido = corrigirMovimento(atual, {{
+                valorCentavos: 8000, atualizadoEm: new Date().toISOString(), atualizadoPor: 'outro-dispositivo'
+            }}, {{ hoje: '{hoje}' }});
+            // Um dispositivo real grava movimento + evento juntos (as regras exigem isso); a simulação
+            // aqui faz o mesmo, para não deixar uma cadeia de auditoria incompleta como resíduo do teste.
+            const evento = criarEventoAuditoria('correcao', atual, corrigido, {{
+                registradoEm: corrigido.atualizadoEm, registradoPor: 'outro-dispositivo'
+            }});
+            mock.escreverDiretamente(colecao, pagamentoId, corrigido);
+            mock.escreverDiretamente(`${{colecao}}/${{pagamentoId}}/auditoria`, corrigido.ultimoEventoId, evento);
+        }}""", pagamento_id_conflito)
+        page.wait_for_function("document.querySelector('[data-financeiro-pedido=\"totalRecebido\"]').textContent.includes('80,00')")
+
+        # Valor escolhido para não gerar excedente (e portanto não abrir um diálogo de confirmação
+        # aqui): o que importa neste passo é só o conflito de versão. A falha esperada também loga
+        # um console.error (mesmo padrão já usado nos testes de conflito de pedido, acima).
+        erros_console_antes_do_conflito = len(console_errors)
+        page.locator("#movimentoValor").fill("90.00")
+        page.locator("#btn-confirmar-movimento-financeiro").click()
+        page.wait_for_function("document.getElementById('ajudaMovimentoFinanceiro').textContent.includes('outro dispositivo')")
+        assert page.locator("#modalMovimentoFinanceiro").evaluate("m => m.classList.contains('active')")
+        erros_conflito = console_errors[erros_console_antes_do_conflito:]
+        assert len(erros_conflito) == 1 and "Falha na operação financeira" in erros_conflito[0], erros_conflito
+        assert "alterado em outro dispositivo" in erros_conflito[0]
+        del console_errors[erros_console_antes_do_conflito:]
+        page.locator("#btn-voltar-movimento-financeiro").click()
+        assert normalizar(page.locator('[data-financeiro-pedido="totalRecebido"]').inner_text()) == "R$ 80,00"
+
+        # J. Contas a Receber: pedidos v2 ativos com movimentos, cancelado e v1 ficam fora.
+        tabs.nth(4).click()
+        page.wait_for_function("document.getElementById('contasReceberCarregando').hidden === true")
+        texto_contas = normalizar(page.locator("#contasReceberTabelaContainer").inner_text())
+        assert "ORC-151" in texto_contas
+        assert "ORC-153" in texto_contas
+        assert "ORC-152" not in texto_contas
+        assert "ORC-150" not in texto_contas
+
+        linha_151 = page.locator("#contasReceberTabelaContainer tbody tr").filter(has_text="ORC-151")
+        assert normalizar(linha_151.locator('[data-label="Saldo"]').inner_text()) == "R$ 100,00"
+        assert "Parcialmente pago" in normalizar(linha_151.locator('[data-label="Situação"]').inner_text())
+        # Recebível vem do snapshot: comissão inclusa (não descontada) e instalação fora. Recebido e
+        # reembolsado saem do domínio, que ignora lançamento cancelado e abate o reembolso no saldo.
+        assert normalizar(linha_151.locator('[data-label="Valor a receber"]').inner_text()) == "R$ 220,00"
+        assert normalizar(linha_151.locator('[data-label="Recebido"]').inner_text()) == "R$ 150,00"
+        assert normalizar(linha_151.locator('[data-label="Reembolsado"]').inner_text()) == "R$ 30,00"
+
+        # ORC-155 tem R$ 300,00 de instalação e nenhum lançamento: instalação não entra no recebível.
+        linha_155 = page.locator("#contasReceberTabelaContainer tbody tr").filter(has_text="ORC-155")
+        assert normalizar(linha_155.locator('[data-label="Valor a receber"]').inner_text()) == "R$ 220,00"
+        assert normalizar(linha_155.locator('[data-label="Saldo"]').inner_text()) == "R$ 220,00"
+        assert "Em aberto" in normalizar(linha_155.locator('[data-label="Situação"]').inner_text())
+
+        # Filtros: "Parcialmente pago" mantém os dois; "Quitado" fica vazio (nenhum pedido está quitado agora).
+        page.locator("#contasReceberFiltroSituacao").select_option("Parcialmente pago")
+        page.wait_for_timeout(50)
+        texto_parcial = normalizar(page.locator("#contasReceberTabelaContainer").inner_text())
+        assert "ORC-151" in texto_parcial and "ORC-153" in texto_parcial
+
+        page.locator("#contasReceberFiltroSituacao").select_option("Quitado")
+        page.wait_for_function("document.getElementById('contasReceberVazio').hidden === false")
+        page.locator("#contasReceberFiltroSituacao").select_option("todos")
+        page.wait_for_timeout(50)
+
+        # Botão "Abrir" navega para o pedido, sem alterar dados.
+        page.locator("#contasReceberTabelaContainer tbody tr").filter(has_text="ORC-153") \
+            .locator(".btn-abrir-orcamento").click()
+        assert page.locator("#tab2").is_visible()
+        assert page.locator("#orcamentoId").inner_text() == "ORC-153"
+
+        # J2. Listener do pedido selecionado: uma assinatura por pedido observado, sem churn.
+        colecao_151 = "orcamentos/ORC-151/pagamentos"
+        colecao_153 = "orcamentos/ORC-153/pagamentos"
+
+        def assinaturas(colecao):
+            return page.evaluate(f"(c) => {firestore_mock}.estatisticasDeAssinatura(c)", colecao)
+
+        seletor.select_option("ORC-151")
+        page.wait_for_function("document.getElementById('financeiroPedidoCardContainer').hidden === false")
+        base_151 = assinaturas(colecao_151)
+        base_153 = assinaturas(colecao_153)
+        assert base_151["subscribes"] - base_151["unsubscribes"] == 1, base_151
+
+        # Um snapshot do próprio listener (o mesmo documento regravado, sem mudar nada) repinta a
+        # interface e NÃO pode derrubar/reabrir a assinatura.
+        pagamento_151 = page.locator(".btn-editar-movimento").first.get_attribute("data-pagamento-id")
+        page.evaluate(
+            f"""(pagamentoId) => {{
+                const mock = {firestore_mock};
+                mock.escreverDiretamente('{colecao_151}', pagamentoId, mock.lerDiretamente('{colecao_151}', pagamentoId));
+            }}""",
+            pagamento_151,
+        )
+        page.wait_for_timeout(100)
+        assert assinaturas(colecao_151) == base_151, "snapshot do próprio listener não deve reassinar"
+
+        # Trocar de pedido: exatamente um unsubscribe em A e um subscribe em B.
+        seletor.select_option("ORC-153")
+        page.wait_for_function("document.getElementById('orcamentoId').textContent === 'ORC-153'")
+        depois_151 = assinaturas(colecao_151)
+        depois_153 = assinaturas(colecao_153)
+        assert depois_151["unsubscribes"] == base_151["unsubscribes"] + 1, depois_151
+        assert depois_151["subscribes"] == base_151["subscribes"], depois_151
+        assert depois_153["subscribes"] == base_153["subscribes"] + 1, depois_153
+
+        # J3. Callback atrasado do listener anterior não escreve no estado nem na interface do pedido
+        # atual. O disparo ignora o unsubscribe de propósito: o SDK real não promete que um callback já
+        # enfileirado nunca chegue, e dinheiro na tela não pode depender dessa suposição.
+        assert normalizar(page.locator('[data-financeiro-pedido="totalRecebido"]').inner_text()) == "R$ 80,00"
+        linhas_b = page.locator("#financeiroPedidoConteudo tbody tr").count()
+        assert page.evaluate(f"() => {firestore_mock}.dispararCallbackTardioDe('{colecao_151}')") is True
+        page.wait_for_timeout(100)
+        assert page.locator("#orcamentoId").inner_text() == "ORC-153"
+        assert normalizar(page.locator('[data-financeiro-pedido="totalRecebido"]').inner_text()) == "R$ 80,00"
+        assert page.locator("#financeiroPedidoConteudo tbody tr").count() == linhas_b
+
+        # J4. Sair de um pedido elegível para um orçamento sem pedido (e para um v1): listener desligado,
+        # movimentos em memória limpos e nenhum card financeiro anterior permanece na tela.
+        antes_saida_153 = assinaturas(colecao_153)
+        seletor.select_option("ORC-154")
+        assert page.locator("#financeiroPedidoCardContainer").is_hidden()
+        assert page.locator("#financeiroPedidoConteudo").inner_html() == ""
+        assert assinaturas(colecao_153)["unsubscribes"] == antes_saida_153["unsubscribes"] + 1
+
+        seletor.select_option("ORC-150")
+        assert page.locator("#financeiroPedidoCardContainer").is_hidden()
+        assert page.locator("#financeiroPedidoConteudo").inner_html() == ""
+        assert page.evaluate(f"() => {firestore_mock}.dispararCallbackTardioDe('{colecao_153}')") is True
+        page.wait_for_timeout(100)
+        assert page.locator("#financeiroPedidoCardContainer").is_hidden(), "callback tardio não pode ressuscitar o bloco"
+        assert page.locator("#financeiroPedidoConteudo").inner_html() == ""
+
+        # J5. Contas a Receber falha fechado: leitura indisponível em UM participante não é "zero
+        # pagamentos" e não pode virar lista parcial nem saldo em aberto artificial.
+        tabs.nth(4).click()
+        page.wait_for_function("document.getElementById('contasReceberCarregando').hidden === true")
+        page.locator("#contasReceberFiltroSituacao").select_option("todos")
+        page.wait_for_timeout(50)
+        linhas_completas = page.locator("#contasReceberTabelaContainer tbody tr").count()
+        texto_completo = normalizar(page.locator("#contasReceberTabelaContainer").inner_text())
+        assert linhas_completas >= 3, linhas_completas
+        for pedido_participante in ("ORC-151", "ORC-153", "ORC-155"):
+            assert pedido_participante in texto_completo
+
+        erros_antes_das_contas = len(console_errors)
+        page.evaluate(f"() => {firestore_mock}.falharLeituraDe('{colecao_153}')")
+        page.locator("#btn-atualizar-contas-a-receber").click()
+        page.wait_for_function("document.getElementById('contasReceberErro').hidden === false")
+        assert "Não foi possível carregar todas as informações de Contas a Receber. Tente novamente." \
+            in texto_visivel(page.locator("#contasReceberErro"))
+        assert page.locator("#contasReceberTabelaContainer").inner_html() == "", "nenhuma tabela parcial"
+        assert page.locator("#contasReceberVazio").is_hidden(), "falha de leitura não é 'nada a receber'"
+
+        # Trocar o filtro não pode ressuscitar a visão (parcial ou vazia) como se fosse válida.
+        page.locator("#contasReceberFiltroSituacao").select_option("Em aberto")
+        page.wait_for_timeout(50)
+        assert page.locator("#contasReceberTabelaContainer").inner_html() == ""
+        assert page.locator("#contasReceberVazio").is_hidden()
+        page.locator("#contasReceberFiltroSituacao").select_option("Parcialmente pago")
+        page.wait_for_timeout(50)
+        assert page.locator("#contasReceberTabelaContainer").inner_html() == ""
+
+        # Restabelecida a leitura, a seção volta completa: o bloqueio é da falha, não da seção.
+        page.evaluate(f"() => {firestore_mock}.falharLeituraDe(null)")
+        page.locator("#btn-atualizar-contas-a-receber").click()
+        page.wait_for_function("document.getElementById('contasReceberErro').hidden === true")
+        page.locator("#contasReceberFiltroSituacao").select_option("todos")
+        page.wait_for_timeout(50)
+        assert page.locator("#contasReceberTabelaContainer tbody tr").count() == linhas_completas
+
+        erros_das_contas = console_errors[erros_antes_das_contas:]
+        assert len(erros_das_contas) == 1 and "Falha ao carregar Contas a Receber" in erros_das_contas[0], erros_das_contas
+        del console_errors[erros_antes_das_contas:]
+
+        tabs.nth(1).click()
+
+        # K. Impressão e privacidade: nada do financeiro do pedido vaza para a Proposta Cliente nem para a impressão.
+        seletor.select_option("ORC-151")
+        verificar_impressao_sem_dados_internos(page, "impressão com pagamentos lançados", VALORES_PAGAMENTO)
+        tabs.nth(2).click()
+        verificar_aba_proposta_sem_dados_internos(page, "aba Proposta com pagamentos lançados", VALORES_PAGAMENTO)
+        tabs.nth(1).click()
+
+        # L. Mobile 390 px: Financeiro do pedido e Contas a Receber sem rolagem horizontal.
+        page.set_viewport_size({"width": 390, "height": 844})
+        page.wait_for_timeout(100)
+        assert sem_rolagem_horizontal(page)
+        page.locator("#financeiroPedidoCardContainer").screenshot(path=str(artifacts / "financeiro-pedido-mobile.png"))
+        tabs.nth(4).click()
+        page.wait_for_timeout(100)
+        assert sem_rolagem_horizontal(page)
+        page.set_viewport_size({"width": 1440, "height": 1000})
+        tabs.nth(1).click()
+
+        # --- Hardening do contrato de backup: cadeia validada na exportação, ordem determinística e
+        # importação fail-closed para pagamentos malformados. ---
+        seletor.select_option("ORC-151")
+        botao_para_corromper = page.locator(".btn-editar-movimento").first
+        pagamento_id_corrompido = botao_para_corromper.get_attribute("data-pagamento-id")
+
+        movimento_original = page.evaluate(
+            f"(pagamentoId) => {firestore_mock}.lerDiretamente('orcamentos/ORC-151/pagamentos', pagamentoId)",
+            pagamento_id_corrompido,
+        )
+
+        # N. Exportação recusa cadeia de auditoria inconsistente: a versão do movimento avança sem que
+        # o evento correspondente exista (evento v2 faltante). Nenhum download deve acontecer.
+        # O botão de exportar/importar vive na aba Configurações: navega até lá primeiro, e garante que
+        # o clique em si seja bem-sucedido ANTES de esperar (ou não) pelo evento de download — assim o
+        # timeout do expect_download só pode significar "nenhum download", nunca "botão não clicável".
+        tabs.nth(5).click()
+        botao_exportar = page.locator("#btn-exportar-dados")
+        botao_exportar.wait_for(state="visible")
+
+        erros_console_antes_do_backup = len(console_errors)
+        page.evaluate(
+            f"""(pagamentoId) => {{
+                const mock = {firestore_mock};
+                const colecao = 'orcamentos/ORC-151/pagamentos';
+                const atual = mock.lerDiretamente(colecao, pagamentoId);
+                mock.escreverDiretamente(colecao, pagamentoId, {{ ...atual, versao: atual.versao + 1, ultimoEventoId: 'v' + (atual.versao + 1) }});
+            }}""",
+            pagamento_id_corrompido,
+        )
+        try:
+            with page.expect_download(timeout=2000):
+                botao_exportar.click()
+            raise AssertionError("backup com cadeia inconsistente não deveria gerar download")
+        except PlaywrightTimeoutError:
+            pass
+        page.wait_for_function(
+            "document.getElementById('app-notification').textContent.includes('Nenhum arquivo foi gerado')"
+        )
+        notificacao_erro_backup = notificacao(page)
+        assert pagamento_id_corrompido in notificacao_erro_backup
+        assert "ORC-151" in notificacao_erro_backup
+        assert "Nenhum arquivo foi gerado" in notificacao_erro_backup
+        erros_backup = console_errors[erros_console_antes_do_backup:]
+        assert len(erros_backup) == 1 and "inconsistente" in erros_backup[0], erros_backup
+        del console_errors[erros_console_antes_do_backup:]
+
+        # O. Corrigida a cadeia (documento restaurado ao estado válido), a exportação volta a funcionar:
+        # a checagem bloqueia o inconsistente, não qualquer exportação.
+        page.evaluate(
+            f"([pagamentoId, dados]) => {firestore_mock}.escreverDiretamente('orcamentos/ORC-151/pagamentos', pagamentoId, dados)",
+            [pagamento_id_corrompido, movimento_original],
+        )
+        with page.expect_download(timeout=5000) as download_info:
+            page.locator("#btn-exportar-dados").click()
+        download = download_info.value
+        assert download.suggested_filename.startswith("filippini_backup_")
+        page.wait_for_function(
+            "document.getElementById('app-notification').textContent.includes('Backup concluído com sucesso')"
+        )
+
+        # O2. Exportação recusa pagamento cujo PAI não é pedido v2 com snapshot financeiro válido: o
+        # backup só pode conter o que uma restauração futura conseguiria associar a um pai legítimo.
+        orcamento_151_original = page.evaluate(f"() => {firestore_mock}.lerDiretamente('orcamentos', 'ORC-151')")
+        page.evaluate(
+            f"""(original) => {{
+                const corrompido = structuredClone(original);
+                corrompido.pedido.financeiro.valorComissaoCentavos += 1;
+                {firestore_mock}.escreverDiretamente('orcamentos', 'ORC-151', corrompido);
+            }}""",
+            orcamento_151_original,
+        )
+        # Espera a aplicação absorver o snapshot inválido: o bloco financeiro do pedido desaparece.
+        tabs.nth(1).click()
+        seletor.select_option("ORC-151")
+        page.wait_for_function("document.getElementById('financeiroPedidoCardContainer').hidden === true")
+
+        erros_console_antes_do_pai = len(console_errors)
+        tabs.nth(5).click()
+        botao_exportar.wait_for(state="visible")
+        try:
+            with page.expect_download(timeout=2000):
+                botao_exportar.click()
+            raise AssertionError("backup com pai financeiro inválido não deveria gerar download")
+        except PlaywrightTimeoutError:
+            pass
+        page.wait_for_function(
+            "document.getElementById('app-notification').textContent.includes('Nenhum arquivo foi gerado')"
+        )
+        notificacao_pai = notificacao(page)
+        assert "ORC-151" in notificacao_pai
+        assert "snapshot financeiro válido" in notificacao_pai
+        assert "Nenhum arquivo foi gerado" in notificacao_pai
+        erros_pai = console_errors[erros_console_antes_do_pai:]
+        assert len(erros_pai) == 1 and "inconsistente" in erros_pai[0], erros_pai
+        del console_errors[erros_console_antes_do_pai:]
+
+        # Restaurado o pedido, a exportação volta a funcionar: o bloqueio é do pai inválido.
+        page.evaluate(
+            f"(original) => {firestore_mock}.escreverDiretamente('orcamentos', 'ORC-151', original)",
+            orcamento_151_original,
+        )
+        tabs.nth(1).click()
+        seletor.select_option("ORC-151")
+        page.wait_for_function("document.getElementById('financeiroPedidoCardContainer').hidden === false")
+        tabs.nth(5).click()
+        botao_exportar.wait_for(state="visible")
+        with page.expect_download(timeout=5000):
+            botao_exportar.click()
+        page.wait_for_function(
+            "document.getElementById('app-notification').textContent.includes('Backup concluído com sucesso')"
+        )
+
+        # P. Importação: contrato de `pagamentos` distingue ausente / vazio / não-vazio / malformado.
+        arquivo_pagamentos_objeto = artifacts / "backup-pagamentos-objeto.json"
+        arquivo_pagamentos_objeto.write_text(json.dumps({"version": "2.0", "pagamentos": {}}), encoding="utf-8")
+        arquivo_pagamentos_texto = artifacts / "backup-pagamentos-texto.json"
+        arquivo_pagamentos_texto.write_text(json.dumps({"version": "2.0", "pagamentos": "x"}), encoding="utf-8")
+        arquivo_pagamentos_nulo = artifacts / "backup-pagamentos-nulo.json"
+        arquivo_pagamentos_nulo.write_text(json.dumps({"version": "2.0", "pagamentos": None}), encoding="utf-8")
+        arquivo_pagamentos_vazio = artifacts / "backup-pagamentos-vazio.json"
+        arquivo_pagamentos_vazio.write_text(json.dumps({"version": "2.0", "pagamentos": []}), encoding="utf-8")
+
+        ids_antes_import = page.evaluate(
+            "() => [...document.querySelectorAll('#seletorOrcamento option')].map(o => o.value).sort()"
+        )
+        erros_console_antes_do_import = len(console_errors)
+
+        for caminho in (arquivo_pagamentos_objeto, arquivo_pagamentos_texto, arquivo_pagamentos_nulo):
+            page.locator("#arquivo-backup").set_input_files(str(caminho))
+            page.wait_for_function(
+                "document.getElementById('app-notification').textContent.includes('Estrutura de backup inválida')"
+            )
+            ids_depois = page.evaluate(
+                "() => [...document.querySelectorAll('#seletorOrcamento option')].map(o => o.value).sort()"
+            )
+            assert ids_depois == ids_antes_import, f"{caminho.name}: zero writes esperado, ids mudaram"
+
+        # `pagamentos: []` não é malformado nem bloqueado por conter histórico: segue o fluxo normal
+        # (que aqui esbarra, sem problema, na ausência de qualquer outro registro para restaurar).
+        page.locator("#arquivo-backup").set_input_files(str(arquivo_pagamentos_vazio))
+        page.wait_for_function(
+            "document.getElementById('app-notification').textContent.includes('não contém registros para restaurar')"
+        )
+        ids_depois_vazio = page.evaluate(
+            "() => [...document.querySelectorAll('#seletorOrcamento option')].map(o => o.value).sort()"
+        )
+        assert ids_depois_vazio == ids_antes_import
+
+        erros_import = console_errors[erros_console_antes_do_import:]
+        assert len(erros_import) == 4, erros_import
+        assert all("Estrutura de backup inválida" in erro for erro in erros_import[:3]), erros_import
+        assert "não contém registros para restaurar" in erros_import[3], erros_import
+        del console_errors[erros_console_antes_do_import:]
+
         assert console_errors == [], console_errors
         assert request_failures == [], request_failures
         browser.close()
@@ -1393,7 +1876,10 @@ def main():
         "Browser smoke test passou: login, prévia com produto válido, salvamento, "
         "duplicação, validade, impressão, proposta detalhada móvel, contatos, WhatsApp, "
         "follow-ups, status perdido/reaberto, pedido confirmado, comissão configurável, snapshot v2, "
-        "confirmação transacional, cancelamento e relatório financeiro de vendas validados."
+        "confirmação transacional, cancelamento, relatório financeiro de vendas, pagamentos do pedido "
+        "(recebimento, reembolso, edição, conflito, cancelamento), Contas a Receber fail-closed, "
+        "listener sem churn nem callback tardio e backup fail-closed (cadeia, pai financeiro, "
+        "importação malformada) validados."
     )
 
 

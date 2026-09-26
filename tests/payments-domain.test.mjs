@@ -17,8 +17,11 @@ import {
     criarEventoAuditoria,
     criarMovimento,
     ehDataMovimentoValida,
+    idDoEventoDaVersao,
     obterValorReceberCentavos,
     pedidoAceitaMovimento,
+    prepararPagamentosParaBackup,
+    validarCadeiaDeAuditoria,
     validarMovimento
 } from '../payments-domain.js';
 
@@ -352,15 +355,60 @@ test('backup restaura recebimento, reembolso, cancelado e versão > 1 sob pedido
     assert.equal(avaliarRestauracaoMovimento(null, cancelado, pedidoAtivo).gravar, true, 'versão > 1 é permitida no domínio');
 });
 
-test('BLOQUEADOR DE DEPLOY: o backup ainda não cobre pagamentos, então nenhum write financeiro pode ir a produção', () => {
-    // Guarda formal da Etapa 4: enquanto exportarDados/importarDados não incluírem a subcoleção de
-    // pagamentos e a auditoria, um pagamento real em produção ficaria fora do backup. Quando a
-    // integração da 4B2 existir, este teste deve ser trocado por um de ida e volta do backup real.
+test('BLOQUEADOR DE DEPLOY (4B2A): exportação cobre pagamentos, mas a restauração financeira continua indisponível', () => {
+    // Guarda formal da Etapa 4: a exportação (Etapa 4B2A) já cobre pagamentos + auditoria, mas a
+    // restauração privilegiada (Etapa 4B2R) ainda não existe. Nenhum write financeiro real pode ir a
+    // produção até a 4B2R decidir o mecanismo de restauração sem reescrever autoria histórica.
     const fonteApps = readFileSync(new URL('../apps.js', import.meta.url), 'utf8');
-    const trechoExportacao = fonteApps.slice(fonteApps.indexOf('function exportarDados()'), fonteApps.indexOf('async function gravarDocumentosEmLotes'));
 
-    assert.ok(!trechoExportacao.includes('pagamentos'), 'exportarDados ainda não exporta pagamentos: liberar pagamento em produção é bloqueado');
-    assert.ok(!fonteApps.includes('avaliarRestauracaoMovimento'), 'importarDados ainda não restaura pagamentos');
+    // 1) Exportação: coletarPagamentosParaBackup existe; montarDadosBackup monta o payload chamando
+    // prepararPagamentosParaBackup (que valida a cadeia e ordena, e lança se algo estiver inconsistente
+    // — fail-closed); exportarDados só chama baixarBackup(data) DEPOIS de montarDadosBackup ter
+    // retornado com sucesso, nunca antes.
+    assert.match(fonteApps, /async function coletarPagamentosParaBackup\(\)/, 'função de coleta de pagamentos existe');
+    assert.match(fonteApps, /function montarDadosBackup\(pagamentosColetados\)/, 'função de montagem do payload existe');
+    assert.match(fonteApps, /function baixarBackup\(data\)/, 'função de download existe e recebe só o payload já pronto');
+
+    const inicioMontar = fonteApps.indexOf('function montarDadosBackup(pagamentosColetados)');
+    const inicioBaixar = fonteApps.indexOf('function baixarBackup(data)');
+    assert.ok(inicioMontar >= 0 && inicioBaixar > inicioMontar, 'montarDadosBackup vem antes de baixarBackup');
+    const trechoMontar = fonteApps.slice(inicioMontar, inicioBaixar);
+    // O mapa de pais precisa ser passado junto: sem ele a certificação de pai não acontece.
+    assert.match(
+        trechoMontar,
+        /prepararPagamentosParaBackup\(pagamentosColetados, orcamentosSalvos\)/,
+        'montarDadosBackup certifica identidade, pai e cadeia via prepararPagamentosParaBackup'
+    );
+
+    const fimBaixar = fonteApps.indexOf('async function exportarDados()');
+    const trechoBaixar = fonteApps.slice(inicioBaixar, fimBaixar);
+    assert.ok(!trechoBaixar.includes('prepararPagamentosParaBackup'), 'baixarBackup não revalida a cadeia — só recebe payload já pronto');
+
+    const inicioExport = fimBaixar;
+    const fimExport = fonteApps.indexOf('async function gravarDocumentosEmLotes');
+    assert.ok(inicioExport >= 0 && fimExport > inicioExport, 'exportarDados existe e vem antes de gravarDocumentosEmLotes');
+    const trechoExportacao = fonteApps.slice(inicioExport, fimExport);
+    assert.match(trechoExportacao, /coletarPagamentosParaBackup\(\)/, 'exportarDados chama a coleta de pagamentos');
+    assert.match(trechoExportacao, /montarDadosBackup\(pagamentosColetados\)/, 'exportarDados chama a montagem validada do payload');
+    const indiceMontarNoExport = trechoExportacao.indexOf('montarDadosBackup(pagamentosColetados)');
+    const indiceBaixarNoExport = trechoExportacao.indexOf('baixarBackup(data)');
+    assert.ok(indiceBaixarNoExport > indiceMontarNoExport, 'o download só acontece depois da montagem validada do payload');
+
+    // 2) Importação: um backup com pagamentos precisa abortar ANTES de qualquer write, ou seja, antes
+    // da primeira chamada a gravarDocumentosEmLotes dentro de importarDados.
+    const inicioImport = fonteApps.indexOf('async function importarDados(event)');
+    const fimImport = fonteApps.indexOf('async function salvarOrcamentoAtual');
+    assert.ok(inicioImport >= 0 && fimImport > inicioImport, 'importarDados existe e tem um fim localizável');
+    const trechoImportacao = fonteApps.slice(inicioImport, fimImport);
+    const indiceBloqueio = trechoImportacao.indexOf('restauração de pagamentos ainda exige');
+    const indicePrimeiraGravacao = trechoImportacao.indexOf('gravarDocumentosEmLotes(');
+    assert.ok(indiceBloqueio >= 0, 'a mensagem de bloqueio de restauração financeira está presente');
+    assert.ok(indicePrimeiraGravacao >= 0, 'importarDados ainda grava dados (fluxo normal preservado)');
+    assert.ok(indiceBloqueio < indicePrimeiraGravacao, 'o bloqueio ocorre antes de qualquer gravação: zero writes com pagamentos no backup');
+
+    // 3) A restauração financeira privilegiada (4B2R) ainda não está wired: nada em apps.js chama o
+    // motor de restauração de movimentos.
+    assert.ok(!fonteApps.includes('avaliarRestauracaoMovimento'), 'a restauração de pagamentos ainda não está implementada em produção');
 });
 
 test('a restauração preserva a validade temporal: data futura é recusada', () => {
@@ -402,4 +450,439 @@ test('backup recusa movimento estruturalmente inválido', () => {
     const avaliacao = avaliarRestauracaoMovimento(null, corrompido, criarPedidoV2());
     assert.equal(avaliacao.gravar, false);
     assert.match(avaliacao.motivo, /^movimento-invalido:/);
+});
+
+// --- validarCadeiaDeAuditoria(): trilha completa v1..vN, usada pelo backup e pela futura restauração ---
+
+function construirCadeiaCompleta() {
+    const v1 = criar();
+    const eventoV1 = criarEventoAuditoria('criacao', null, v1, { registradoEm: v1.criadoEm, registradoPor: 'usuario-teste' });
+
+    const v2 = corrigirMovimento(
+        v1, { valorCentavos: 45000, atualizadoEm: '2026-09-19T09:00:00.000Z', atualizadoPor: 'usuario-teste' }, { hoje: HOJE }
+    );
+    const eventoV2 = criarEventoAuditoria('correcao', v1, v2, { registradoEm: v2.atualizadoEm, registradoPor: 'usuario-teste' });
+
+    const v3 = cancelarMovimento(v2, {
+        motivo: 'Lançado em duplicidade', canceladoEm: '2026-09-20T10:00:00.000Z', canceladoPor: 'usuario-teste'
+    });
+    const eventoV3 = criarEventoAuditoria('cancelamento', v2, v3, {
+        registradoEm: v3.canceladoEm, registradoPor: 'usuario-teste', motivo: v3.motivoCancelamento
+    });
+
+    const eventos = [
+        { eventoId: 'v1', dados: eventoV1 },
+        { eventoId: 'v2', dados: eventoV2 },
+        { eventoId: 'v3', dados: eventoV3 }
+    ];
+    return { v1, v2, v3, eventos };
+}
+
+test('cadeia íntegra v1..v3 (criação, correção, cancelamento) é válida', () => {
+    const { v3, eventos } = construirCadeiaCompleta();
+    const resultado = validarCadeiaDeAuditoria(v3, eventos);
+    assert.equal(resultado.valido, true, JSON.stringify(resultado));
+    assert.deepEqual(resultado.erros, []);
+});
+
+test('movimento ativo na versão 1 (só criação) é uma cadeia válida', () => {
+    const v1 = criar();
+    const evento = criarEventoAuditoria('criacao', null, v1, { registradoEm: v1.criadoEm, registradoPor: 'usuario-teste' });
+    const resultado = validarCadeiaDeAuditoria(v1, [{ eventoId: 'v1', dados: evento }]);
+    assert.equal(resultado.valido, true, JSON.stringify(resultado));
+});
+
+test('movimento ativo em versão > 1 precisa terminar em correção, não em criação', () => {
+    const { v2, eventos } = construirCadeiaCompleta();
+    // v2 é ativo (a cadeia completa cancela depois, em v3); aqui testamos só até v2.
+    const resultado = validarCadeiaDeAuditoria(v2, eventos.slice(0, 2));
+    assert.equal(resultado.valido, true, JSON.stringify(resultado));
+});
+
+test('cadeia truncada (falta um evento do meio) é recusada', () => {
+    const { v3, eventos } = construirCadeiaCompleta();
+    const truncada = [eventos[0], eventos[2]]; // falta v2
+    const resultado = validarCadeiaDeAuditoria(v3, truncada);
+    assert.equal(resultado.valido, false);
+    assert.ok(resultado.erros.some(erro => erro.includes('lacuna') || erro.includes('incompleta')), JSON.stringify(resultado));
+});
+
+test('evento faltante no final (cadeia incompleta para a versão do movimento) é recusado', () => {
+    const { v3, eventos } = construirCadeiaCompleta();
+    const semUltimo = eventos.slice(0, 2); // só v1 e v2, mas o movimento está na versão 3
+    const resultado = validarCadeiaDeAuditoria(v3, semUltimo);
+    assert.equal(resultado.valido, false);
+    assert.ok(resultado.erros.some(erro => erro.includes('incompleta')), JSON.stringify(resultado));
+});
+
+test('evento duplicado (duas entradas para a mesma versão) é recusado', () => {
+    const { v3, eventos } = construirCadeiaCompleta();
+    // Mesmo eventoId "v2" (formato correto), só que repetido: é a duplicata que importa aqui.
+    const duplicada = [...eventos, { eventoId: 'v2', dados: eventos[1].dados }];
+    const resultado = validarCadeiaDeAuditoria(v3, duplicada);
+    assert.equal(resultado.valido, false);
+    assert.ok(resultado.erros.some(erro => erro.includes('duplicado')), JSON.stringify(resultado));
+});
+
+test('estado final divergente do último evento é recusado', () => {
+    const { v3, eventos } = construirCadeiaCompleta();
+    const movimentoAdulterado = { ...v3, valorCentavos: 999999 };
+    const resultado = validarCadeiaDeAuditoria(movimentoAdulterado, eventos);
+    assert.equal(resultado.valido, false);
+    assert.ok(resultado.erros.includes('ultimo-estadoNovo-diverge-do-movimento-atual'), JSON.stringify(resultado));
+});
+
+test('eventoId que não corresponde a "v" + versaoNova é recusado', () => {
+    const { v1 } = construirCadeiaCompleta();
+    const evento = criarEventoAuditoria('criacao', null, v1, { registradoEm: v1.criadoEm, registradoPor: 'usuario-teste' });
+    const resultado = validarCadeiaDeAuditoria(v1, [{ eventoId: 'evento-1', dados: evento }]);
+    assert.equal(resultado.valido, false);
+    assert.ok(resultado.erros.some(erro => erro.includes('nao-corresponde-a-versaoNova')), JSON.stringify(resultado));
+});
+
+test('v1 com versaoAnterior ou estadoAnterior preenchidos é recusado', () => {
+    const { v1 } = construirCadeiaCompleta();
+    const eventoAdulterado = { ...criarEventoAuditoria('criacao', null, v1, { registradoEm: v1.criadoEm, registradoPor: 'u' }), versaoAnterior: 0 };
+    const resultado = validarCadeiaDeAuditoria(v1, [{ eventoId: 'v1', dados: eventoAdulterado }]);
+    assert.equal(resultado.valido, false);
+    assert.ok(resultado.erros.includes('v1-versaoAnterior-nao-nula'), JSON.stringify(resultado));
+});
+
+test('elo quebrado: estadoAnterior de v2 não bate com estadoNovo de v1 é recusado', () => {
+    const { v1, v2, eventos } = construirCadeiaCompleta();
+    const eventoV2Adulterado = { ...eventos[1].dados, estadoAnterior: { ...eventos[1].dados.estadoAnterior, valorCentavos: 1 } };
+    const resultado = validarCadeiaDeAuditoria(v2, [eventos[0], { eventoId: 'v2', dados: eventoV2Adulterado }]);
+    assert.equal(resultado.valido, false);
+    assert.ok(resultado.erros.some(erro => erro.includes('nao-bate-com-v1')), JSON.stringify(resultado));
+});
+
+test('cadeia vazia ou movimento ausente são recusados', () => {
+    assert.equal(validarCadeiaDeAuditoria(null, []).valido, false);
+    assert.equal(validarCadeiaDeAuditoria(criar(), []).valido, false);
+    assert.equal(validarCadeiaDeAuditoria(criar(), null).valido, false);
+});
+
+// --- Round-trip estrutural puro do backup (sem Firestore): serializa, reparseia e revalida ------
+
+test('round-trip JSON puro preserva IDs, versões, autores, datas, estados e a cadeia de auditoria', () => {
+    const { v3, eventos } = construirCadeiaCompleta();
+    const backup = {
+        versaoBackup: 2,
+        pagamentos: [{ orcamentoId: 'ORC-90', pagamentoId: 'pag-teste', movimento: v3, auditoria: eventos }]
+    };
+
+    const reidratado = JSON.parse(JSON.stringify(backup));
+    const registro = reidratado.pagamentos[0];
+
+    assert.deepEqual(registro.movimento, v3, 'o movimento sobrevive ao round-trip JSON sem perder nem ganhar campos');
+    assert.deepEqual(registro.auditoria, eventos, 'a auditoria completa sobrevive ao round-trip JSON');
+    assert.equal(registro.orcamentoId, 'ORC-90');
+    assert.equal(registro.pagamentoId, 'pag-teste');
+
+    const validacao = validarCadeiaDeAuditoria(registro.movimento, registro.auditoria);
+    assert.equal(validacao.valido, true, JSON.stringify(validacao));
+
+    // Nenhum Timestamp do Firestore, nenhum objeto complexo: tudo string/number/null/boolean.
+    const semTimestamp = valor => {
+        if (valor === null || typeof valor !== 'object') return true;
+        if (Array.isArray(valor)) return valor.every(semTimestamp);
+        if (typeof valor.toDate === 'function' || 'seconds' in valor) return false;
+        return Object.values(valor).every(semTimestamp);
+    };
+    assert.ok(semTimestamp(backup), 'o backup não depende de Timestamp do Firestore');
+});
+
+// --- Contrato da camada agregadora/UI (Contas a Receber e listener do pedido) --------------------
+// Esta camada não é domínio puro: vive em apps.js e só pode ser inspecionada pela fonte. O E2E prova o
+// comportamento; estes testes travam as decisões que um refactor silencioso poderia desfazer.
+
+// Comentários explicam por que uma escolha NÃO foi feita e citam o helper rejeitado: as asserções de
+// ausência precisam olhar só o código executável.
+function semComentarios(trecho) {
+    return trecho.split(/\r?\n/).filter(linha => !linha.trim().startsWith('//')).join('\n');
+}
+
+function trechoDaFuncao(fonte, assinatura, assinaturaSeguinte) {
+    const inicio = fonte.indexOf(assinatura);
+    assert.ok(inicio >= 0, `função ${assinatura} existe em apps.js`);
+    const fim = fonte.indexOf(assinaturaSeguinte, inicio + assinatura.length);
+    assert.ok(fim > inicio, `função ${assinaturaSeguinte} vem depois de ${assinatura}`);
+    return fonte.slice(inicio, fim);
+}
+
+test('Contas a Receber: participação só por pedidoParticipaFinanceiro, e falha de leitura derruba o conjunto', () => {
+    const fonteApps = readFileSync(new URL('../apps.js', import.meta.url), 'utf8');
+    const trechoCarregar = trechoDaFuncao(fonteApps, 'async function carregarContasAReceber()', 'function inicializarSelectInteligente');
+
+    // Fonte de participação: o portão oficial, que já recusa pedido cancelado, v1 e snapshot inválido.
+    assert.match(
+        trechoCarregar,
+        /Object\.values\(orcamentosSalvos\)\.filter\(pedidoParticipaFinanceiro\)/,
+        'a lista global usa pedidoParticipaFinanceiro como único critério de participação'
+    );
+    assert.ok(
+        !semComentarios(trechoCarregar).includes('pedidoTemSnapshotV2Valido'),
+        'pedidoTemSnapshotV2Valido NÃO decide participação no Contas a Receber ativo: ele aceita de propósito '
+        + 'pedido cancelado depois, para histórico e reembolso'
+    );
+
+    // Fail-closed na leitura: Promise.all rejeita o conjunto; allSettled com soma parcial é proibido.
+    assert.match(trechoCarregar, /await Promise\.all\(/, 'a carga usa Promise.all, que rejeita se qualquer leitura falhar');
+    assert.ok(!semComentarios(trechoCarregar).includes('allSettled'), 'Promise.allSettled seguido de soma parcial é proibido aqui');
+    assert.match(trechoCarregar, /contasAReceberComFalha = true/, 'a falha marca a seção como sem visão válida');
+    assert.match(trechoCarregar, /contasAReceberCarregadas = \[\]/, 'a falha descarta o que foi lido, em vez de deixar visão parcial acessível');
+    assert.match(
+        trechoCarregar,
+        /Não foi possível carregar todas as informações de Contas a Receber\. Tente novamente\./,
+        'a interface informa que a carga não foi completa'
+    );
+
+    // O render também precisa respeitar o estado de falha: trocar o filtro não pode repintar a lista.
+    const trechoRender = trechoDaFuncao(fonteApps, 'function renderizarContasAReceber()', 'async function carregarContasAReceber()');
+    const indiceGuarda = trechoRender.indexOf('if (contasAReceberComFalha)');
+    const indiceFiltro = trechoRender.indexOf('contasReceberFiltroSituacao');
+    assert.ok(indiceGuarda >= 0, 'renderizarContasAReceber tem guarda de falha');
+    assert.ok(indiceGuarda < indiceFiltro, 'a guarda de falha vem antes de qualquer filtragem/pintura');
+
+    // Nada de recalcular dinheiro nesta camada: todos os valores saem de calcularSituacaoFinanceira.
+    assert.match(trechoCarregar, /calcularSituacaoFinanceira\(orcamento, movimentos\)/, 'a situação vem do domínio');
+    const trechoLinha = trechoDaFuncao(fonteApps, 'function criarLinhaContasAReceber(', 'function renderizarContasAReceber()');
+    for (const proibido of ['valorTotal', 'percentualComissao', 'valoresInstalacao', 'converterValorParaCentavos', 'obterValorReceberCentavos']) {
+        assert.ok(
+            !semComentarios(trechoLinha).includes(proibido),
+            `a linha de Contas a Receber não recalcula ${proibido}: recebível, comissão, instalação e saldo vêm da situação`
+        );
+    }
+    for (const campo of ['situacao.valorReceberCentavos', 'situacao.recebidoCentavos', 'situacao.reembolsadoCentavos', 'situacao.saldoCentavos']) {
+        assert.ok(trechoLinha.includes(campo), `a linha exibe ${campo} calculado pelo domínio`);
+    }
+});
+
+test('listener financeiro: uma assinatura por pedido observado, com guarda contra callback atrasado', () => {
+    const fonteApps = readFileSync(new URL('../apps.js', import.meta.url), 'utf8');
+    const trechoListener = trechoDaFuncao(fonteApps, 'function atualizarListenerFinanceiroDoPedido()', 'function criarLinhaMovimento(');
+
+    // Sem churn: mesmo pedido/elegibilidade => só repinta, sem passar por unsubscribe/onSnapshot.
+    const indiceGuardaIdentidade = trechoListener.indexOf('if (orcamentoIdDoListenerFinanceiro === idAlvo)');
+    const indiceUnsubscribe = trechoListener.indexOf('unsubscribeMovimentosFinanceiros();');
+    const indiceOnSnapshot = trechoListener.indexOf('onSnapshot(');
+    assert.ok(indiceGuardaIdentidade >= 0, 'a identidade do pedido observado é conferida');
+    assert.ok(indiceGuardaIdentidade < indiceUnsubscribe, 'a guarda de identidade vem antes de desligar o listener');
+    assert.ok(indiceGuardaIdentidade < indiceOnSnapshot, 'a guarda de identidade vem antes de assinar de novo');
+    assert.ok(
+        !semComentarios(trechoListener).includes('atualizarInterfacePedido()'),
+        'o listener não chama atualizarInterfacePedido(), que o chamaria de volta e criaria churn'
+    );
+
+    // Callback atrasado: geração + pedido esperado conferidos ANTES de escrever estado ou pintar.
+    assert.match(trechoListener, /\+\+geracaoListenerFinanceiro/, 'cada assinatura recebe uma geração própria');
+    assert.match(
+        trechoListener,
+        /geracaoDestaAssinatura === geracaoListenerFinanceiro\s*\r?\n?\s*&& orcamentoIdDoListenerFinanceiro === idAlvo/,
+        'a guarda confere geração e pedido esperado'
+    );
+    const trechoCallbacks = trechoListener.slice(indiceOnSnapshot);
+    const indicePrimeiraGuarda = trechoCallbacks.indexOf('if (!ehCallbackAtual()) return;');
+    const indicePrimeiraEscrita = trechoCallbacks.indexOf('movimentosDoOrcamentoAtual =');
+    assert.ok(indicePrimeiraGuarda >= 0, 'o callback de dados começa descartando callback fora de geração');
+    assert.ok(indicePrimeiraGuarda < indicePrimeiraEscrita, 'a guarda vem antes de escrever movimentosDoOrcamentoAtual');
+    assert.equal(
+        trechoCallbacks.split('if (!ehCallbackAtual()) return;').length - 1,
+        2,
+        'os dois callbacks (dados e erro) são protegidos, não só o de dados'
+    );
+
+    // Logout precisa invalidar a geração, além de desligar o listener.
+    const trechoDetach = trechoDaFuncao(fonteApps, 'function detachAllListeners()', '// --- 6. PONTO DE ENTRADA');
+    assert.match(trechoDetach, /geracaoListenerFinanceiro\+\+/, 'logout invalida a geração dos callbacks pendentes');
+    assert.match(trechoDetach, /movimentosDoOrcamentoAtual = \[\]/, 'logout limpa os movimentos em memória');
+    assert.match(trechoDetach, /contasAReceberCarregadas = \[\]/, 'logout limpa o cache de Contas a Receber');
+});
+
+// --- prepararPagamentosParaBackup(): portão real do caminho de exportação --------------------------
+
+function registro(orcamentoId, pagamentoId, movimento, auditoria) {
+    return { orcamentoId, pagamentoId, movimento, auditoria };
+}
+
+// Mapa de pais válidos, como orcamentosSalvos entrega em apps.js: um pedido v2 íntegro por id citado.
+function paisDe(...ids) {
+    return Object.fromEntries(ids.map(id => [id, criarPedidoV2({ id })]));
+}
+
+test('cadeia íntegra: o pagamento entra no backup, com a auditoria ordenada por versão', () => {
+    const { v3, eventos } = construirCadeiaCompleta();
+    // Embaralha a ordem de chegada da auditoria para provar que a ordenação é feita aqui, não
+    // presumida da ordem natural de retorno do Firestore.
+    const embaralhada = [eventos[2], eventos[0], eventos[1]];
+    const resultado = prepararPagamentosParaBackup([registro('ORC-90', 'pag-1', v3, embaralhada)], paisDe('ORC-90'));
+
+    assert.equal(resultado.length, 1);
+    assert.deepEqual(resultado[0].auditoria.map(e => e.eventoId), ['v1', 'v2', 'v3']);
+});
+
+test('exportação aborta (lança) quando um pagamento tem evento de auditoria faltante', () => {
+    const { v3, eventos } = construirCadeiaCompleta();
+    const semV2 = [eventos[0], eventos[2]];
+    assert.throws(
+        () => prepararPagamentosParaBackup([registro('ORC-90', 'pag-1', v3, semV2)], paisDe('ORC-90')),
+        erro => erro instanceof ErroMovimento
+            && erro.codigo === 'cadeia-invalida'
+            && erro.message.includes('pag-1')
+            && erro.message.includes('ORC-90')
+            && erro.message.includes('Nenhum arquivo foi gerado')
+    );
+});
+
+test('exportação aborta quando o estado final do movimento diverge do último evento', () => {
+    const { v3, eventos } = construirCadeiaCompleta();
+    const adulterado = { ...v3, valorCentavos: 999999 };
+    assert.throws(
+        () => prepararPagamentosParaBackup([registro('ORC-90', 'pag-1', adulterado, eventos)], paisDe('ORC-90')),
+        ErroMovimento
+    );
+});
+
+test('dois pagamentos válidos entram os dois; um cancelado e um reembolso também', () => {
+    const { v3: recebimentoCorrigidoECancelado, eventos: eventosA } = construirCadeiaCompleta();
+    const reembolso = criar({ tipo: TIPOS_MOVIMENTO.REEMBOLSO });
+    const eventoReembolso = criarEventoAuditoria('criacao', null, reembolso, {
+        registradoEm: reembolso.criadoEm, registradoPor: 'usuario-teste'
+    });
+
+    const resultado = prepararPagamentosParaBackup([
+        registro('ORC-90', 'pag-cancelado', recebimentoCorrigidoECancelado, eventosA),
+        registro('ORC-91', 'pag-reembolso', reembolso, [{ eventoId: 'v1', dados: eventoReembolso }])
+    ], paisDe('ORC-90', 'ORC-91'));
+
+    assert.equal(resultado.length, 2);
+    assert.equal(resultado.find(r => r.pagamentoId === 'pag-cancelado').movimento.status, STATUS_MOVIMENTO.CANCELADO);
+    assert.equal(resultado.find(r => r.pagamentoId === 'pag-reembolso').movimento.tipo, TIPOS_MOVIMENTO.REEMBOLSO);
+});
+
+test('ordem determinística: por orcamentoId e pagamentoId, e a auditoria por versão numérica (v10 depois de v2)', () => {
+    const { v1: base } = construirCadeiaCompleta();
+
+    // Dois registros em ordem "errada" de chegada: ORC-90/pag-2 antes de ORC-2/pag-1.
+    const eventoBase = criarEventoAuditoria('criacao', null, base, { registradoEm: base.criadoEm, registradoPor: 'u' });
+    const resultado = prepararPagamentosParaBackup([
+        registro('ORC-90', 'pag-2', base, [{ eventoId: 'v1', dados: eventoBase }]),
+        registro('ORC-2', 'pag-1', base, [{ eventoId: 'v1', dados: eventoBase }])
+    ], paisDe('ORC-90', 'ORC-2'));
+    assert.deepEqual(resultado.map(r => r.orcamentoId + '/' + r.pagamentoId), ['ORC-2/pag-1', 'ORC-90/pag-2']);
+
+    // Cadeia longa (v1..v11): auditoria fora de ordem lexical não pode enganar a ordenação numérica.
+    let atual = criar();
+    const cadeiaLonga = [criarEventoAuditoria('criacao', null, atual, { registradoEm: atual.criadoEm, registradoPor: 'u' })];
+    for (let i = 0; i < 10; i++) {
+        const anterior = atual;
+        atual = corrigirMovimento(anterior, { valorCentavos: anterior.valorCentavos + 100 }, { hoje: HOJE });
+        cadeiaLonga.push(criarEventoAuditoria('correcao', anterior, atual, { registradoEm: atual.atualizadoEm, registradoPor: 'u' }));
+    }
+    const eventosEmbaralhados = [...cadeiaLonga].sort(() => Math.random() - 0.5)
+        .map(dados => ({ eventoId: idDoEventoDaVersao(dados.versaoNova), dados }));
+    const resultadoLongo = prepararPagamentosParaBackup([registro('ORC-1', 'pag-longo', atual, eventosEmbaralhados)], paisDe('ORC-1'));
+    assert.deepEqual(
+        resultadoLongo[0].auditoria.map(e => e.eventoId),
+        Array.from({ length: 11 }, (_, i) => 'v' + (i + 1)),
+        'v10 e v11 vêm depois de v2..v9, não antes (a ordenação é numérica, não lexical)'
+    );
+});
+
+test('prepararPagamentosParaBackup recusa entrada que não é um array', () => {
+    assert.throws(() => prepararPagamentosParaBackup({}, paisDe('ORC-90')), ErroMovimento);
+    assert.throws(() => prepararPagamentosParaBackup('x', paisDe('ORC-90')), ErroMovimento);
+    assert.throws(() => prepararPagamentosParaBackup(null, paisDe('ORC-90')), ErroMovimento);
+});
+
+test('prepararPagamentosParaBackup recusa mapa de pais ausente ou que não é mapa', () => {
+    const { v3, eventos } = construirCadeiaCompleta();
+    const lista = [registro('ORC-90', 'pag-1', v3, eventos)];
+    for (const paisInvalidos of [undefined, null, [], 'x', 7]) {
+        assert.throws(
+            () => prepararPagamentosParaBackup(lista, paisInvalidos),
+            erro => erro instanceof ErroMovimento && erro.codigo === 'orcamentos-do-backup-invalidos',
+            'sem mapa de pais não há como certificar o pai de cada pagamento'
+        );
+    }
+});
+
+test('prepararPagamentosParaBackup não muta os registros de entrada', () => {
+    const { v3, eventos } = construirCadeiaCompleta();
+    const entrada = congelarProfundamente([registro('ORC-90', 'pag-1', v3, [eventos[2], eventos[0], eventos[1]])]);
+    assert.doesNotThrow(() => prepararPagamentosParaBackup(entrada, paisDe('ORC-90')));
+});
+
+// --- Certificação do PAI financeiro no backup ----------------------------------------------------
+// Semântica deliberada aqui: pedidoTemSnapshotV2Valido(), não pedidoParticipaFinanceiro(). Um pedido
+// cancelado depois continua tendo histórico financeiro legítimo a exportar.
+
+test('backup exporta pagamento de pedido v2 cancelado depois (histórico continua válido)', () => {
+    const { v3, eventos } = construirCadeiaCompleta();
+    const pais = { 'ORC-90': cancelarPedido(criarPedidoV2({ id: 'ORC-90' }), CANCELAMENTO_PEDIDO) };
+
+    const resultado = prepararPagamentosParaBackup([registro('ORC-90', 'pag-1', v3, eventos)], pais);
+    assert.equal(resultado.length, 1, 'cancelar o pedido não apaga o histórico financeiro do backup');
+});
+
+test('backup aborta quando o orcamentoId do pagamento não existe entre os orçamentos exportados', () => {
+    const { v3, eventos } = construirCadeiaCompleta();
+    assert.throws(
+        () => prepararPagamentosParaBackup([registro('ORC-404', 'pag-1', v3, eventos)], paisDe('ORC-90')),
+        erro => erro instanceof ErroMovimento
+            && erro.codigo === 'pai-do-pagamento-ausente'
+            && erro.message.includes('ORC-404')
+            && erro.message.includes('pag-1')
+            && erro.message.includes('Nenhum arquivo foi gerado')
+    );
+});
+
+test('backup aborta com pagamento sob pedido v1, sob orçamento em negociação ou sob snapshot v2 inválido', () => {
+    const { v3, eventos } = construirCadeiaCompleta();
+    const lista = [registro('ORC-90', 'pag-1', v3, eventos)];
+
+    const snapshotInvalido = criarPedidoV2({ id: 'ORC-90' });
+    snapshotInvalido.pedido.financeiro.valorComissaoCentavos += 1;
+
+    const paisImpossiveis = {
+        'pedido v1': { 'ORC-90': criarPedidoV1() },
+        'orcamento em negociacao': { 'ORC-90': criarOrcamento({ id: 'ORC-90' }) },
+        'snapshot v2 invalido': { 'ORC-90': snapshotInvalido },
+        'pai nulo': { 'ORC-90': null }
+    };
+
+    for (const [rotulo, pais] of Object.entries(paisImpossiveis)) {
+        assert.throws(
+            () => prepararPagamentosParaBackup(lista, pais),
+            erro => erro instanceof ErroMovimento
+                && ['pai-do-pagamento-invalido', 'pai-do-pagamento-ausente'].includes(erro.codigo)
+                && erro.message.includes('Nenhum arquivo foi gerado'),
+            'pagamento sob ' + rotulo + ' não pode ser exportado'
+        );
+    }
+});
+
+// --- Identidade única do par pedido+pagamento ----------------------------------------------------
+
+test('backup aborta quando o mesmo pedido+pagamento aparece duas vezes', () => {
+    const { v3, eventos } = construirCadeiaCompleta();
+    const duplicado = registro('ORC-90', 'pag-1', v3, eventos);
+    assert.throws(
+        () => prepararPagamentosParaBackup([duplicado, { ...duplicado }], paisDe('ORC-90')),
+        erro => erro instanceof ErroMovimento
+            && erro.codigo === 'pagamento-duplicado-no-backup'
+            && erro.message.includes('pag-1')
+            && erro.message.includes('ORC-90')
+            && erro.message.includes('Nenhum arquivo foi gerado')
+    );
+});
+
+test('o mesmo pagamentoId sob pedidos diferentes é permitido (ids são por subcoleção)', () => {
+    const { v3, eventos } = construirCadeiaCompleta();
+    const resultado = prepararPagamentosParaBackup([
+        registro('ORC-90', 'pag-1', v3, eventos),
+        registro('ORC-91', 'pag-1', v3, eventos)
+    ], paisDe('ORC-90', 'ORC-91'));
+
+    assert.deepEqual(resultado.map(r => r.orcamentoId + '/' + r.pagamentoId), ['ORC-90/pag-1', 'ORC-91/pag-1']);
 });

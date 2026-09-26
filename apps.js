@@ -37,9 +37,27 @@ import { converterInstanteParaDataCivil, ehDataCivilValida, obterDataCivilAtual 
 import { listarFollowUps } from './followup-domain.js';
 import { gerarRelatorioVendas } from './sales-report-domain.js';
 import {
+    ErroMovimento,
+    FORMAS_PAGAMENTO,
+    SITUACOES_FINANCEIRAS,
+    STATUS_MOVIMENTO,
+    TIPOS_MOVIMENTO,
+    calcularSituacaoFinanceira,
+    obterValorReceberCentavos,
+    pedidoTemSnapshotV2Valido,
+    prepararPagamentosParaBackup
+} from './payments-domain.js';
+import {
+    ErroOperacaoMovimento,
+    cancelarMovimentoComTransacao,
+    corrigirMovimentoComTransacao,
+    registrarMovimentoComTransacao
+} from './payment-transactions.js';
+import {
     arredondamentoFinanceiro,
     calcularDetalhesItem,
     calcularPrecoFinal,
+    converterValorParaCentavos,
     interpretarPercentualComissao,
     normalizarUnidadeMedida,
     validarParametrosProduto,
@@ -74,10 +92,41 @@ let paginaAtual = 1;
 const itensPorPagina = 10;
 let estadoOrdenacao = { coluna: 'codigo', direcao: 'asc' };
 const dataVersion = "2.0"; // Versão para controle de backup
+// Maior versaoBackup que esta versão do app sabe ler. Um arquivo futuro com versaoBackup maior pode
+// usar um contrato de pagamentos/auditoria que esta versão não entende — melhor recusar do que
+// tentar interpretar parcialmente.
+const VERSAO_BACKUP_SUPORTADA = 2;
 const orcamentosComAlteracoesPendentes = new Set();
 let temporizadorNotificacao = null;
 // Evita confirmações simultâneas do mesmo pedido pela mesma aba enquanto a transação está em curso.
 let confirmacaoDePedidoEmAndamento = false;
+// Movimentos financeiros (recebimentos/reembolsos) do pedido atualmente selecionado. Um único
+// listener por vez, na subcoleção pagamentos do pedido em foco — nunca N listeners permanentes.
+let movimentosDoOrcamentoAtual = [];
+let unsubscribeMovimentosFinanceiros = null;
+let orcamentoIdDoListenerFinanceiro = null;
+// Geração do listener financeiro: incrementada a cada assinatura nova. Um callback que chega depois de
+// a seleção ter mudado carrega uma geração antiga e é descartado, em vez de sobrescrever o estado do
+// pedido que está em foco agora. NÃO depende da suposição de que unsubscribe() cancela callbacks já
+// enfileirados — dinheiro na tela não pode depender disso.
+let geracaoListenerFinanceiro = 0;
+let operacaoFinanceiraEmAndamento = false;
+// Estado do modal de recebimento/reembolso/edição: 'criar' ou 'editar', e qual lançamento/tipo/versão.
+let modoMovimentoFinanceiro = null;
+let pagamentoIdEmEdicao = null;
+let tipoMovimentoEmEdicao = null;
+let versaoMovimentoEmEdicao = null;
+// Estado do modal de cancelamento de lançamento.
+let pagamentoIdParaCancelar = null;
+let versaoMovimentoParaCancelar = null;
+// Cache local de Contas a Receber: busca pontual por pedido quando a seção é aberta (sem listener
+// permanente e sem collectionGroup, para não exigir índice novo).
+let contasAReceberCarregadas = [];
+// Falha ao ler os pagamentos de QUALQUER pedido participante não é "zero pagamentos": enquanto este
+// sinalizador estiver ligado, a seção fica em estado de erro e nenhuma tabela é pintada, nem ao trocar
+// o filtro — uma lista parcial (ou vazia) apresentada como resultado financeiro válido seria pior do
+// que não mostrar nada.
+let contasAReceberComFalha = false;
 // Campo de celular -> link de WhatsApp e texto de ajuda correspondentes.
 const CONTATOS_WHATSAPP = {
     celularCliente: { link: 'whatsappCliente', ajuda: 'ajudaCelularCliente' },
@@ -301,6 +350,8 @@ function atualizarInterfacePedido() {
 
     document.querySelectorAll('.btn-item-action, .btn-produto-action, .btn-add-item-to-produto')
         .forEach(botao => { botao.disabled = bloqueado; });
+
+    atualizarListenerFinanceiroDoPedido();
 }
 
 function aplicarPedidoGravadoLocalmente(id, documento) {
@@ -662,6 +713,17 @@ function detachAllListeners() {
     console.log(`Desanexando ${unsubscribeListeners.length} listeners do Firestore...`);
     unsubscribeListeners.forEach(unsubscribe => unsubscribe());
     unsubscribeListeners = []; // Limpa o array para a próxima sessão de login
+    if (unsubscribeMovimentosFinanceiros) {
+        unsubscribeMovimentosFinanceiros();
+        unsubscribeMovimentosFinanceiros = null;
+    }
+    orcamentoIdDoListenerFinanceiro = null;
+    movimentosDoOrcamentoAtual = [];
+    // Invalida também a geração: qualquer callback financeiro ainda enfileirado morre aqui, sem
+    // repintar dados de uma sessão que já foi encerrada.
+    geracaoListenerFinanceiro++;
+    contasAReceberCarregadas = [];
+    contasAReceberComFalha = false;
 }
 
 
@@ -761,6 +823,35 @@ window.addEventListener('beforeunload', (event) => {
         document.getElementById('btn-financeiro-este-mes').addEventListener('click', () => aplicarAtalhoPeriodoFinanceiro('esteMes'));
         document.getElementById('btn-financeiro-mes-anterior').addEventListener('click', () => aplicarAtalhoPeriodoFinanceiro('mesAnterior'));
         document.getElementById('financeiroTabelaContainer').addEventListener('click', (event) => {
+            const botaoAbrir = event.target.closest('.btn-abrir-orcamento');
+            if (botaoAbrir) abrirOrcamentoDoFollowUp(botaoAbrir.dataset.orcamentoId);
+        });
+        document.getElementById('financeiroPedidoConteudo').addEventListener('click', (event) => {
+            if (event.target.closest('#btn-registrar-recebimento')) {
+                abrirModalMovimentoFinanceiro(TIPOS_MOVIMENTO.RECEBIMENTO);
+                return;
+            }
+            if (event.target.closest('#btn-registrar-reembolso')) {
+                abrirModalMovimentoFinanceiro(TIPOS_MOVIMENTO.REEMBOLSO);
+                return;
+            }
+            const botaoEditar = event.target.closest('.btn-editar-movimento');
+            if (botaoEditar) {
+                abrirModalEdicaoMovimento(botaoEditar.dataset.pagamentoId);
+                return;
+            }
+            const botaoCancelar = event.target.closest('.btn-cancelar-movimento');
+            if (botaoCancelar) abrirModalCancelarMovimento(botaoCancelar.dataset.pagamentoId);
+        });
+        document.getElementById('btn-fechar-movimento-financeiro').addEventListener('click', fecharModalMovimentoFinanceiro);
+        document.getElementById('btn-voltar-movimento-financeiro').addEventListener('click', fecharModalMovimentoFinanceiro);
+        document.getElementById('btn-confirmar-movimento-financeiro').addEventListener('click', confirmarMovimentoFinanceiro);
+        document.getElementById('btn-fechar-cancelar-movimento').addEventListener('click', fecharModalCancelarMovimento);
+        document.getElementById('btn-voltar-cancelar-movimento').addEventListener('click', fecharModalCancelarMovimento);
+        document.getElementById('btn-confirmar-cancelamento-movimento').addEventListener('click', confirmarCancelamentoMovimento);
+        document.getElementById('contasReceberFiltroSituacao').addEventListener('change', renderizarContasAReceber);
+        document.getElementById('btn-atualizar-contas-a-receber').addEventListener('click', carregarContasAReceber);
+        document.getElementById('contasReceberTabelaContainer').addEventListener('click', (event) => {
             const botaoAbrir = event.target.closest('.btn-abrir-orcamento');
             if (botaoAbrir) abrirOrcamentoDoFollowUp(botaoAbrir.dataset.orcamentoId);
         });
@@ -1026,6 +1117,7 @@ window.addEventListener('beforeunload', (event) => {
             renderizarFollowUps();
         } else if (painelAtivo?.id === 'tab-financeiro') {
             renderizarFinanceiro();
+            carregarContasAReceber();
         }
     }
 
@@ -2434,16 +2526,51 @@ window.addEventListener('beforeunload', (event) => {
         window.print();
     }
 
-    function exportarDados() {
-        const data = {
+    // Lê, para cada orçamento carregado, sua subcoleção de pagamentos e, para cada pagamento, sua
+    // subcoleção de auditoria — sem collectionGroup, para não exigir nenhum índice novo (mesmo padrão
+    // de busca pontual usado em Contas a Receber). Uma falha de leitura em QUALQUER pagamento ou
+    // auditoria propaga para cima: o backup nunca é gerado parcialmente incompleto.
+    async function coletarPagamentosParaBackup() {
+        const resultado = [];
+        for (const orcamentoId of Object.keys(orcamentosSalvos)) {
+            const pagamentosSnap = await getDocs(collection(db, 'orcamentos', orcamentoId, 'pagamentos'));
+            for (const pagamentoDoc of pagamentosSnap.docs) {
+                const pagamentoId = pagamentoDoc.id;
+                const auditoriaSnap = await getDocs(collection(db, 'orcamentos', orcamentoId, 'pagamentos', pagamentoId, 'auditoria'));
+                const auditoria = auditoriaSnap.docs.map(eventoDoc => ({ eventoId: eventoDoc.id, dados: eventoDoc.data() }));
+                resultado.push({ orcamentoId, pagamentoId, movimento: pagamentoDoc.data(), auditoria });
+            }
+        }
+        return resultado;
+    }
+
+    // Monta o payload final do backup a partir do que já foi coletado do Firestore. NÃO toca a rede:
+    // só valida e ordena. Fail-closed — se prepararPagamentosParaBackup() reprovar qualquer registro
+    // (par pedido+pagamento duplicado, pai ausente/não-v2-válido, ou cadeia de auditoria inconsistente),
+    // lança e esta função nunca retorna um payload; o backup representa, portanto, só o que já sabemos
+    // ser estruturalmente restaurável no domínio e associável a um pai válido dentro do próprio arquivo.
+    function montarDadosBackup(pagamentosColetados) {
+        return {
             version: dataVersion,
+            // Marca que este arquivo já cobre pagamentos + auditoria (Etapa 4B2A). Independente do
+            // dataVersion, que descreve o formato de precos/orcamentos.
+            versaoBackup: 2,
             exportadoEm: new Date().toISOString(),
             precos: precos,
             fornecedores: fornecedores,
             categorias: categorias,
             unidadesDeMedida: unidadesDeMedida,
-            orcamentosSalvos: orcamentosSalvos
+            orcamentosSalvos: orcamentosSalvos,
+            // Identidade, pai e cadeia certificados, em ordem determinística (orcamentoId, pagamentoId,
+            // versaoNova numérica): nunca a ordem natural de retorno do Firestore. O mapa de pais é o
+            // MESMO objeto exportado acima, para que a certificação valha sobre o conteúdo do arquivo.
+            pagamentos: prepararPagamentosParaBackup(pagamentosColetados, orcamentosSalvos)
         };
+    }
+
+    // Só recebe payload já validado por montarDadosBackup(): esta função nunca decide se o backup é
+    // seguro, só o materializa em arquivo.
+    function baixarBackup(data) {
         const dataStr = JSON.stringify(data, null, 2);
         const blob = new Blob([dataStr], { type: 'application/json' });
         const url = URL.createObjectURL(blob);
@@ -2454,7 +2581,41 @@ window.addEventListener('beforeunload', (event) => {
         a.click();
         document.body.removeChild(a);
         URL.revokeObjectURL(url);
-        mostrarNotificacao("Backup concluído com sucesso!");
+    }
+
+    async function exportarDados() {
+        atualizarStatusSincronizacao('Preparando backup…', 'loading');
+        let pagamentosColetados;
+        try {
+            pagamentosColetados = await coletarPagamentosParaBackup();
+        } catch (error) {
+            // Falha de LEITURA do Firestore: nunca gerar arquivo, porque um backup sem pagamentos por
+            // causa disso seria um backup incompleto disfarçado de completo.
+            console.error('Falha ao coletar pagamentos/auditoria para o backup:', error);
+            atualizarStatusSincronizacao('Falha ao preparar backup', 'error');
+            mostrarNotificacao(`Não foi possível gerar o backup: falha ao ler pagamentos/auditoria (${error.message}). Nenhum arquivo foi gerado.`, 'erro');
+            return;
+        }
+
+        let data;
+        try {
+            data = montarDadosBackup(pagamentosColetados);
+        } catch (error) {
+            // Falha de INTEGRIDADE da cadeia financeira: distinta da falha de leitura acima, mas o
+            // resultado é o mesmo — nenhum arquivo, e a mensagem aponta exatamente qual lançamento
+            // impediu a exportação.
+            console.error('Cadeia financeira inconsistente ao montar o backup:', error);
+            atualizarStatusSincronizacao('Falha ao preparar backup', 'error');
+            const mensagem = error instanceof ErroMovimento
+                ? error.message
+                : `Não foi possível gerar o backup: histórico financeiro inconsistente (${error.message}). Nenhum arquivo foi gerado.`;
+            mostrarNotificacao(mensagem, 'erro');
+            return;
+        }
+
+        baixarBackup(data);
+        atualizarStatusSincronizacao('Dados sincronizados', 'ok');
+        mostrarNotificacao(`Backup concluído com sucesso! ${data.pagamentos.length} pagamento(s) incluído(s).`);
     }
 
     async function gravarDocumentosEmLotes(documentos) {
@@ -2475,13 +2636,39 @@ window.addEventListener('beforeunload', (event) => {
         try {
             const importedData = JSON.parse(await file.text());
             const colecoesArray = ['precos', 'fornecedores', 'categorias', 'unidadesDeMedida'];
+            // Contrato de `pagamentos`: campo AUSENTE é backup legado (fluxo antigo, sem pagamentos);
+            // um ARRAY (vazio ou não) é o único formato aceito quando presente. Qualquer outra coisa —
+            // objeto, string, número, `null` — é backup malformado e não deve ser tratado como "sem
+            // pagamentos": rejeitar explicitamente, nunca converter silenciosamente em array vazio.
+            const pagamentosPresente = 'pagamentos' in importedData;
+            const pagamentosEstruturalmenteValido = !pagamentosPresente || Array.isArray(importedData.pagamentos);
+            // versaoBackup, quando declarada, precisa ser um inteiro que esta versão do app conhece.
+            const versaoBackupValida = importedData.versaoBackup === undefined
+                || (Number.isInteger(importedData.versaoBackup) && importedData.versaoBackup <= VERSAO_BACKUP_SUPORTADA);
             const estruturaValida = importedData
                 && typeof importedData === 'object'
                 && colecoesArray.every(nome => importedData[nome] === undefined || Array.isArray(importedData[nome]))
-                && (importedData.orcamentosSalvos === undefined || typeof importedData.orcamentosSalvos === 'object');
+                && (importedData.orcamentosSalvos === undefined || typeof importedData.orcamentosSalvos === 'object')
+                && pagamentosEstruturalmenteValido
+                && versaoBackupValida;
 
             if (!estruturaValida) {
                 throw new Error('Estrutura de backup inválida.');
+            }
+
+            // BLOQUEIO DELIBERADO (Etapa 4B2A): a restauração financeira privilegiada (Etapa 4B2R) ainda
+            // não existe. Um backup com histórico de pagamentos não pode ser restaurado parcialmente —
+            // restaurar só os orçamentos e deixar os pagamentos para trás produziria um estado
+            // inconsistente (pedido com saldo/situação divergente do que existia quando o backup foi
+            // feito). Por isso a checagem é a primeira coisa depois de validar a estrutura do arquivo,
+            // antes de montar `documentos` ou de qualquer gravação: zero writes quando há pagamentos.
+            // `pagamentos: []` (array vazio) segue pelo fluxo normal, como um backup sem histórico.
+            if (Array.isArray(importedData.pagamentos) && importedData.pagamentos.length > 0) {
+                throw new Error(
+                    'Este backup contém histórico financeiro. A restauração de pagamentos ainda exige o '
+                    + 'módulo de restauração financeira segura e não pode ser executada por esta versão. '
+                    + 'Nenhuma alteração foi feita.'
+                );
             }
 
             if (importedData.version !== dataVersion && importedData.version !== '1.0') {
@@ -2807,6 +2994,18 @@ window.addEventListener('beforeunload', (event) => {
             </div>`;
     }
 
+    // Mesmo visual do card acima, mas com um atributo de dados próprio: os cards do relatório de
+    // vendas (por período) e os do financeiro de UM pedido usam chaves com significados diferentes
+    // (ex.: "pedidos" é uma contagem num, "valorReceber" é o recebível de um pedido só); manter os
+    // dois na mesma "gaveta" data-financeiro seria uma coincidência de nomes, não um contrato real.
+    function criarCardFinanceiroPedido(chave, rotulo, valor) {
+        return `
+            <div class="financeiro-card">
+                <span class="financeiro-card-rotulo">${escaparHtml(rotulo)}</span>
+                <span class="financeiro-card-valor" data-financeiro-pedido="${chave}">${valor}</span>
+            </div>`;
+    }
+
     function criarLinhaFinanceira(venda) {
         return `
             <tr>
@@ -2896,6 +3095,505 @@ window.addEventListener('beforeunload', (event) => {
             </table>`;
     }
     // --- FIM: ABA FINANCEIRO (ETAPA 3B2) ---
+
+    // --- INÍCIO: PAGAMENTOS DO PEDIDO E CONTAS A RECEBER (ETAPA 4B2A) ---
+    // Toda regra financeira (saldo, situação, elegibilidade) vem exclusivamente de payments-domain.js;
+    // nada aqui recalcula ou duplica essa lógica. As escritas passam sempre por payment-transactions.js,
+    // que já valida ator, conflito de versão e conexão antes de tocar o Firestore.
+
+    function situacaoParaClasse(situacao) {
+        if (situacao === SITUACOES_FINANCEIRAS.QUITADO) return 'quitado';
+        if (situacao === SITUACOES_FINANCEIRAS.EXCEDENTE) return 'excedente';
+        if (situacao === SITUACOES_FINANCEIRAS.PARCIALMENTE_PAGO) return 'parcial';
+        return 'aberto';
+    }
+
+    function preencherSelectFormaPagamento(select, selecionado = '') {
+        if (!select) return;
+        select.innerHTML = FORMAS_PAGAMENTO.map(forma => `<option value="${escaparHtml(forma)}">${escaparHtml(forma)}</option>`).join('');
+        select.value = selecionado && FORMAS_PAGAMENTO.includes(selecionado) ? selecionado : FORMAS_PAGAMENTO[0];
+    }
+
+    // Um único listener por vez, na subcoleção pagamentos do pedido em foco. Ao trocar de pedido (ou
+    // sair de um pedido v2 elegível), o listener anterior é sempre desligado antes de abrir o próximo.
+    //
+    // O listener muda SOMENTE quando muda a identidade/elegibilidade do pedido observado: um snapshot do
+    // próprio listener repinta a interface e não passa por aqui, então não há unsubscribe/resubscribe a
+    // cada atualização de pagamentos.
+    function atualizarListenerFinanceiroDoPedido() {
+        const orcamento = obterOrcamentoAtual();
+        const elegivel = Boolean(orcamento) && pedidoTemSnapshotV2Valido(orcamento);
+        const idAlvo = elegivel ? orcamentoAtualId : null;
+
+        if (orcamentoIdDoListenerFinanceiro === idAlvo) {
+            // Mesmo pedido (ou nenhum dos dois é elegível): só repintar, o pedido pode ter mudado
+            // (ex.: acabou de ser cancelado) mesmo sem trocar de listener.
+            renderizarFinanceiroDoPedido();
+            return;
+        }
+
+        if (unsubscribeMovimentosFinanceiros) {
+            unsubscribeMovimentosFinanceiros();
+            unsubscribeMovimentosFinanceiros = null;
+        }
+        orcamentoIdDoListenerFinanceiro = idAlvo;
+        movimentosDoOrcamentoAtual = [];
+
+        if (!idAlvo) {
+            renderizarFinanceiroDoPedido();
+            return;
+        }
+
+        // Cada assinatura recebe sua própria geração. Os callbacks conferem geração E pedido esperado
+        // antes de escrever qualquer coisa: um callback atrasado do pedido anterior é descartado.
+        const geracaoDestaAssinatura = ++geracaoListenerFinanceiro;
+        const ehCallbackAtual = () => geracaoDestaAssinatura === geracaoListenerFinanceiro
+            && orcamentoIdDoListenerFinanceiro === idAlvo;
+
+        const pagamentosRef = collection(db, 'orcamentos', idAlvo, 'pagamentos');
+        unsubscribeMovimentosFinanceiros = onSnapshot(pagamentosRef, (snapshot) => {
+            if (!ehCallbackAtual()) return;
+            movimentosDoOrcamentoAtual = snapshot.docs.map(documento => ({ ...documento.data(), pagamentoId: documento.id }));
+            renderizarFinanceiroDoPedido();
+        }, (error) => {
+            if (!ehCallbackAtual()) return;
+            console.error('Listener de pagamentos do pedido:', error);
+            movimentosDoOrcamentoAtual = [];
+            renderizarFinanceiroDoPedido();
+        });
+    }
+
+    function criarLinhaMovimento(movimento) {
+        const cancelado = movimento.status === STATUS_MOVIMENTO.CANCELADO;
+        const tipoTexto = movimento.tipo === TIPOS_MOVIMENTO.REEMBOLSO ? 'Reembolso' : 'Recebimento';
+        const statusTexto = cancelado
+            ? `Cancelado — ${escaparHtml(movimento.motivoCancelamento || 'sem motivo registrado')}`
+            : 'Ativo';
+        const acoes = cancelado
+            ? ''
+            : `<button type="button" class="btn btn-secondary btn-sm btn-editar-movimento" data-pagamento-id="${escaparHtml(movimento.pagamentoId)}">Editar</button>
+               <button type="button" class="btn btn-cancelar-pedido btn-sm btn-cancelar-movimento" data-pagamento-id="${escaparHtml(movimento.pagamentoId)}">Cancelar lançamento</button>`;
+        return `
+            <tr class="${cancelado ? 'movimento-financeiro-cancelado' : ''}">
+                <td data-label="Data" class="followup-sem-quebra">${escaparHtml(formatarData(movimento.dataMovimento))}</td>
+                <td data-label="Tipo" class="followup-sem-quebra">${tipoTexto}</td>
+                <td data-label="Forma">${escaparHtml(movimento.formaPagamento || '')}</td>
+                <td data-label="Valor" class="followup-sem-quebra">${formatarMoeda(movimento.valorCentavos / 100)}</td>
+                <td data-label="Observação">${escaparHtml(movimento.observacao || '')}</td>
+                <td data-label="Status">${statusTexto}</td>
+                <td data-label="Ações">${acoes}</td>
+            </tr>`;
+    }
+
+    function criarHistoricoMovimentos(movimentos) {
+        if (!movimentos || movimentos.length === 0) {
+            return '<p class="followup-vazio">Nenhum lançamento registrado ainda.</p>';
+        }
+        const ordenados = [...movimentos].sort((a, b) => (
+            (b.dataMovimento || '').localeCompare(a.dataMovimento || '')
+                || (b.criadoEm || '').localeCompare(a.criadoEm || '')
+        ));
+        return `
+            <table class="followups-table financeiro-tabela-pedido">
+                <thead>
+                    <tr>
+                        <th scope="col">Data</th>
+                        <th scope="col">Tipo</th>
+                        <th scope="col">Forma</th>
+                        <th scope="col">Valor</th>
+                        <th scope="col">Observação</th>
+                        <th scope="col">Status</th>
+                        <th scope="col">Ações</th>
+                    </tr>
+                </thead>
+                <tbody>${ordenados.map(criarLinhaMovimento).join('')}</tbody>
+            </table>`;
+    }
+
+    function renderizarFinanceiroDoPedido() {
+        const container = document.getElementById('financeiroPedidoCardContainer');
+        const conteudo = document.getElementById('financeiroPedidoConteudo');
+        if (!container || !conteudo) return;
+
+        const orcamento = obterOrcamentoAtual();
+        const elegivel = Boolean(orcamento) && pedidoTemSnapshotV2Valido(orcamento);
+        container.hidden = !elegivel;
+        if (!elegivel) {
+            conteudo.innerHTML = '';
+            return;
+        }
+
+        const situacao = calcularSituacaoFinanceira(orcamento, movimentosDoOrcamentoAtual);
+        const aceitaRecebimentoNovo = pedidoParticipaFinanceiro(orcamento);
+        const moeda = centavos => formatarMoeda(centavos / 100);
+        const excedenteTexto = situacao.excedenteCentavos > 0 ? ` (excedente de ${moeda(situacao.excedenteCentavos)})` : '';
+
+        conteudo.innerHTML = `
+            <div class="financeiro-cards">
+                ${criarCardFinanceiroPedido('valorReceber', 'Valor a receber', moeda(situacao.valorReceberCentavos))}
+                ${criarCardFinanceiroPedido('totalRecebido', 'Total recebido', moeda(situacao.recebidoCentavos))}
+                ${criarCardFinanceiroPedido('totalReembolsado', 'Total reembolsado', moeda(situacao.reembolsadoCentavos))}
+                ${criarCardFinanceiroPedido('saldo', 'Saldo', moeda(situacao.saldoCentavos))}
+            </div>
+            <p class="situacao-financeira situacao-financeira-${situacaoParaClasse(situacao.situacao)}" data-financeiro-pedido="situacao">Situação: ${escaparHtml(situacao.situacao)}${excedenteTexto}</p>
+            <div class="financeiro-pedido-acoes">
+                <button id="btn-registrar-recebimento" class="btn btn-success" type="button" ${aceitaRecebimentoNovo ? '' : 'disabled'}>Registrar recebimento</button>
+                <button id="btn-registrar-reembolso" class="btn btn-secondary" type="button">Registrar reembolso</button>
+            </div>
+            ${!aceitaRecebimentoNovo ? '<p class="resumo-interno-aviso" role="status">Pedido cancelado: não aceita novo recebimento, mas reembolsos continuam possíveis e o histórico pode ser corrigido.</p>' : ''}
+            ${criarHistoricoMovimentos(movimentosDoOrcamentoAtual)}
+        `;
+    }
+
+    function abrirModalMovimentoFinanceiro(tipo) {
+        const orcamento = obterOrcamentoAtual();
+        if (!orcamento) return;
+        if (tipo === TIPOS_MOVIMENTO.RECEBIMENTO && !pedidoParticipaFinanceiro(orcamento)) {
+            mostrarNotificacao('Este pedido não aceita novo recebimento.');
+            return;
+        }
+        if (!auth.currentUser) {
+            mostrarNotificacao('Faça login novamente para registrar um lançamento financeiro.');
+            return;
+        }
+
+        modoMovimentoFinanceiro = 'criar';
+        pagamentoIdEmEdicao = null;
+        tipoMovimentoEmEdicao = tipo;
+        versaoMovimentoEmEdicao = null;
+
+        const hoje = obterDataCivilAtual();
+        document.getElementById('tituloMovimentoFinanceiro').textContent = tipo === TIPOS_MOVIMENTO.REEMBOLSO
+            ? 'Registrar reembolso' : 'Registrar recebimento';
+        document.getElementById('avisoTipoMovimentoFinanceiro').textContent = tipo === TIPOS_MOVIMENTO.REEMBOLSO
+            ? 'Reembolso: dinheiro devolvido ao cliente. Reduz o total recebido deste pedido.'
+            : 'Recebimento: dinheiro efetivamente recebido do cliente.';
+        const campoData = document.getElementById('movimentoData');
+        campoData.value = hoje;
+        campoData.max = hoje;
+        document.getElementById('movimentoValor').value = '';
+        preencherSelectFormaPagamento(document.getElementById('movimentoForma'));
+        document.getElementById('movimentoObservacao').value = '';
+        document.getElementById('ajudaMovimentoFinanceiro').textContent = '';
+        document.getElementById('btn-confirmar-movimento-financeiro').textContent = 'Confirmar';
+        abrirModal('modalMovimentoFinanceiro');
+    }
+
+    function abrirModalEdicaoMovimento(pagamentoId) {
+        const movimento = movimentosDoOrcamentoAtual.find(item => item.pagamentoId === pagamentoId);
+        if (!movimento || movimento.status === STATUS_MOVIMENTO.CANCELADO) return;
+        if (!auth.currentUser) {
+            mostrarNotificacao('Faça login novamente para editar um lançamento financeiro.');
+            return;
+        }
+
+        modoMovimentoFinanceiro = 'editar';
+        pagamentoIdEmEdicao = pagamentoId;
+        tipoMovimentoEmEdicao = movimento.tipo;
+        versaoMovimentoEmEdicao = movimento.versao;
+
+        document.getElementById('tituloMovimentoFinanceiro').textContent = movimento.tipo === TIPOS_MOVIMENTO.REEMBOLSO
+            ? 'Editar reembolso' : 'Editar recebimento';
+        document.getElementById('avisoTipoMovimentoFinanceiro').textContent = 'O tipo do lançamento não pode ser alterado.';
+        const campoData = document.getElementById('movimentoData');
+        campoData.value = movimento.dataMovimento;
+        campoData.max = obterDataCivilAtual();
+        document.getElementById('movimentoValor').value = (movimento.valorCentavos / 100).toFixed(2);
+        preencherSelectFormaPagamento(document.getElementById('movimentoForma'), movimento.formaPagamento);
+        document.getElementById('movimentoObservacao').value = movimento.observacao || '';
+        document.getElementById('ajudaMovimentoFinanceiro').textContent = '';
+        document.getElementById('btn-confirmar-movimento-financeiro').textContent = 'Salvar correção';
+        abrirModal('modalMovimentoFinanceiro');
+    }
+
+    function fecharModalMovimentoFinanceiro() {
+        fecharModal('modalMovimentoFinanceiro');
+        modoMovimentoFinanceiro = null;
+        pagamentoIdEmEdicao = null;
+        tipoMovimentoEmEdicao = null;
+        versaoMovimentoEmEdicao = null;
+    }
+
+    async function confirmarMovimentoFinanceiro() {
+        if (operacaoFinanceiraEmAndamento) return;
+        const orcamento = obterOrcamentoAtual();
+        const uid = auth.currentUser?.uid || null;
+        const ajuda = document.getElementById('ajudaMovimentoFinanceiro');
+        const botao = document.getElementById('btn-confirmar-movimento-financeiro');
+        ajuda.textContent = '';
+
+        if (!orcamento || !uid) {
+            ajuda.textContent = 'Sessão sem usuário identificado: faça login novamente.';
+            return;
+        }
+
+        const dataMovimento = document.getElementById('movimentoData').value;
+        const valorDigitado = document.getElementById('movimentoValor').value;
+        const formaPagamento = document.getElementById('movimentoForma').value;
+        const observacao = document.getElementById('movimentoObservacao').value;
+        const valorCentavos = converterValorParaCentavos(valorDigitado);
+
+        if (!dataMovimento) {
+            ajuda.textContent = 'Informe a data.';
+            return;
+        }
+        if (!(valorCentavos > 0)) {
+            ajuda.textContent = 'Informe um valor maior que zero.';
+            return;
+        }
+
+        // Excedente nunca bloqueia: só avisa, e só faz sentido para recebimento (reembolso reduz o
+        // saldo recebido, nunca "excede" o pedido).
+        if (tipoMovimentoEmEdicao === TIPOS_MOVIMENTO.RECEBIMENTO) {
+            const situacaoAtual = calcularSituacaoFinanceira(orcamento, movimentosDoOrcamentoAtual);
+            const valorAnterior = modoMovimentoFinanceiro === 'editar'
+                ? (movimentosDoOrcamentoAtual.find(item => item.pagamentoId === pagamentoIdEmEdicao)?.valorCentavos || 0)
+                : 0;
+            const saldoProjetado = situacaoAtual.saldoCentavos + valorAnterior - valorCentavos;
+            if (saldoProjetado < 0) {
+                const continuar = confirm(
+                    `Este recebimento deixará ${formatarMoeda(-saldoProjetado / 100)} pagos além do valor do pedido. Deseja continuar?`
+                );
+                if (!continuar) return;
+            }
+        }
+
+        const hoje = obterDataCivilAtual();
+        operacaoFinanceiraEmAndamento = true;
+        botao.disabled = true;
+        try {
+            if (modoMovimentoFinanceiro === 'criar') {
+                await registrarMovimentoComTransacao({ db, doc, runTransaction }, {
+                    orcamentoId: orcamentoAtualId,
+                    pagamentoId: crypto.randomUUID(),
+                    tipo: tipoMovimentoEmEdicao,
+                    dataMovimento,
+                    valorCentavos,
+                    formaPagamento,
+                    observacao,
+                    registradoEm: new Date().toISOString(),
+                    registradoPor: uid,
+                    hoje,
+                    online: navigator.onLine
+                });
+                mostrarNotificacao(
+                    `${tipoMovimentoEmEdicao === TIPOS_MOVIMENTO.REEMBOLSO ? 'Reembolso' : 'Recebimento'} registrado com sucesso.`,
+                    'sucesso'
+                );
+            } else if (modoMovimentoFinanceiro === 'editar') {
+                await corrigirMovimentoComTransacao({ db, doc, runTransaction }, {
+                    orcamentoId: orcamentoAtualId,
+                    pagamentoId: pagamentoIdEmEdicao,
+                    versaoEsperada: versaoMovimentoEmEdicao,
+                    dataMovimento,
+                    valorCentavos,
+                    formaPagamento,
+                    observacao,
+                    corrigidoEm: new Date().toISOString(),
+                    corrigidoPor: uid,
+                    hoje,
+                    online: navigator.onLine
+                });
+                mostrarNotificacao('Lançamento corrigido com sucesso.', 'sucesso');
+            }
+            fecharModalMovimentoFinanceiro();
+        } catch (error) {
+            console.error('Falha na operação financeira:', error);
+            if (error instanceof ErroOperacaoMovimento && error.codigo === 'conflito') {
+                ajuda.textContent = 'Este lançamento foi alterado em outro dispositivo. Os dados já foram atualizados; revise e tente novamente.';
+            } else {
+                ajuda.textContent = error.message || 'Não foi possível concluir a operação.';
+            }
+        } finally {
+            operacaoFinanceiraEmAndamento = false;
+            botao.disabled = false;
+        }
+    }
+
+    function abrirModalCancelarMovimento(pagamentoId) {
+        const movimento = movimentosDoOrcamentoAtual.find(item => item.pagamentoId === pagamentoId);
+        if (!movimento || movimento.status === STATUS_MOVIMENTO.CANCELADO) return;
+        if (!auth.currentUser) {
+            mostrarNotificacao('Faça login novamente para cancelar um lançamento financeiro.');
+            return;
+        }
+        pagamentoIdParaCancelar = pagamentoId;
+        versaoMovimentoParaCancelar = movimento.versao;
+        document.getElementById('motivoCancelamentoMovimento').value = '';
+        document.getElementById('ajudaMotivoCancelamentoMovimento').textContent = '';
+        abrirModal('modalCancelarMovimento');
+    }
+
+    function fecharModalCancelarMovimento() {
+        fecharModal('modalCancelarMovimento');
+        pagamentoIdParaCancelar = null;
+        versaoMovimentoParaCancelar = null;
+    }
+
+    async function confirmarCancelamentoMovimento() {
+        if (operacaoFinanceiraEmAndamento) return;
+        const uid = auth.currentUser?.uid || null;
+        const campoMotivo = document.getElementById('motivoCancelamentoMovimento');
+        const ajuda = document.getElementById('ajudaMotivoCancelamentoMovimento');
+        const botao = document.getElementById('btn-confirmar-cancelamento-movimento');
+        ajuda.textContent = '';
+
+        if (!uid) {
+            ajuda.textContent = 'Sessão sem usuário identificado: faça login novamente.';
+            return;
+        }
+        if (!pagamentoIdParaCancelar) return;
+        if (!campoMotivo.value.trim()) {
+            ajuda.textContent = 'Informe o motivo do cancelamento.';
+            campoMotivo.focus();
+            return;
+        }
+
+        operacaoFinanceiraEmAndamento = true;
+        botao.disabled = true;
+        try {
+            await cancelarMovimentoComTransacao({ db, doc, runTransaction }, {
+                orcamentoId: orcamentoAtualId,
+                pagamentoId: pagamentoIdParaCancelar,
+                versaoEsperada: versaoMovimentoParaCancelar,
+                motivo: campoMotivo.value,
+                canceladoEm: new Date().toISOString(),
+                canceladoPor: uid,
+                online: navigator.onLine
+            });
+            mostrarNotificacao('Lançamento cancelado. Ele continua no histórico, fora dos totais.', 'sucesso');
+            fecharModalCancelarMovimento();
+        } catch (error) {
+            console.error('Falha ao cancelar lançamento:', error);
+            ajuda.textContent = error.message || 'Não foi possível cancelar o lançamento.';
+        } finally {
+            operacaoFinanceiraEmAndamento = false;
+            botao.disabled = false;
+        }
+    }
+
+    // --- Contas a Receber: busca pontual por pedido quando a seção é aberta, sem listener permanente
+    // e sem collectionGroup (evita exigir índice novo). ---
+
+    function criarLinhaContasAReceber({ orcamento, situacao }) {
+        const moeda = centavos => formatarMoeda(centavos / 100);
+        const clienteNome = orcamento.pedido?.cliente?.nome || 'Não informado';
+        const dataVenda = orcamento.pedido?.financeiro?.dataVenda;
+        return `
+            <tr>
+                <td data-label="Pedido" class="followup-sem-quebra">${escaparHtml(orcamento.id)}</td>
+                <td data-label="Cliente">${escaparHtml(clienteNome)}</td>
+                <td data-label="Data da venda" class="followup-sem-quebra">${escaparHtml(formatarData(dataVenda))}</td>
+                <td data-label="Valor a receber" class="followup-sem-quebra">${moeda(situacao.valorReceberCentavos)}</td>
+                <td data-label="Recebido" class="followup-sem-quebra">${moeda(situacao.recebidoCentavos)}</td>
+                <td data-label="Reembolsado" class="followup-sem-quebra">${moeda(situacao.reembolsadoCentavos)}</td>
+                <td data-label="Saldo" class="followup-sem-quebra">${moeda(situacao.saldoCentavos)}</td>
+                <td data-label="Situação">${escaparHtml(situacao.situacao)}</td>
+                <td data-label="Ação">
+                    <button type="button" class="btn btn-secondary btn-sm btn-abrir-orcamento" data-orcamento-id="${escaparHtml(orcamento.id)}">Abrir</button>
+                </td>
+            </tr>`;
+    }
+
+    function renderizarContasAReceber() {
+        const tabelaContainer = document.getElementById('contasReceberTabelaContainer');
+        const vazio = document.getElementById('contasReceberVazio');
+        if (!tabelaContainer || !vazio) return;
+
+        // Fail-closed: se a última carga falhou, não existe visão financeira válida para filtrar. Sem
+        // este retorno, trocar o filtro repintaria a lista (parcial ou vazia) como se fosse completa.
+        if (contasAReceberComFalha) {
+            tabelaContainer.innerHTML = '';
+            vazio.hidden = true;
+            return;
+        }
+
+        const filtro = document.getElementById('contasReceberFiltroSituacao')?.value || 'todos';
+        const linhas = contasAReceberCarregadas.filter(({ situacao }) => filtro === 'todos' || situacao.situacao === filtro);
+
+        // Saldo pendente primeiro; dentro de cada grupo, venda mais recente primeiro.
+        linhas.sort((a, b) => {
+            const grupoA = a.situacao.saldoCentavos > 0 ? 0 : 1;
+            const grupoB = b.situacao.saldoCentavos > 0 ? 0 : 1;
+            if (grupoA !== grupoB) return grupoA - grupoB;
+            const dataA = a.orcamento.pedido?.financeiro?.dataVenda || '';
+            const dataB = b.orcamento.pedido?.financeiro?.dataVenda || '';
+            return dataB.localeCompare(dataA);
+        });
+
+        if (linhas.length === 0) {
+            tabelaContainer.innerHTML = '';
+            vazio.hidden = false;
+            return;
+        }
+        vazio.hidden = true;
+        tabelaContainer.innerHTML = `
+            <table class="followups-table contas-a-receber-tabela">
+                <thead>
+                    <tr>
+                        <th scope="col">Pedido</th>
+                        <th scope="col">Cliente</th>
+                        <th scope="col">Data da venda</th>
+                        <th scope="col">Valor a receber</th>
+                        <th scope="col">Recebido</th>
+                        <th scope="col">Reembolsado</th>
+                        <th scope="col">Saldo</th>
+                        <th scope="col">Situação</th>
+                        <th scope="col">Ação</th>
+                    </tr>
+                </thead>
+                <tbody>${linhas.map(criarLinhaContasAReceber).join('')}</tbody>
+            </table>`;
+    }
+
+    async function carregarContasAReceber() {
+        const carregando = document.getElementById('contasReceberCarregando');
+        const erro = document.getElementById('contasReceberErro');
+        const tabelaContainer = document.getElementById('contasReceberTabelaContainer');
+        const vazio = document.getElementById('contasReceberVazio');
+        if (!carregando || !erro || !tabelaContainer || !vazio) return;
+
+        carregando.hidden = false;
+        erro.hidden = true;
+        erro.textContent = '';
+
+        // Participação no Contas a Receber ATIVO é decidida só por pedidoParticipaFinanceiro() — o mesmo
+        // portão oficial do relatório de vendas: pedido v2 com snapshot válido e não cancelado. Aqui NÃO
+        // cabe pedidoTemSnapshotV2Valido(), que de propósito também aceita pedido cancelado depois (para
+        // histórico e reembolso); um pedido cancelado não é conta a receber. O pedido cancelado continua
+        // exibindo seu histórico financeiro quando aberto individualmente, na aba do pedido.
+        // v1 -> fora | orçamento em negociação -> fora | v2 inválido -> fora | v2 cancelado -> fora.
+        const pedidosElegiveis = Object.values(orcamentosSalvos).filter(pedidoParticipaFinanceiro);
+        try {
+            // Promise.all (nunca allSettled com soma parcial): se a leitura dos pagamentos de QUALQUER
+            // pedido participante falhar, o conjunto inteiro rejeita. Falha de leitura não é "zero
+            // pagamentos" e não pode virar saldo em aberto artificial.
+            const carregadas = await Promise.all(pedidosElegiveis.map(async orcamento => {
+                const pagamentosSnap = await getDocs(collection(db, 'orcamentos', orcamento.id, 'pagamentos'));
+                const movimentos = pagamentosSnap.docs.map(documento => ({ ...documento.data(), pagamentoId: documento.id }));
+                // Todos os valores da linha vêm daqui: recebível, recebido, reembolsado, saldo e
+                // situação. Nada é recalculado nesta camada.
+                return { orcamento, situacao: calcularSituacaoFinanceira(orcamento, movimentos) };
+            }));
+            contasAReceberCarregadas = carregadas;
+            contasAReceberComFalha = false;
+            renderizarContasAReceber();
+        } catch (error) {
+            // Operação global falha: descarta o que foi lido (nenhuma visão parcial fica acessível nem
+            // pelo filtro) e mostra estado de erro. O aplicativo não tem padrão de "preservar a última
+            // visão válida" em caso de erro, então limpar é o comportamento seguro e consistente.
+            console.error('Falha ao carregar Contas a Receber:', error);
+            contasAReceberCarregadas = [];
+            contasAReceberComFalha = true;
+            erro.hidden = false;
+            erro.textContent = 'Não foi possível carregar todas as informações de Contas a Receber. Tente novamente.';
+            tabelaContainer.innerHTML = '';
+            vazio.hidden = true;
+        } finally {
+            carregando.hidden = true;
+        }
+    }
+    // --- FIM: PAGAMENTOS DO PEDIDO E CONTAS A RECEBER (ETAPA 4B2A) ---
 
     function inicializarSelectInteligente(inputId) {
         const input = document.getElementById(inputId);

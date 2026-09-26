@@ -246,6 +246,12 @@ function extrairEstado(movimento) {
     }, {});
 }
 
+function estadosIguais(a, b) {
+    if (a === b) return true;
+    if (!a || !b) return false;
+    return CAMPOS_ESTADO.every(campo => a[campo] === b[campo]);
+}
+
 export function criarEventoAuditoria(evento, anterior, novo, { registradoEm, registradoPor = null, motivo = null } = {}) {
     if (!Object.values(EVENTOS_AUDITORIA).includes(evento)) {
         throw new ErroMovimento('evento-invalido', 'Evento de auditoria desconhecido.');
@@ -328,4 +334,155 @@ export function avaliarRestauracaoMovimento(existente, candidato, orcamentoPai, 
     const validacao = validarMovimento(candidato, { hoje });
     if (!validacao.valido) return { gravar: false, motivo: `movimento-invalido:${validacao.erros.join(',')}` };
     return { gravar: true, motivo: null };
+}
+
+// Valida a trilha COMPLETA de um movimento (v1..vN, sem lacunas nem duplicatas), não só o documento
+// isolado como validarMovimento(). Usada pelo backup (round-trip estrutural) e, no futuro, pela
+// restauração financeira privilegiada (Etapa 4B2R) — nunca pela escrita operacional normal, que
+// sempre grava um evento por vez e é validada pelas Firestore Rules na própria transação.
+export function validarCadeiaDeAuditoria(movimento, eventos) {
+    const erros = [];
+    if (!movimento || typeof movimento !== 'object') return { valido: false, erros: ['movimento-ausente'] };
+    if (!Array.isArray(eventos) || eventos.length === 0) return { valido: false, erros: ['cadeia-vazia'] };
+
+    // Cada item é { eventoId, dados }. eventoId precisa bater com "v" + versaoNova, sem duplicatas.
+    const porVersao = new Map();
+    for (const item of eventos) {
+        const eventoId = item?.eventoId;
+        const dados = item?.dados;
+        if (typeof eventoId !== 'string' || !dados || typeof dados !== 'object') {
+            erros.push('evento-malformado');
+            continue;
+        }
+        if (!Number.isSafeInteger(dados.versaoNova) || dados.versaoNova < 1) {
+            erros.push(`evento-${eventoId}-versaoNova-invalida`);
+            continue;
+        }
+        if (eventoId !== idDoEventoDaVersao(dados.versaoNova)) {
+            erros.push(`evento-${eventoId}-id-nao-corresponde-a-versaoNova`);
+            continue;
+        }
+        if (porVersao.has(dados.versaoNova)) {
+            erros.push(`evento-duplicado-versao-${dados.versaoNova}`);
+            continue;
+        }
+        if (!Object.values(EVENTOS_AUDITORIA).includes(dados.evento)) erros.push(`evento-${eventoId}-tipo-invalido`);
+        if (!ehInstanteIsoUtc(dados.registradoEm)) erros.push(`evento-${eventoId}-registradoEm-invalido`);
+        if (!ehTextoOuNulo(dados.registradoPor)) erros.push(`evento-${eventoId}-registradoPor-invalido`);
+        if (!ehTextoOuNulo(dados.motivo)) erros.push(`evento-${eventoId}-motivo-invalido`);
+        porVersao.set(dados.versaoNova, dados);
+    }
+    if (erros.length > 0) return { valido: false, erros };
+
+    const versaoFinal = movimento.versao;
+    if (!Number.isSafeInteger(versaoFinal) || versaoFinal < 1) return { valido: false, erros: ['movimento-versao-invalida'] };
+
+    // Precisa ser exatamente 1..versaoFinal, contíguo, sem buraco nem sobra.
+    if (porVersao.size !== versaoFinal) {
+        return { valido: false, erros: [`cadeia-incompleta:esperado-${versaoFinal}-eventos-recebido-${porVersao.size}`] };
+    }
+    for (let v = 1; v <= versaoFinal; v++) {
+        if (!porVersao.has(v)) return { valido: false, erros: [`cadeia-com-lacuna-na-versao-${v}`] };
+    }
+
+    const v1 = porVersao.get(1);
+    if (v1.evento !== EVENTOS_AUDITORIA.CRIACAO) erros.push('v1-nao-e-criacao');
+    if (v1.versaoAnterior !== null) erros.push('v1-versaoAnterior-nao-nula');
+    if (v1.estadoAnterior !== null) erros.push('v1-estadoAnterior-nao-nulo');
+    if (!v1.estadoNovo || typeof v1.estadoNovo !== 'object') erros.push('v1-estadoNovo-ausente');
+
+    for (let v = 2; v <= versaoFinal; v++) {
+        const atual = porVersao.get(v);
+        const anterior = porVersao.get(v - 1);
+        if (atual.versaoAnterior !== v - 1) erros.push(`evento-v${v}-versaoAnterior-nao-encadeia`);
+        if (!estadosIguais(atual.estadoAnterior, anterior.estadoNovo)) erros.push(`evento-v${v}-estadoAnterior-nao-bate-com-v${v - 1}`);
+        if (![EVENTOS_AUDITORIA.CORRECAO, EVENTOS_AUDITORIA.CANCELAMENTO].includes(atual.evento)) {
+            erros.push(`evento-v${v}-tipo-invalido-para-nao-ser-criacao`);
+        }
+    }
+
+    const ultimo = porVersao.get(versaoFinal);
+    if (!estadosIguais(ultimo.estadoNovo, extrairEstado(movimento))) erros.push('ultimo-estadoNovo-diverge-do-movimento-atual');
+
+    if (movimento.status === STATUS_MOVIMENTO.CANCELADO) {
+        if (ultimo.evento !== EVENTOS_AUDITORIA.CANCELAMENTO) erros.push('movimento-cancelado-mas-ultimo-evento-nao-e-cancelamento');
+        if (!ehTextoOuNulo(movimento.motivoCancelamento) || !movimento.motivoCancelamento) erros.push('movimento-cancelado-sem-motivo');
+    } else if (versaoFinal === 1) {
+        if (ultimo.evento !== EVENTOS_AUDITORIA.CRIACAO) erros.push('movimento-ativo-v1-mas-ultimo-evento-nao-e-criacao');
+    } else {
+        if (ultimo.evento !== EVENTOS_AUDITORIA.CORRECAO) erros.push('movimento-ativo-versao-maior-que-1-mas-ultimo-evento-nao-e-correcao');
+    }
+
+    if (movimento.ultimoEventoId !== idDoEventoDaVersao(versaoFinal)) erros.push('movimento-ultimoEventoId-nao-bate-com-versao-final');
+
+    return { valido: erros.length === 0, erros };
+}
+
+// Portão real do backup: certifica CADA pagamento coletado antes de devolver a lista pronta para
+// serialização, em ordem determinística. Fail-closed — o primeiro registro reprovado lança e nada é
+// devolvido; o chamador (exportarDados) nunca monta um arquivo parcial. São três certificações, todas
+// necessárias para que o conjunto exportado seja conceitualmente associável a pais válidos por uma
+// futura restauração (4B2R):
+//
+// 1. IDENTIDADE: orcamentoId + pagamentoId não se repete. Uma consulta normal do Firestore não produz
+//    duplicata, mas este helper é puro e serve como certificador estrutural do payload, inclusive de
+//    payloads montados por outro caminho.
+// 2. PAI: o orcamentoId existe entre os orçamentos exportados e é pedido v2 com snapshot financeiro
+//    válido. Aqui a semântica correta é pedidoTemSnapshotV2Valido() e NÃO pedidoParticipaFinanceiro():
+//    um pedido cancelado depois continua tendo histórico financeiro legítimo a preservar. Pagamento
+//    sob v1, sob orçamento em negociação, sob snapshot v2 inválido ou sob pai ausente é estado
+//    impossível (corrupção/admin) e bloqueia a exportação.
+// 3. CADEIA: a trilha de auditoria do movimento é íntegra de v1 até a versão atual.
+export function prepararPagamentosParaBackup(pagamentosColetados, orcamentosPorId) {
+    if (!Array.isArray(pagamentosColetados)) {
+        throw new ErroMovimento('pagamentos-coletados-invalidos', 'A lista de pagamentos coletados para o backup precisa ser um array.');
+    }
+    if (!orcamentosPorId || typeof orcamentosPorId !== 'object' || Array.isArray(orcamentosPorId)) {
+        throw new ErroMovimento('orcamentos-do-backup-invalidos', 'Os orçamentos do backup precisam ser informados como mapa por id para certificar o pai de cada pagamento.');
+    }
+
+    const abortar = (codigo, registro, motivo) => {
+        throw new ErroMovimento(
+            codigo,
+            `Não foi possível gerar o backup financeiro. O lançamento ${registro?.pagamentoId} do pedido `
+            + `${registro?.orcamentoId} ${motivo}. Nenhum arquivo foi gerado.`
+        );
+    };
+
+    const chavesVistas = new Set();
+    for (const registro of pagamentosColetados) {
+        // 1. Identidade única do par pedido+pagamento. O mesmo pagamentoId sob orcamentoIds diferentes
+        // é legítimo (ids são gerados por subcoleção) e continua permitido.
+        const chave = `${registro?.orcamentoId}/${registro?.pagamentoId}`;
+        if (chavesVistas.has(chave)) {
+            abortar('pagamento-duplicado-no-backup', registro, 'aparece mais de uma vez na lista coletada');
+        }
+        chavesVistas.add(chave);
+
+        // 2. Pai financeiro válido dentro do próprio backup.
+        const pai = orcamentosPorId[registro?.orcamentoId];
+        if (!pai) {
+            abortar('pai-do-pagamento-ausente', registro, 'aponta para um pedido que não existe no backup');
+        }
+        if (!pedidoTemSnapshotV2Valido(pai)) {
+            abortar('pai-do-pagamento-invalido', registro, 'está sob um pedido que não é v2 com snapshot financeiro válido');
+        }
+
+        // 3. Cadeia de auditoria íntegra.
+        const validacao = validarCadeiaDeAuditoria(registro?.movimento, registro?.auditoria);
+        if (!validacao.valido) {
+            abortar('cadeia-invalida', registro, `possui histórico de auditoria inconsistente (${validacao.erros.join(', ')})`);
+        }
+    }
+
+    // Ordem determinística: por orcamentoId e depois pagamentoId (numérica quando aplicável), e a
+    // auditoria de cada pagamento por versaoNova numérica — nunca lexical, para que v10 não venha
+    // antes de v2. Isso não substitui a validação acima; só torna o arquivo reproduzível e legível.
+    const comparar = (a, b) => String(a).localeCompare(String(b), 'pt-BR', { numeric: true });
+    return [...pagamentosColetados]
+        .sort((a, b) => comparar(a.orcamentoId, b.orcamentoId) || comparar(a.pagamentoId, b.pagamentoId))
+        .map(registro => ({
+            ...registro,
+            auditoria: [...registro.auditoria].sort((a, b) => a.dados.versaoNova - b.dados.versaoNova)
+        }));
 }
