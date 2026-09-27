@@ -469,6 +469,45 @@
             font-size: 0.9em;
         }
 
+        .financeiro-pedido-acoes {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 10px;
+            margin: 4px 0 16px;
+        }
+
+        .situacao-financeira {
+            display: inline-block;
+            margin: 0 0 16px;
+            padding: 6px 14px;
+            border-radius: 999px;
+            font-weight: 600;
+        }
+
+        .situacao-financeira-aberto {
+            background: #FBEAEA;
+            color: #A03A3A;
+        }
+
+        .situacao-financeira-parcial {
+            background: #FFF3D6;
+            color: #8A6300;
+        }
+
+        .situacao-financeira-quitado {
+            background: #E4F3E4;
+            color: #2F6B2F;
+        }
+
+        .situacao-financeira-excedente {
+            background: #E6ECFB;
+            color: #2C4B9B;
+        }
+
+        .movimento-financeiro-cancelado {
+            opacity: 0.65;
+        }
+
         /* Deixa aparecer o fundo escuro previsto para thead, em vez da cor de linha alternada. */
         .followups-table thead tr {
             background-color: transparent;
@@ -2253,8 +2292,13 @@
                 <div id="resumoAmbientes">
                 </div>
             </div>
+
+            <div class="card-container" id="financeiroPedidoCardContainer" hidden>
+                <div class="section-title">Financeiro do pedido</div>
+                <div id="financeiroPedidoConteudo"></div>
+            </div>
         </div>
-        
+
         <div id="tab3" class="tab-content" role="tabpanel" aria-labelledby="btn-tab-2" tabindex="0">
             <div class="card-container">
                 <div class="section-title">Proposta Final para o Cliente</div>
@@ -2361,6 +2405,30 @@
 
                 <div id="financeiroTabelaContainer"></div>
                 <p id="financeiroVazio" class="followup-vazio" hidden>Nenhuma venda registrada neste período.</p>
+            </div>
+
+            <div class="card-container">
+                <div class="section-title">Contas a Receber</div>
+                <p class="followups-intro">Situação financeira dos pedidos v2 ativos, a partir dos recebimentos e reembolsos já lançados. Pedidos cancelados e anteriores ao módulo financeiro (v1) não entram aqui.</p>
+                <div class="form-row financeiro-filtros">
+                    <div class="form-group">
+                        <label for="contasReceberFiltroSituacao">Situação:</label>
+                        <select id="contasReceberFiltroSituacao">
+                            <option value="todos">Todos</option>
+                            <option value="Em aberto">Em aberto</option>
+                            <option value="Parcialmente pago">Parcialmente pago</option>
+                            <option value="Quitado">Quitado</option>
+                            <option value="Excedente">Excedente</option>
+                        </select>
+                    </div>
+                    <div class="form-group financeiro-atalhos-grupo">
+                        <button id="btn-atualizar-contas-a-receber" class="btn btn-secondary btn-sm" type="button">Atualizar</button>
+                    </div>
+                </div>
+                <p id="contasReceberCarregando" class="financeiro-info" role="status" hidden>Carregando contas a receber…</p>
+                <p id="contasReceberErro" class="resumo-interno-aviso" role="status" hidden></p>
+                <div id="contasReceberTabelaContainer"></div>
+                <p id="contasReceberVazio" class="followup-vazio" hidden>Nenhum pedido com controle financeiro ativo no momento.</p>
             </div>
         </div>
 
@@ -2713,6 +2781,50 @@
                     <div style="text-align: right;">
                         <button id="btn-voltar-cancelar-pedido" class="btn btn-secondary" type="button">Voltar</button>
                         <button id="btn-confirmar-cancelamento-pedido" class="btn btn-danger" type="button">Cancelar pedido</button>
+                    </div>
+                </div>
+            </div>
+            <div id="modalMovimentoFinanceiro" class="modal" role="dialog" aria-modal="true">
+                <div class="modal-content" style="max-width: 520px;">
+                    <button id="btn-fechar-movimento-financeiro" class="close-button" type="button" aria-label="Fechar janela">&times;</button>
+                    <h2 class="section-title" id="tituloMovimentoFinanceiro" style="margin-top: 0;">Registrar recebimento</h2>
+                    <p id="avisoTipoMovimentoFinanceiro" class="campo-ajuda"></p>
+                    <div class="form-group" style="margin-bottom: 14px;">
+                        <label for="movimentoData">Data:</label>
+                        <input type="date" id="movimentoData">
+                    </div>
+                    <div class="form-group" style="margin-bottom: 14px;">
+                        <label for="movimentoValor">Valor (R$):</label>
+                        <input type="number" id="movimentoValor" step="0.01" min="0.01" placeholder="Ex: 500,00">
+                    </div>
+                    <div class="form-group" style="margin-bottom: 14px;">
+                        <label for="movimentoForma">Forma de pagamento:</label>
+                        <select id="movimentoForma"></select>
+                    </div>
+                    <div class="form-group" style="margin-bottom: 20px;">
+                        <label for="movimentoObservacao">Observação (opcional):</label>
+                        <textarea id="movimentoObservacao" rows="2" maxlength="500"></textarea>
+                    </div>
+                    <p id="ajudaMovimentoFinanceiro" class="campo-ajuda" aria-live="polite"></p>
+                    <div style="text-align: right;">
+                        <button id="btn-voltar-movimento-financeiro" class="btn btn-secondary" type="button">Voltar</button>
+                        <button id="btn-confirmar-movimento-financeiro" class="btn btn-success" type="button">Confirmar</button>
+                    </div>
+                </div>
+            </div>
+            <div id="modalCancelarMovimento" class="modal" role="dialog" aria-modal="true">
+                <div class="modal-content" style="max-width: 520px;">
+                    <button id="btn-fechar-cancelar-movimento" class="close-button" type="button" aria-label="Fechar janela">&times;</button>
+                    <h2 class="section-title" style="margin-top: 0;">Cancelar lançamento</h2>
+                    <p class="aviso-cancelamento">O lançamento continuará no histórico, mas deixará de participar dos totais. Esta ação não pode ser desfeita.</p>
+                    <div class="form-group" style="margin-bottom: 20px;">
+                        <label for="motivoCancelamentoMovimento">Motivo do cancelamento (obrigatório):</label>
+                        <textarea id="motivoCancelamentoMovimento" rows="3" maxlength="500" required aria-describedby="ajudaMotivoCancelamentoMovimento" placeholder="Ex.: lançado em duplicidade"></textarea>
+                        <small id="ajudaMotivoCancelamentoMovimento" class="campo-ajuda" aria-live="polite"></small>
+                    </div>
+                    <div style="text-align: right;">
+                        <button id="btn-voltar-cancelar-movimento" class="btn btn-secondary" type="button">Voltar</button>
+                        <button id="btn-confirmar-cancelamento-movimento" class="btn btn-danger" type="button">Cancelar lançamento</button>
                     </div>
                 </div>
             </div>

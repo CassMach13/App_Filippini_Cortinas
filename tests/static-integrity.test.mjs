@@ -48,9 +48,10 @@ test('abas, modais e ordenação usam controles semânticos', () => {
     // Seis abas: Follow-ups (Etapa 1) e Financeiro (Etapa 3B2).
     assert.equal((html.match(/role=["']tab["']/g) || []).length, 6);
     assert.equal((html.match(/role=["']tabpanel["']/g) || []).length, 6);
-    // Doze modais: o modal de cancelamento de pedido foi incluído na Etapa 3B1.
-    assert.equal((html.match(/class=["']modal["'][^>]+role=["']dialog["']/g) || []).length, 12);
-    assert.equal((html.match(/class=["']close-button["']/g) || []).length, 12);
+    // Catorze modais: os modais de recebimento/reembolso/edição e de cancelamento de lançamento
+    // foram incluídos na Etapa 4B2A.
+    assert.equal((html.match(/class=["']modal["'][^>]+role=["']dialog["']/g) || []).length, 14);
+    assert.equal((html.match(/class=["']close-button["']/g) || []).length, 14);
     assert.doesNotMatch(html, /<span[^>]+class=["']close-button["']/i);
     assert.equal((html.match(/class=["']sort-button["']/g) || []).length, 10);
 });

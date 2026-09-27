@@ -11,6 +11,8 @@ const filesToPublish = [
     'order-domain.js',
     'order-transactions.js',
     'sales-report-domain.js',
+    'payments-domain.js',
+    'payment-transactions.js',
     'pricing-domain.js',
     'date-domain.js',
     'contact-domain.js',
