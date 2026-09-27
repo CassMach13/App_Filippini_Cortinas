@@ -39,3 +39,8 @@ node_modules/
 tests/artifacts/
 .firebase-cli-config/
 public/
+
+# Backups e credenciais administrativas (restauração 4B2R): nunca versionar
+filippini_backup_*.json
+service-account*.json
+*-firebase-adminsdk-*.json
