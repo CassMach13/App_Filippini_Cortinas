@@ -5357,7 +5357,8 @@ window.addEventListener('beforeunload', (event) => {
             return;
         }
 
-        const dataAtual = new Date().toISOString().split('T')[0];
+        // Data CIVIL de Brasília (mesmo contrato da duplicação), nunca a data UTC do toISOString().
+        const dataAtual = obterDataCivilAtual();
 
         const novoOrcamento = {
             id: newId,
@@ -5428,9 +5429,11 @@ window.addEventListener('beforeunload', (event) => {
                 return;
             }
             
+            // Data CIVIL de Brasília, nunca a data UTC: entre 21h e 24h BRT o toISOString() já está no
+            // dia seguinte e a cópia nasceria com a data de amanhã.
             const novoOrcamento = criarOrcamentoDuplicado(orcamentoOriginal, {
                 novoId: newId,
-                dataOrcamento: new Date().toISOString().split('T')[0]
+                dataOrcamento: obterDataCivilAtual()
             });
             
             try {

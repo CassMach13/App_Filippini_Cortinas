@@ -2035,6 +2035,42 @@ def main():
         assert "não contém registros para restaurar" in erros_import[5], erros_import
         del console_errors[erros_console_antes_do_import:]
 
+        # Q. Criação e duplicação gravam dataOrcamento na data civil de Brasília, não na UTC. Relógio do
+        # navegador fixado em 2026-09-28T01:30Z = 27/09 22:30 BRT: a data UTC já é 28/09, a correta é
+        # 27/09. Fica no fim do teste porque o relógio permanece fixo daqui em diante.
+        def data_orcamento_persistida(id_orcamento):
+            return page.evaluate(
+                f"(id) => {firestore_mock}.lerDiretamente('orcamentos', id).infoGerais.dataOrcamento", id_orcamento
+            )
+
+        tabs.nth(1).click()
+        page.clock.set_fixed_time("2026-09-28T01:30:00.000Z")
+
+        # Q1. Criação de orçamento novo.
+        ids_antes_da_criacao = page.evaluate("() => [...document.querySelectorAll('#seletorOrcamento option')].map(o => o.value)")
+        page.locator("#btn-novo-orcamento").click()
+        page.wait_for_function(
+            "(antes) => [...document.querySelectorAll('#seletorOrcamento option')].some(o => o.value && !antes.includes(o.value))",
+            arg=ids_antes_da_criacao,
+        )
+        id_criado_noturno = page.evaluate(
+            "(antes) => [...document.querySelectorAll('#seletorOrcamento option')].map(o => o.value).find(v => v && !antes.includes(v))",
+            ids_antes_da_criacao,
+        )
+        seletor.select_option(id_criado_noturno)
+        page.wait_for_function(f"document.getElementById('orcamentoId').textContent === '{id_criado_noturno}'")
+        assert page.locator("#dataOrcamento").input_value() == "2026-09-27"
+        assert data_orcamento_persistida(id_criado_noturno) == "2026-09-27", data_orcamento_persistida(id_criado_noturno)
+
+        # Q2. Duplicação.
+        seletor.select_option("ORC-154")
+        page.wait_for_function("document.getElementById('orcamentoId').textContent === 'ORC-154'")
+        page.locator("#btn-duplicar-orcamento").click()
+        page.wait_for_function("document.querySelector('#seletorOrcamento').value !== 'ORC-154'")
+        id_duplicado_noturno = page.locator("#orcamentoId").inner_text()
+        assert page.locator("#dataOrcamento").input_value() == "2026-09-27"
+        assert data_orcamento_persistida(id_duplicado_noturno) == "2026-09-27", data_orcamento_persistida(id_duplicado_noturno)
+
         assert console_errors == [], console_errors
         assert request_failures == [], request_failures
         browser.close()
