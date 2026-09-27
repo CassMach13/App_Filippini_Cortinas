@@ -110,6 +110,12 @@ let orcamentoIdDoListenerFinanceiro = null;
 // pedido que está em foco agora. NÃO depende da suposição de que unsubscribe() cancela callbacks já
 // enfileirados — dinheiro na tela não pode depender disso.
 let geracaoListenerFinanceiro = 0;
+// Falha do listener de pagamentos do pedido em foco. Falha de leitura NÃO é "recebido = 0" nem "saldo
+// integral em aberto": enquanto este sinalizador estiver ligado, o bloco financeiro do pedido não
+// mostra valores, situação nem ações. Só um snapshot válido (do mesmo pedido) o desliga; trocar de
+// pedido ou sair da sessão o descarta junto com a assinatura.
+let financeiroPedidoComFalha = false;
+const MENSAGEM_FALHA_FINANCEIRO_PEDIDO = 'Não foi possível carregar os lançamentos financeiros deste pedido. Tente novamente.';
 let operacaoFinanceiraEmAndamento = false;
 // Estado do modal de recebimento/reembolso/edição: 'criar' ou 'editar', e qual lançamento/tipo/versão.
 let modoMovimentoFinanceiro = null;
@@ -127,6 +133,10 @@ let contasAReceberCarregadas = [];
 // o filtro — uma lista parcial (ou vazia) apresentada como resultado financeiro válido seria pior do
 // que não mostrar nada.
 let contasAReceberComFalha = false;
+// Geração da carga de Contas a Receber: a seção pode ser recarregada (aba reaberta, botão Atualizar)
+// antes de a carga anterior terminar. Só a carga mais recente escreve dados, erro, tabela e loading;
+// uma carga antiga que termine depois — com sucesso ou falha — é descartada.
+let geracaoCargaContasAReceber = 0;
 // Campo de celular -> link de WhatsApp e texto de ajuda correspondentes.
 const CONTATOS_WHATSAPP = {
     celularCliente: { link: 'whatsappCliente', ajuda: 'ajudaCelularCliente' },
@@ -722,8 +732,11 @@ function detachAllListeners() {
     // Invalida também a geração: qualquer callback financeiro ainda enfileirado morre aqui, sem
     // repintar dados de uma sessão que já foi encerrada.
     geracaoListenerFinanceiro++;
+    financeiroPedidoComFalha = false;
     contasAReceberCarregadas = [];
     contasAReceberComFalha = false;
+    // Uma carga de Contas a Receber em andamento no logout também perde a vez.
+    geracaoCargaContasAReceber++;
 }
 
 
@@ -827,6 +840,10 @@ window.addEventListener('beforeunload', (event) => {
             if (botaoAbrir) abrirOrcamentoDoFollowUp(botaoAbrir.dataset.orcamentoId);
         });
         document.getElementById('financeiroPedidoConteudo').addEventListener('click', (event) => {
+            if (event.target.closest('#btn-recarregar-financeiro-pedido')) {
+                recarregarFinanceiroDoPedido();
+                return;
+            }
             if (event.target.closest('#btn-registrar-recebimento')) {
                 abrirModalMovimentoFinanceiro(TIPOS_MOVIMENTO.RECEBIMENTO);
                 return;
@@ -2643,8 +2660,12 @@ window.addEventListener('beforeunload', (event) => {
             const pagamentosPresente = 'pagamentos' in importedData;
             const pagamentosEstruturalmenteValido = !pagamentosPresente || Array.isArray(importedData.pagamentos);
             // versaoBackup, quando declarada, precisa ser um inteiro que esta versão do app conhece.
+            // Ausente = backup legado. Presente: inteiro entre 1 e a versão suportada (0, negativos,
+            // frações e versões futuras são recusados antes de qualquer write).
             const versaoBackupValida = importedData.versaoBackup === undefined
-                || (Number.isInteger(importedData.versaoBackup) && importedData.versaoBackup <= VERSAO_BACKUP_SUPORTADA);
+                || (Number.isInteger(importedData.versaoBackup)
+                    && importedData.versaoBackup >= 1
+                    && importedData.versaoBackup <= VERSAO_BACKUP_SUPORTADA);
             const estruturaValida = importedData
                 && typeof importedData === 'object'
                 && colecoesArray.every(nome => importedData[nome] === undefined || Array.isArray(importedData[nome]))
@@ -3120,24 +3141,30 @@ window.addEventListener('beforeunload', (event) => {
     // O listener muda SOMENTE quando muda a identidade/elegibilidade do pedido observado: um snapshot do
     // próprio listener repinta a interface e não passa por aqui, então não há unsubscribe/resubscribe a
     // cada atualização de pagamentos.
-    function atualizarListenerFinanceiroDoPedido() {
+    function atualizarListenerFinanceiroDoPedido({ forcarReassinatura = false } = {}) {
         const orcamento = obterOrcamentoAtual();
         const elegivel = Boolean(orcamento) && pedidoTemSnapshotV2Valido(orcamento);
         const idAlvo = elegivel ? orcamentoAtualId : null;
 
-        if (orcamentoIdDoListenerFinanceiro === idAlvo) {
+        if (orcamentoIdDoListenerFinanceiro === idAlvo && !forcarReassinatura) {
             // Mesmo pedido (ou nenhum dos dois é elegível): só repintar, o pedido pode ter mudado
             // (ex.: acabou de ser cancelado) mesmo sem trocar de listener.
             renderizarFinanceiroDoPedido();
             return;
         }
 
+        const trocouDePedido = orcamentoIdDoListenerFinanceiro !== idAlvo;
         if (unsubscribeMovimentosFinanceiros) {
             unsubscribeMovimentosFinanceiros();
             unsubscribeMovimentosFinanceiros = null;
         }
         orcamentoIdDoListenerFinanceiro = idAlvo;
-        movimentosDoOrcamentoAtual = [];
+        if (trocouDePedido) {
+            // A falha e os movimentos pertenciam ao pedido anterior. Numa reassinatura do MESMO
+            // pedido (Tentar novamente), a falha continua de pé até chegar um snapshot válido.
+            movimentosDoOrcamentoAtual = [];
+            financeiroPedidoComFalha = false;
+        }
 
         if (!idAlvo) {
             renderizarFinanceiroDoPedido();
@@ -3153,14 +3180,33 @@ window.addEventListener('beforeunload', (event) => {
         const pagamentosRef = collection(db, 'orcamentos', idAlvo, 'pagamentos');
         unsubscribeMovimentosFinanceiros = onSnapshot(pagamentosRef, (snapshot) => {
             if (!ehCallbackAtual()) return;
+            // Snapshot válido: é a única coisa que tira o pedido do estado de falha.
+            financeiroPedidoComFalha = false;
             movimentosDoOrcamentoAtual = snapshot.docs.map(documento => ({ ...documento.data(), pagamentoId: documento.id }));
             renderizarFinanceiroDoPedido();
         }, (error) => {
             if (!ehCallbackAtual()) return;
+            // Falha de leitura não é lista vazia: marca a falha e descarta o que havia, para que nenhum
+            // handler calcule saldo ou excedente a partir de um estado incompleto.
             console.error('Listener de pagamentos do pedido:', error);
+            financeiroPedidoComFalha = true;
             movimentosDoOrcamentoAtual = [];
             renderizarFinanceiroDoPedido();
         });
+    }
+
+    // "Tentar novamente" do bloco financeiro: no SDK real, um listener que falhou já foi encerrado e
+    // não entrega mais snapshots, então é preciso assinar de novo o MESMO pedido. A falha só sai quando
+    // o primeiro snapshot válido da nova assinatura chegar.
+    function recarregarFinanceiroDoPedido() {
+        atualizarListenerFinanceiroDoPedido({ forcarReassinatura: true });
+    }
+
+    // Nenhuma ação financeira parte de um estado que não foi carregado por inteiro.
+    function financeiroDoPedidoIndisponivel() {
+        if (!financeiroPedidoComFalha) return false;
+        mostrarNotificacao(MENSAGEM_FALHA_FINANCEIRO_PEDIDO, 'erro');
+        return true;
     }
 
     function criarLinhaMovimento(movimento) {
@@ -3223,6 +3269,17 @@ window.addEventListener('beforeunload', (event) => {
             return;
         }
 
+        // Fail-closed: sem cards monetários, sem situação calculada, sem histórico e sem ações. Mostrar
+        // "R$ 0,00 recebido" ou "Em aberto" aqui seria afirmar algo que não foi lido.
+        if (financeiroPedidoComFalha) {
+            conteudo.innerHTML = `
+                <p class="resumo-interno-aviso" role="alert" data-financeiro-pedido="falha">${escaparHtml(MENSAGEM_FALHA_FINANCEIRO_PEDIDO)}</p>
+                <div class="financeiro-pedido-acoes">
+                    <button id="btn-recarregar-financeiro-pedido" class="btn btn-secondary" type="button">Tentar novamente</button>
+                </div>`;
+            return;
+        }
+
         const situacao = calcularSituacaoFinanceira(orcamento, movimentosDoOrcamentoAtual);
         const aceitaRecebimentoNovo = pedidoParticipaFinanceiro(orcamento);
         const moeda = centavos => formatarMoeda(centavos / 100);
@@ -3248,6 +3305,7 @@ window.addEventListener('beforeunload', (event) => {
     function abrirModalMovimentoFinanceiro(tipo) {
         const orcamento = obterOrcamentoAtual();
         if (!orcamento) return;
+        if (financeiroDoPedidoIndisponivel()) return;
         if (tipo === TIPOS_MOVIMENTO.RECEBIMENTO && !pedidoParticipaFinanceiro(orcamento)) {
             mostrarNotificacao('Este pedido não aceita novo recebimento.');
             return;
@@ -3280,6 +3338,7 @@ window.addEventListener('beforeunload', (event) => {
     }
 
     function abrirModalEdicaoMovimento(pagamentoId) {
+        if (financeiroDoPedidoIndisponivel()) return;
         const movimento = movimentosDoOrcamentoAtual.find(item => item.pagamentoId === pagamentoId);
         if (!movimento || movimento.status === STATUS_MOVIMENTO.CANCELADO) return;
         if (!auth.currentUser) {
@@ -3324,6 +3383,12 @@ window.addEventListener('beforeunload', (event) => {
 
         if (!orcamento || !uid) {
             ajuda.textContent = 'Sessão sem usuário identificado: faça login novamente.';
+            return;
+        }
+        // O modal pode ter sido aberto antes de a leitura falhar: o aviso de excedente e a própria
+        // decisão partiriam de movimentos incompletos. Recusa até haver um snapshot válido.
+        if (financeiroPedidoComFalha) {
+            ajuda.textContent = MENSAGEM_FALHA_FINANCEIRO_PEDIDO;
             return;
         }
 
@@ -3411,6 +3476,7 @@ window.addEventListener('beforeunload', (event) => {
     }
 
     function abrirModalCancelarMovimento(pagamentoId) {
+        if (financeiroDoPedidoIndisponivel()) return;
         const movimento = movimentosDoOrcamentoAtual.find(item => item.pagamentoId === pagamentoId);
         if (!movimento || movimento.status === STATUS_MOVIMENTO.CANCELADO) return;
         if (!auth.currentUser) {
@@ -3443,6 +3509,10 @@ window.addEventListener('beforeunload', (event) => {
             return;
         }
         if (!pagamentoIdParaCancelar) return;
+        if (financeiroPedidoComFalha) {
+            ajuda.textContent = MENSAGEM_FALHA_FINANCEIRO_PEDIDO;
+            return;
+        }
         if (!campoMotivo.value.trim()) {
             ajuda.textContent = 'Informe o motivo do cancelamento.';
             campoMotivo.focus();
@@ -3553,6 +3623,11 @@ window.addEventListener('beforeunload', (event) => {
         const vazio = document.getElementById('contasReceberVazio');
         if (!carregando || !erro || !tabelaContainer || !vazio) return;
 
+        // Cada carga captura sua geração; depois do await, só a mais recente pode escrever qualquer
+        // coisa (dados, sinalizador de falha, tabela, erro ou loading).
+        const geracaoDestaCarga = ++geracaoCargaContasAReceber;
+        const ehCargaAtual = () => geracaoDestaCarga === geracaoCargaContasAReceber;
+
         carregando.hidden = false;
         erro.hidden = true;
         erro.textContent = '';
@@ -3575,10 +3650,17 @@ window.addEventListener('beforeunload', (event) => {
                 // situação. Nada é recalculado nesta camada.
                 return { orcamento, situacao: calcularSituacaoFinanceira(orcamento, movimentos) };
             }));
+            // Uma carga mais nova começou enquanto esta lia: o resultado desta já está velho.
+            if (!ehCargaAtual()) return;
             contasAReceberCarregadas = carregadas;
             contasAReceberComFalha = false;
             renderizarContasAReceber();
         } catch (error) {
+            // Falha de uma carga já superada não apaga a visão (válida) da carga mais nova.
+            if (!ehCargaAtual()) {
+                console.warn('Carga antiga de Contas a Receber falhou depois de superada; resultado descartado.', error);
+                return;
+            }
             // Operação global falha: descarta o que foi lido (nenhuma visão parcial fica acessível nem
             // pelo filtro) e mostra estado de erro. O aplicativo não tem padrão de "preservar a última
             // visão válida" em caso de erro, então limpar é o comportamento seguro e consistente.
@@ -3590,7 +3672,8 @@ window.addEventListener('beforeunload', (event) => {
             tabelaContainer.innerHTML = '';
             vazio.hidden = true;
         } finally {
-            carregando.hidden = true;
+            // O finally de uma carga antiga não pode esconder o loading da carga que ainda está lendo.
+            if (ehCargaAtual()) carregando.hidden = true;
         }
     }
     // --- FIM: PAGAMENTOS DO PEDIDO E CONTAS A RECEBER (ETAPA 4B2A) ---

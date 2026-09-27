@@ -1692,6 +1692,166 @@ def main():
 
         tabs.nth(1).click()
 
+        # J6. Financeiro do pedido fail-closed: falha do listener NÃO é "R$ 0,00 recebido" nem saldo
+        # integral em aberto. Sem valores, sem situação, sem ações até um snapshot válido chegar.
+        mensagem_falha_pedido = "Não foi possível carregar os lançamentos financeiros deste pedido. Tente novamente."
+        seletor_falha_pedido = '[data-financeiro-pedido="falha"]'
+
+        def total_recebido_do_pedido():
+            return normalizar(page.locator('[data-financeiro-pedido="totalRecebido"]').inner_text())
+
+        def assert_bloco_financeiro_em_falha():
+            page.wait_for_function(f"document.querySelector('{seletor_falha_pedido}') !== null")
+            assert page.locator("#financeiroPedidoCardContainer").is_visible()
+            texto_bloco = texto_visivel(page.locator("#financeiroPedidoConteudo"))
+            assert mensagem_falha_pedido in texto_bloco
+            assert "R$" not in texto_bloco, "nenhum valor monetário apresentado como válido"
+            assert "Situação" not in texto_bloco and "Em aberto" not in texto_bloco
+            for seletor_proibido in (
+                '[data-financeiro-pedido="totalRecebido"]', '[data-financeiro-pedido="saldo"]',
+                '[data-financeiro-pedido="situacao"]', "#btn-registrar-recebimento", "#btn-registrar-reembolso",
+                ".btn-editar-movimento", ".btn-cancelar-movimento",
+            ):
+                assert page.locator(seletor_proibido).count() == 0, seletor_proibido
+
+        erros_antes_da_falha_do_pedido = len(console_errors)
+        seletor.select_option("ORC-151")
+        page.wait_for_function("document.getElementById('financeiroPedidoCardContainer').hidden === false")
+        assert total_recebido_do_pedido() == "R$ 150,00", "o pedido tem recebimentos reais antes da falha"
+
+        # Modal de edição aberto ANTES da falha: a confirmação precisa ser recusada depois dela.
+        botao_editar_antes_da_falha = page.locator(".btn-editar-movimento").first
+        pagamento_em_edicao = botao_editar_antes_da_falha.get_attribute("data-pagamento-id")
+        versao_antes_da_falha = page.evaluate(
+            f"(id) => {firestore_mock}.lerDiretamente('{colecao_151}', id).versao", pagamento_em_edicao
+        )
+        botao_editar_antes_da_falha.click()
+        page.locator("#modalMovimentoFinanceiro").wait_for(state="visible")
+
+        assert page.evaluate(f"() => {firestore_mock}.falharListenerDe('{colecao_151}')") == 1
+        assert_bloco_financeiro_em_falha()
+
+        page.locator("#movimentoValor").fill("12.34")
+        page.locator("#btn-confirmar-movimento-financeiro").click()
+        page.wait_for_function(
+            f"document.getElementById('ajudaMovimentoFinanceiro').textContent.includes('{mensagem_falha_pedido}')"
+        )
+        assert page.locator("#modalMovimentoFinanceiro").evaluate("m => m.classList.contains('active')")
+        assert page.evaluate(
+            f"(id) => {firestore_mock}.lerDiretamente('{colecao_151}', id).versao", pagamento_em_edicao
+        ) == versao_antes_da_falha, "nenhuma correção pode partir de estado incompleto"
+        page.locator("#btn-voltar-movimento-financeiro").click()
+        assert_bloco_financeiro_em_falha()
+
+        # Trocar de pedido descarta a falha do anterior; erro tardio de A não afeta B.
+        seletor.select_option("ORC-153")
+        page.wait_for_function("document.getElementById('orcamentoId').textContent === 'ORC-153'")
+        assert page.locator(seletor_falha_pedido).count() == 0
+        assert total_recebido_do_pedido() == "R$ 80,00"
+        assert page.evaluate(f"() => {firestore_mock}.dispararErroTardioDe('{colecao_151}')") is True
+        page.wait_for_timeout(100)
+        assert page.locator(seletor_falha_pedido).count() == 0, "erro tardio de A não pode marcar falha em B"
+        assert total_recebido_do_pedido() == "R$ 80,00"
+        assert page.locator("#btn-registrar-recebimento").is_enabled()
+
+        # De volta a A: assinatura nova, valores normais.
+        seletor.select_option("ORC-151")
+        page.wait_for_function("document.getElementById('orcamentoId').textContent === 'ORC-151'")
+        assert page.locator(seletor_falha_pedido).count() == 0
+        assert total_recebido_do_pedido() == "R$ 150,00"
+
+        # Snapshot válido posterior (mesma assinatura) limpa a falha e volta a renderizar normalmente.
+        assert page.evaluate(f"() => {firestore_mock}.falharListenerDe('{colecao_151}')") == 1
+        assert_bloco_financeiro_em_falha()
+        page.evaluate(
+            f"""(id) => {{
+                const mock = {firestore_mock};
+                mock.escreverDiretamente('{colecao_151}', id, mock.lerDiretamente('{colecao_151}', id));
+            }}""",
+            pagamento_em_edicao,
+        )
+        page.wait_for_function(f"document.querySelector('{seletor_falha_pedido}') === null")
+        assert total_recebido_do_pedido() == "R$ 150,00"
+        assert page.locator("#btn-registrar-recebimento").is_enabled()
+
+        # "Tentar novamente": no SDK real o listener que falhou está encerrado; o botão reassina o MESMO
+        # pedido (um unsubscribe + um subscribe) e a falha só sai com o snapshot válido da nova assinatura.
+        assert page.evaluate(f"() => {firestore_mock}.falharListenerDe('{colecao_151}')") == 1
+        assert_bloco_financeiro_em_falha()
+        antes_de_tentar_novamente = assinaturas(colecao_151)
+        page.locator("#btn-recarregar-financeiro-pedido").click()
+        page.wait_for_function(f"document.querySelector('{seletor_falha_pedido}') === null")
+        depois_de_tentar_novamente = assinaturas(colecao_151)
+        assert depois_de_tentar_novamente["unsubscribes"] == antes_de_tentar_novamente["unsubscribes"] + 1
+        assert depois_de_tentar_novamente["subscribes"] == antes_de_tentar_novamente["subscribes"] + 1
+        assert total_recebido_do_pedido() == "R$ 150,00"
+
+        erros_da_falha_do_pedido = console_errors[erros_antes_da_falha_do_pedido:]
+        assert len(erros_da_falha_do_pedido) == 3, erros_da_falha_do_pedido
+        assert all("Listener de pagamentos do pedido" in erro for erro in erros_da_falha_do_pedido), erros_da_falha_do_pedido
+        del console_errors[erros_antes_da_falha_do_pedido:]
+
+        # J7. Contas a Receber: cargas concorrentes. Só a carga mais recente escreve.
+        tabs.nth(4).click()
+        page.wait_for_function("document.getElementById('contasReceberCarregando').hidden === true")
+        page.locator("#contasReceberFiltroSituacao").select_option("todos")
+        page.wait_for_timeout(50)
+        assert page.locator("#contasReceberTabelaContainer tbody tr").count() == linhas_completas
+
+        def recebido_153_em_contas():
+            linha = page.locator("#contasReceberTabelaContainer tbody tr").filter(has_text="ORC-153")
+            return normalizar(linha.locator('[data-label="Recebido"]').inner_text())
+
+        def retidas():
+            return page.evaluate(f"() => {firestore_mock}.quantidadeDeLeiturasRetidas()")
+
+        botao_atualizar_contas = page.locator("#btn-atualizar-contas-a-receber")
+
+        # Cenário 1: A começa, B começa e termina com sucesso, A termina depois com dado velho -> ignorada.
+        page.evaluate(f"() => {firestore_mock}.reterLeiturasDe('{colecao_153}')")
+        botao_atualizar_contas.click()
+        page.wait_for_function(f"() => {firestore_mock}.quantidadeDeLeiturasRetidas() === 1")
+        page.evaluate(f"() => {firestore_mock}.reterLeiturasDe(null)")
+        botao_atualizar_contas.click()
+        page.wait_for_function("document.getElementById('contasReceberCarregando').hidden === true")
+        assert recebido_153_em_contas() == "R$ 80,00"
+        assert page.evaluate(f"() => {firestore_mock}.liberarLeituraRetida('vazio')") is True
+        page.wait_for_timeout(150)
+        assert recebido_153_em_contas() == "R$ 80,00", "resultado velho da carga A não pode sobrescrever B"
+        assert page.locator("#contasReceberErro").is_hidden()
+        assert page.locator("#contasReceberCarregando").is_hidden()
+
+        # Cenário 2: A começa, B termina com sucesso, A FALHA depois -> o erro antigo não apaga B.
+        page.evaluate(f"() => {firestore_mock}.reterLeiturasDe('{colecao_153}')")
+        botao_atualizar_contas.click()
+        page.wait_for_function(f"() => {firestore_mock}.quantidadeDeLeiturasRetidas() === 1")
+        page.evaluate(f"() => {firestore_mock}.reterLeiturasDe(null)")
+        botao_atualizar_contas.click()
+        page.wait_for_function("document.getElementById('contasReceberCarregando').hidden === true")
+        assert page.evaluate(f"() => {firestore_mock}.liberarLeituraRetida('falha')") is True
+        page.wait_for_timeout(150)
+        assert page.locator("#contasReceberErro").is_hidden(), "falha de carga superada não mostra erro"
+        assert page.locator("#contasReceberTabelaContainer tbody tr").count() == linhas_completas
+        assert recebido_153_em_contas() == "R$ 80,00"
+
+        # Cenário 3: A e B em voo; A termina primeiro -> o finally de A não esconde o loading de B.
+        page.evaluate(f"() => {firestore_mock}.reterLeiturasDe('{colecao_153}')")
+        botao_atualizar_contas.click()
+        page.wait_for_function(f"() => {firestore_mock}.quantidadeDeLeiturasRetidas() === 1")
+        botao_atualizar_contas.click()
+        page.wait_for_function(f"() => {firestore_mock}.quantidadeDeLeiturasRetidas() === 2")
+        assert page.evaluate(f"() => {firestore_mock}.liberarLeituraRetida('atual')") is True
+        page.wait_for_timeout(150)
+        assert page.locator("#contasReceberCarregando").is_visible(), "a carga B ainda está lendo"
+        page.evaluate(f"() => {firestore_mock}.reterLeiturasDe(null)")
+        assert page.evaluate(f"() => {firestore_mock}.liberarLeituraRetida('atual')") is True
+        page.wait_for_function("document.getElementById('contasReceberCarregando').hidden === true")
+        assert page.locator("#contasReceberErro").is_hidden()
+        assert page.locator("#contasReceberTabelaContainer tbody tr").count() == linhas_completas
+        assert retidas() == 0
+
+        tabs.nth(1).click()
+
         # K. Impressão e privacidade: nada do financeiro do pedido vaza para a Proposta Cliente nem para a impressão.
         seletor.select_option("ORC-151")
         verificar_impressao_sem_dados_internos(page, "impressão com pagamentos lançados", VALORES_PAGAMENTO)
@@ -1830,6 +1990,11 @@ def main():
         arquivo_pagamentos_texto.write_text(json.dumps({"version": "2.0", "pagamentos": "x"}), encoding="utf-8")
         arquivo_pagamentos_nulo = artifacts / "backup-pagamentos-nulo.json"
         arquivo_pagamentos_nulo.write_text(json.dumps({"version": "2.0", "pagamentos": None}), encoding="utf-8")
+        # versaoBackup presente precisa estar entre 1 e a versão suportada: 0 e negativos são inválidos.
+        arquivo_versao_zero = artifacts / "backup-versao-zero.json"
+        arquivo_versao_zero.write_text(json.dumps({"version": "2.0", "versaoBackup": 0, "pagamentos": []}), encoding="utf-8")
+        arquivo_versao_negativa = artifacts / "backup-versao-negativa.json"
+        arquivo_versao_negativa.write_text(json.dumps({"version": "2.0", "versaoBackup": -1, "pagamentos": []}), encoding="utf-8")
         arquivo_pagamentos_vazio = artifacts / "backup-pagamentos-vazio.json"
         arquivo_pagamentos_vazio.write_text(json.dumps({"version": "2.0", "pagamentos": []}), encoding="utf-8")
 
@@ -1838,7 +2003,12 @@ def main():
         )
         erros_console_antes_do_import = len(console_errors)
 
-        for caminho in (arquivo_pagamentos_objeto, arquivo_pagamentos_texto, arquivo_pagamentos_nulo):
+        for caminho in (
+            arquivo_pagamentos_objeto, arquivo_pagamentos_texto, arquivo_pagamentos_nulo,
+            arquivo_versao_zero, arquivo_versao_negativa,
+        ):
+            # Limpa a notificação para que cada espera abaixo corresponda a ESTA importação, não à anterior.
+            page.evaluate("() => { document.getElementById('app-notification').textContent = ''; }")
             page.locator("#arquivo-backup").set_input_files(str(caminho))
             page.wait_for_function(
                 "document.getElementById('app-notification').textContent.includes('Estrutura de backup inválida')"
@@ -1860,9 +2030,9 @@ def main():
         assert ids_depois_vazio == ids_antes_import
 
         erros_import = console_errors[erros_console_antes_do_import:]
-        assert len(erros_import) == 4, erros_import
-        assert all("Estrutura de backup inválida" in erro for erro in erros_import[:3]), erros_import
-        assert "não contém registros para restaurar" in erros_import[3], erros_import
+        assert len(erros_import) == 6, erros_import
+        assert all("Estrutura de backup inválida" in erro for erro in erros_import[:5]), erros_import
+        assert "não contém registros para restaurar" in erros_import[5], erros_import
         del console_errors[erros_console_antes_do_import:]
 
         assert console_errors == [], console_errors

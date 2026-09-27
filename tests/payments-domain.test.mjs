@@ -592,6 +592,189 @@ test('round-trip JSON puro preserva IDs, versões, autores, datas, estados e a c
     assert.ok(semTimestamp(backup), 'o backup não depende de Timestamp do Firestore');
 });
 
+// --- validarCadeiaDeAuditoria(): certificação contra as invariantes das Rules da 4B1 ----------------
+// Cada caso parte de uma cadeia íntegra produzida pelo domínio e adultera UM ponto. Todos passariam
+// pela versão anterior do validador; agora precisam ser recusados.
+
+function cadeiaCanceladaIntegra() {
+    const { v3, eventos } = construirCadeiaCompleta();
+    return { movimento: structuredClone(v3), eventos: structuredClone(eventos) };
+}
+
+function cadeiaCorrigidaIntegra() {
+    const { v2, eventos } = construirCadeiaCompleta();
+    return { movimento: structuredClone(v2), eventos: structuredClone(eventos.slice(0, 2)) };
+}
+
+function errosDaCadeia(movimento, eventos, hoje = HOJE) {
+    const resultado = validarCadeiaDeAuditoria(movimento, eventos, { hoje });
+    assert.equal(resultado.valido, false, 'a cadeia adulterada precisa ser recusada');
+    return resultado.erros;
+}
+
+test('as cadeias íntegras de referência continuam válidas com relógio injetado', () => {
+    for (const { movimento, eventos } of [cadeiaCanceladaIntegra(), cadeiaCorrigidaIntegra()]) {
+        const resultado = validarCadeiaDeAuditoria(movimento, eventos, { hoje: HOJE });
+        assert.equal(resultado.valido, true, JSON.stringify(resultado));
+    }
+});
+
+test('movimento atual inválido bloqueia a cadeia: data futura (relógio injetado) e forma inválida', () => {
+    // Data futura em relação ao relógio da certificação. As Rules não conseguem barrar isso; o backup barra.
+    const futuro = criarMovimento(dadosRecebimento({ dataMovimento: '2026-09-25' }), { hoje: '2026-09-25' });
+    const eventosFuturo = [{
+        eventoId: 'v1',
+        dados: criarEventoAuditoria('criacao', null, futuro, { registradoEm: futuro.criadoEm, registradoPor: futuro.criadoPor })
+    }];
+    assert.ok(errosDaCadeia(futuro, eventosFuturo, '2026-09-20').includes('movimento-dataMovimento-futura'));
+    assert.equal(
+        validarCadeiaDeAuditoria(futuro, eventosFuturo, { hoje: '2026-09-25' }).valido, true,
+        'a mesma cadeia é válida quando o relógio alcança a data: o critério é o relógio injetado'
+    );
+
+    const { movimento, eventos } = cadeiaCorrigidaIntegra();
+    movimento.formaPagamento = 'Cheque';
+    eventos[1].dados.estadoNovo.formaPagamento = 'Cheque';
+    assert.ok(errosDaCadeia(movimento, eventos).includes('movimento-formaPagamento-invalida'));
+});
+
+test('prepararPagamentosParaBackup usa o validador fortalecido e o relógio injetado', () => {
+    const futuro = criarMovimento(dadosRecebimento({ dataMovimento: '2026-09-25' }), { hoje: '2026-09-25' });
+    const eventos = [{
+        eventoId: 'v1',
+        dados: criarEventoAuditoria('criacao', null, futuro, { registradoEm: futuro.criadoEm, registradoPor: futuro.criadoPor })
+    }];
+    const lista = [registro('ORC-90', 'pag-futuro', futuro, eventos)];
+    assert.throws(
+        () => prepararPagamentosParaBackup(lista, paisDe('ORC-90'), { hoje: '2026-09-20' }),
+        erro => erro instanceof ErroMovimento && erro.codigo === 'cadeia-invalida' && erro.message.includes('movimento-dataMovimento-futura')
+    );
+    assert.equal(prepararPagamentosParaBackup(lista, paisDe('ORC-90'), { hoje: '2026-09-25' }).length, 1);
+});
+
+test('estado de negócio precisa ter exatamente os seis campos', () => {
+    const extra = cadeiaCorrigidaIntegra();
+    extra.eventos[0].dados.estadoNovo.extra = 'não pertence ao contrato';
+    assert.ok(errosDaCadeia(extra.movimento, extra.eventos).includes('evento-v1-estadoNovo-malformado'));
+
+    const faltando = cadeiaCorrigidaIntegra();
+    delete faltando.eventos[1].dados.estadoAnterior.observacao;
+    assert.ok(errosDaCadeia(faltando.movimento, faltando.eventos).includes('evento-v2-estadoAnterior-malformado'));
+
+    const naoMapa = cadeiaCorrigidaIntegra();
+    naoMapa.eventos[1].dados.estadoNovo = ['tipo', 'valorCentavos'];
+    assert.ok(errosDaCadeia(naoMapa.movimento, naoMapa.eventos).includes('evento-v2-estadoNovo-malformado'));
+});
+
+test('evento com campo desconhecido é recusado', () => {
+    const { movimento, eventos } = cadeiaCorrigidaIntegra();
+    eventos[1].dados.ip = '10.0.0.1';
+    assert.ok(errosDaCadeia(movimento, eventos).includes('evento-v2-formato-invalido'));
+});
+
+test('cancelamento é terminal: cancelamento intermediário seguido de correção é recusado', () => {
+    const v1 = criar();
+    const v2 = cancelarMovimento(v1, { motivo: 'Engano', canceladoEm: '2026-09-19T10:00:00.000Z', canceladoPor: 'usuario-teste' });
+    // v3 "reativa" por correção: o domínio e as Rules recusam; aqui é montado à mão como adulteração.
+    const { canceladoEm, canceladoPor, motivoCancelamento, ...semCancelamento } = v2;
+    const v3 = {
+        ...semCancelamento, status: STATUS_MOVIMENTO.ATIVO, versao: 3, ultimoEventoId: 'v3',
+        atualizadoEm: '2026-09-20T09:00:00.000Z', atualizadoPor: 'usuario-teste'
+    };
+    const eventos = [
+        { eventoId: 'v1', dados: criarEventoAuditoria('criacao', null, v1, { registradoEm: v1.criadoEm, registradoPor: v1.criadoPor }) },
+        { eventoId: 'v2', dados: criarEventoAuditoria('cancelamento', v1, v2, { registradoEm: v2.canceladoEm, registradoPor: 'usuario-teste', motivo: 'Engano' }) },
+        { eventoId: 'v3', dados: criarEventoAuditoria('correcao', v2, v3, { registradoEm: v3.atualizadoEm, registradoPor: 'usuario-teste' }) }
+    ];
+    const erros = errosDaCadeia(v3, eventos);
+    assert.ok(erros.includes('evento-v2-intermediario-so-pode-ser-correcao'), erros.join(','));
+    assert.ok(erros.includes('evento-v3-correcao-fora-de-estado-ativo'), erros.join(','));
+});
+
+test('semântica de motivo: criação e correção sem motivo; cancelamento com o motivo do movimento', () => {
+    const criacaoComMotivo = cadeiaCorrigidaIntegra();
+    criacaoComMotivo.eventos[0].dados.motivo = 'não deveria existir';
+    assert.ok(errosDaCadeia(criacaoComMotivo.movimento, criacaoComMotivo.eventos).includes('v1-motivo-nao-nulo'));
+
+    const correcaoComMotivo = cadeiaCorrigidaIntegra();
+    correcaoComMotivo.eventos[1].dados.motivo = 'não deveria existir';
+    assert.ok(errosDaCadeia(correcaoComMotivo.movimento, correcaoComMotivo.eventos).includes('evento-v2-correcao-com-motivo'));
+
+    const motivoDivergente = cadeiaCanceladaIntegra();
+    motivoDivergente.eventos[2].dados.motivo = 'Outro motivo qualquer';
+    assert.ok(errosDaCadeia(motivoDivergente.movimento, motivoDivergente.eventos).includes('ultimo-motivo-diverge-de-motivoCancelamento'));
+});
+
+test('transições seguem as Rules: correção não troca tipo e cancelamento não altera valores', () => {
+    const trocaTipo = cadeiaCorrigidaIntegra();
+    trocaTipo.movimento.tipo = TIPOS_MOVIMENTO.REEMBOLSO;
+    trocaTipo.eventos[1].dados.estadoNovo.tipo = TIPOS_MOVIMENTO.REEMBOLSO;
+    assert.ok(errosDaCadeia(trocaTipo.movimento, trocaTipo.eventos).includes('evento-v2-correcao-muda-tipo'));
+
+    const cancelaEMuda = cadeiaCanceladaIntegra();
+    cancelaEMuda.movimento.valorCentavos = 1;
+    cancelaEMuda.eventos[2].dados.estadoNovo.valorCentavos = 1;
+    assert.ok(errosDaCadeia(cancelaEMuda.movimento, cancelaEMuda.eventos).includes('evento-v3-cancelamento-altera-valores'));
+});
+
+test('autoria e instante da criação precisam bater com o documento', () => {
+    const autorDivergente = cadeiaCanceladaIntegra();
+    autorDivergente.eventos[0].dados.registradoPor = 'intruso';
+    assert.ok(errosDaCadeia(autorDivergente.movimento, autorDivergente.eventos).includes('v1-registradoPor-diverge-de-criadoPor'));
+
+    const instanteDivergente = cadeiaCanceladaIntegra();
+    instanteDivergente.eventos[0].dados.registradoEm = '2026-09-18T15:00:00.000Z';
+    assert.ok(errosDaCadeia(instanteDivergente.movimento, instanteDivergente.eventos).includes('v1-registradoEm-diverge-de-criadoEm'));
+
+    // Movimento da 4B1 sempre tem autor; autor nulo não é histórico preservável.
+    const semAutor = cadeiaCorrigidaIntegra();
+    semAutor.movimento.criadoPor = null;
+    semAutor.eventos[0].dados.registradoPor = null;
+    assert.ok(errosDaCadeia(semAutor.movimento, semAutor.eventos).includes('movimento-criadoPor-ausente'));
+});
+
+test('autoria e instante do último evento precisam bater com atualizadoPor/Em', () => {
+    for (const construir of [cadeiaCorrigidaIntegra, cadeiaCanceladaIntegra]) {
+        const autor = construir();
+        autor.eventos.at(-1).dados.registradoPor = 'intruso';
+        assert.ok(errosDaCadeia(autor.movimento, autor.eventos).includes('ultimo-registradoPor-diverge-de-atualizadoPor'));
+
+        const instante = construir();
+        instante.eventos.at(-1).dados.registradoEm = '2026-09-20T23:59:59.000Z';
+        assert.ok(errosDaCadeia(instante.movimento, instante.eventos).includes('ultimo-registradoEm-diverge-de-atualizadoEm'));
+    }
+});
+
+test('cancelamento: canceladoPor/Em coincidem com atualizadoPor/Em e com o último evento', () => {
+    const autor = cadeiaCanceladaIntegra();
+    autor.movimento.canceladoPor = 'outro-usuario';
+    const errosAutor = errosDaCadeia(autor.movimento, autor.eventos);
+    assert.ok(errosAutor.includes('movimento-canceladoPor-diverge-de-atualizadoPor'), errosAutor.join(','));
+    assert.ok(errosAutor.includes('ultimo-registradoPor-diverge-de-canceladoPor'), errosAutor.join(','));
+
+    const instante = cadeiaCanceladaIntegra();
+    instante.movimento.canceladoEm = '2026-09-20T11:00:00.000Z';
+    const errosInstante = errosDaCadeia(instante.movimento, instante.eventos);
+    assert.ok(errosInstante.includes('movimento-canceladoEm-diverge-de-atualizadoEm'), errosInstante.join(','));
+    assert.ok(errosInstante.includes('ultimo-registradoEm-diverge-de-canceladoEm'), errosInstante.join(','));
+});
+
+test('evento intermediário: basta autor não vazio e instante válido (não se inventa relação)', () => {
+    // v2 de uma cadeia v1..v3 é intermediário: seu autor pode ser outro usuário, com instante próprio.
+    const outroAutor = cadeiaCanceladaIntegra();
+    outroAutor.eventos[1].dados.registradoPor = 'outro-usuario-legitimo';
+    outroAutor.eventos[1].dados.registradoEm = '2026-09-19T11:11:11.000Z';
+    assert.equal(validarCadeiaDeAuditoria(outroAutor.movimento, outroAutor.eventos, { hoje: HOJE }).valido, true);
+
+    const semAutor = cadeiaCanceladaIntegra();
+    semAutor.eventos[1].dados.registradoPor = '';
+    assert.ok(errosDaCadeia(semAutor.movimento, semAutor.eventos).includes('evento-v2-registradoPor-invalido'));
+
+    const instanteInvalido = cadeiaCanceladaIntegra();
+    instanteInvalido.eventos[1].dados.registradoEm = '19/09/2026';
+    assert.ok(errosDaCadeia(instanteInvalido.movimento, instanteInvalido.eventos).includes('evento-v2-registradoEm-invalido'));
+});
+
 // --- Contrato da camada agregadora/UI (Contas a Receber e listener do pedido) --------------------
 // Esta camada não é domínio puro: vive em apps.js e só pode ser inspecionada pela fonte. O E2E prova o
 // comportamento; estes testes travam as decisões que um refactor silencioso poderia desfazer.
@@ -660,10 +843,11 @@ test('Contas a Receber: participação só por pedidoParticipaFinanceiro, e falh
 
 test('listener financeiro: uma assinatura por pedido observado, com guarda contra callback atrasado', () => {
     const fonteApps = readFileSync(new URL('../apps.js', import.meta.url), 'utf8');
-    const trechoListener = trechoDaFuncao(fonteApps, 'function atualizarListenerFinanceiroDoPedido()', 'function criarLinhaMovimento(');
+    const trechoListener = trechoDaFuncao(fonteApps, 'function atualizarListenerFinanceiroDoPedido(', 'function recarregarFinanceiroDoPedido()');
 
-    // Sem churn: mesmo pedido/elegibilidade => só repinta, sem passar por unsubscribe/onSnapshot.
-    const indiceGuardaIdentidade = trechoListener.indexOf('if (orcamentoIdDoListenerFinanceiro === idAlvo)');
+    // Sem churn: mesmo pedido/elegibilidade => só repinta, sem passar por unsubscribe/onSnapshot. A
+    // única exceção é o "Tentar novamente" explícito, que força reassinar o MESMO pedido.
+    const indiceGuardaIdentidade = trechoListener.indexOf('if (orcamentoIdDoListenerFinanceiro === idAlvo && !forcarReassinatura)');
     const indiceUnsubscribe = trechoListener.indexOf('unsubscribeMovimentosFinanceiros();');
     const indiceOnSnapshot = trechoListener.indexOf('onSnapshot(');
     assert.ok(indiceGuardaIdentidade >= 0, 'a identidade do pedido observado é conferida');
@@ -697,6 +881,69 @@ test('listener financeiro: uma assinatura por pedido observado, com guarda contr
     assert.match(trechoDetach, /geracaoListenerFinanceiro\+\+/, 'logout invalida a geração dos callbacks pendentes');
     assert.match(trechoDetach, /movimentosDoOrcamentoAtual = \[\]/, 'logout limpa os movimentos em memória');
     assert.match(trechoDetach, /contasAReceberCarregadas = \[\]/, 'logout limpa o cache de Contas a Receber');
+    assert.match(trechoDetach, /financeiroPedidoComFalha = false/, 'logout descarta a falha financeira do pedido');
+    assert.match(trechoDetach, /geracaoCargaContasAReceber\+\+/, 'logout invalida carga de Contas a Receber em andamento');
+});
+
+test('financeiro do pedido: falha de leitura é estado explícito, nunca lista vazia apresentada como válida', () => {
+    const fonteApps = readFileSync(new URL('../apps.js', import.meta.url), 'utf8');
+    const trechoListener = trechoDaFuncao(fonteApps, 'function atualizarListenerFinanceiroDoPedido(', 'function recarregarFinanceiroDoPedido()');
+    const trechoCallbacks = trechoListener.slice(trechoListener.indexOf('onSnapshot('));
+    const inicioErro = trechoCallbacks.indexOf('}, (error) => {');
+    assert.ok(inicioErro > 0, 'o listener registra callback de erro');
+    const callbackDados = trechoCallbacks.slice(0, inicioErro);
+    const callbackErro = trechoCallbacks.slice(inicioErro);
+    assert.match(callbackErro, /financeiroPedidoComFalha = true/, 'o callback de erro marca a falha');
+    assert.ok(
+        callbackErro.indexOf('if (!ehCallbackAtual()) return;') < callbackErro.indexOf('financeiroPedidoComFalha = true'),
+        'erro tardio de listener anterior não marca falha no pedido atual'
+    );
+    assert.match(callbackDados, /financeiroPedidoComFalha = false/, 'só um snapshot válido tira o pedido do estado de falha');
+
+    // Render: o estado de falha vem antes de qualquer cálculo ou pintura de valores.
+    const trechoRender = trechoDaFuncao(fonteApps, 'function renderizarFinanceiroDoPedido()', 'function abrirModalMovimentoFinanceiro(');
+    const indiceFalha = trechoRender.indexOf('if (financeiroPedidoComFalha)');
+    assert.ok(indiceFalha >= 0, 'o render tem ramo de falha');
+    assert.ok(indiceFalha < trechoRender.indexOf('calcularSituacaoFinanceira('), 'a falha é tratada antes de calcular a situação');
+    const ramoFalha = trechoRender.slice(indiceFalha, trechoRender.indexOf('calcularSituacaoFinanceira('));
+    for (const proibido of ['btn-registrar-recebimento', 'btn-registrar-reembolso', 'btn-editar-movimento', 'btn-cancelar-movimento', 'Situação:', 'criarCardFinanceiroPedido']) {
+        assert.ok(!ramoFalha.includes(proibido), `o estado de falha não exibe ${proibido}`);
+    }
+    assert.match(ramoFalha, /MENSAGEM_FALHA_FINANCEIRO_PEDIDO/, 'o estado de falha explica o problema');
+
+    // Todas as portas de ação financeira recusam enquanto a leitura estiver em falha.
+    for (const [inicio, fim] of [
+        ['function abrirModalMovimentoFinanceiro(', 'function abrirModalEdicaoMovimento('],
+        ['function abrirModalEdicaoMovimento(', 'function fecharModalMovimentoFinanceiro()'],
+        ['function abrirModalCancelarMovimento(', 'function fecharModalCancelarMovimento()']
+    ]) {
+        assert.match(trechoDaFuncao(fonteApps, inicio, fim), /financeiroDoPedidoIndisponivel\(\)/, `${inicio} recusa sob falha de leitura`);
+    }
+    for (const [inicio, fim] of [
+        ['async function confirmarMovimentoFinanceiro()', 'function abrirModalCancelarMovimento('],
+        ['async function confirmarCancelamentoMovimento()', '// --- Contas a Receber']
+    ]) {
+        assert.match(trechoDaFuncao(fonteApps, inicio, fim), /if \(financeiroPedidoComFalha\)/, `${inicio} recusa sob falha de leitura`);
+    }
+});
+
+test('Contas a Receber: só a carga mais recente escreve dados, erro, tabela e loading', () => {
+    const fonteApps = readFileSync(new URL('../apps.js', import.meta.url), 'utf8');
+    const trechoCarregar = semComentarios(trechoDaFuncao(fonteApps, 'async function carregarContasAReceber()', 'function inicializarSelectInteligente'));
+
+    assert.match(trechoCarregar, /const geracaoDestaCarga = \+\+geracaoCargaContasAReceber;/, 'cada carga captura sua geração');
+    const indiceAwait = trechoCarregar.indexOf('await Promise.all(');
+    const indiceGuardaSucesso = trechoCarregar.indexOf('if (!ehCargaAtual()) return;', indiceAwait);
+    assert.ok(indiceGuardaSucesso > indiceAwait, 'o sucesso confere a geração depois do await');
+    assert.ok(indiceGuardaSucesso < trechoCarregar.indexOf('contasAReceberCarregadas = carregadas'), 'antes de gravar os dados');
+
+    const trechoCatch = trechoCarregar.slice(trechoCarregar.indexOf('} catch (error) {'), trechoCarregar.indexOf('} finally {'));
+    assert.ok(
+        trechoCatch.indexOf('if (!ehCargaAtual())') < trechoCatch.indexOf('contasAReceberComFalha = true'),
+        'falha de carga superada não apaga a visão da carga nova'
+    );
+    const trechoFinally = trechoCarregar.slice(trechoCarregar.indexOf('} finally {'));
+    assert.match(trechoFinally, /if \(ehCargaAtual\(\)\) carregando\.hidden = true;/, 'finally antigo não esconde o loading da carga nova');
 });
 
 // --- prepararPagamentosParaBackup(): portão real do caminho de exportação --------------------------
@@ -764,7 +1011,7 @@ test('ordem determinística: por orcamentoId e pagamentoId, e a auditoria por ve
     const { v1: base } = construirCadeiaCompleta();
 
     // Dois registros em ordem "errada" de chegada: ORC-90/pag-2 antes de ORC-2/pag-1.
-    const eventoBase = criarEventoAuditoria('criacao', null, base, { registradoEm: base.criadoEm, registradoPor: 'u' });
+    const eventoBase = criarEventoAuditoria('criacao', null, base, { registradoEm: base.criadoEm, registradoPor: base.criadoPor });
     const resultado = prepararPagamentosParaBackup([
         registro('ORC-90', 'pag-2', base, [{ eventoId: 'v1', dados: eventoBase }]),
         registro('ORC-2', 'pag-1', base, [{ eventoId: 'v1', dados: eventoBase }])
@@ -772,12 +1019,15 @@ test('ordem determinística: por orcamentoId e pagamentoId, e a auditoria por ve
     assert.deepEqual(resultado.map(r => r.orcamentoId + '/' + r.pagamentoId), ['ORC-2/pag-1', 'ORC-90/pag-2']);
 
     // Cadeia longa (v1..v11): auditoria fora de ordem lexical não pode enganar a ordenação numérica.
+    // Autoria coerente com as Rules: criação pelo criadoPor, cada correção pelo usuário que a gravou.
     let atual = criar();
-    const cadeiaLonga = [criarEventoAuditoria('criacao', null, atual, { registradoEm: atual.criadoEm, registradoPor: 'u' })];
+    const cadeiaLonga = [criarEventoAuditoria('criacao', null, atual, { registradoEm: atual.criadoEm, registradoPor: atual.criadoPor })];
     for (let i = 0; i < 10; i++) {
         const anterior = atual;
-        atual = corrigirMovimento(anterior, { valorCentavos: anterior.valorCentavos + 100 }, { hoje: HOJE });
-        cadeiaLonga.push(criarEventoAuditoria('correcao', anterior, atual, { registradoEm: atual.atualizadoEm, registradoPor: 'u' }));
+        atual = corrigirMovimento(anterior, {
+            valorCentavos: anterior.valorCentavos + 100, atualizadoPor: 'usuario-teste'
+        }, { hoje: HOJE });
+        cadeiaLonga.push(criarEventoAuditoria('correcao', anterior, atual, { registradoEm: atual.atualizadoEm, registradoPor: atual.atualizadoPor }));
     }
     const eventosEmbaralhados = [...cadeiaLonga].sort(() => Math.random() - 0.5)
         .map(dados => ({ eventoId: idDoEventoDaVersao(dados.versaoNova), dados }));

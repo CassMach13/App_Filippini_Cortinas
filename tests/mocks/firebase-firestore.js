@@ -99,13 +99,22 @@ const controle = {
     falhaProximaTransacao: null,
     regraDeEscrita: null,
     // Trecho de caminho cuja LEITURA (getDocs) deve falhar, para simular uma subcoleção inacessível.
-    falhaDeLeitura: null
+    falhaDeLeitura: null,
+    // Trecho de caminho cujas leituras ficam RETIDAS até o teste liberá-las, para simular cargas
+    // concorrentes que terminam fora de ordem.
+    retencaoDeLeitura: null
 };
+
+// Leituras retidas, em ordem de chegada: cada uma espera o teste dizer como termina.
+const leiturasRetidas = [];
 
 // Contagem de assinaturas por coleção e último callback registrado: existem só para o teste provar que
 // não há churn de listener e que um callback atrasado não escreve na interface.
 const assinaturas = new Map();
 const ultimoCallbackPorColecao = new Map();
+// Callbacks de erro das assinaturas ativas e o último registrado por coleção (mesmo propósito acima).
+const callbacksDeErro = new Map();
+const ultimoCallbackDeErroPorColecao = new Map();
 
 function contarAssinatura(name, campo) {
     const atual = assinaturas.get(name) || { subscribes: 0, unsubscribes: 0 };
@@ -226,6 +235,38 @@ globalThis.__firestoreMock = {
         if (!callback) return false;
         callback(querySnapshot(colecao));
         return true;
+    },
+    falharListenerDe(colecao) {
+        // Entrega um erro às assinaturas ATIVAS desta coleção. Diferença deliberada em relação ao SDK
+        // real: lá o listener termina depois do erro; aqui ele continua registrado, para o teste poder
+        // provar que um snapshot válido posterior tira a interface do estado de falha. O caminho real
+        // (listener encerrado) é coberto pelo "Tentar novamente", que reassina o pedido.
+        const erro = erroFirestore('unavailable', `Listener simulado indisponível em ${colecao}.`);
+        const ativos = [...(callbacksDeErro.get(colecao) || [])];
+        ativos.forEach(callback => callback(erro));
+        return ativos.length;
+    },
+    dispararErroTardioDe(colecao) {
+        // Como dispararCallbackTardioDe, mas para o callback de ERRO: chega depois do unsubscribe.
+        const callback = ultimoCallbackDeErroPorColecao.get(colecao);
+        if (!callback) return false;
+        callback(erroFirestore('unavailable', `Erro tardio simulado em ${colecao}.`));
+        return true;
+    },
+    reterLeiturasDe(trechoDoCaminho) {
+        // Toda getDocs cujo caminho contenha o trecho fica pendente até liberarLeituraRetida().
+        controle.retencaoDeLeitura = trechoDoCaminho || null;
+    },
+    quantidadeDeLeiturasRetidas() {
+        return leiturasRetidas.length;
+    },
+    liberarLeituraRetida(resultado = 'atual') {
+        // Libera a leitura retida MAIS ANTIGA: 'atual' (dados de agora), 'vazio' (como se a subcoleção
+        // estivesse vazia quando foi lida) ou 'falha' (a leitura rejeita).
+        const pendente = leiturasRetidas.shift();
+        if (!pendente) return false;
+        pendente.resolve(resultado);
+        return true;
     }
 };
 
@@ -262,19 +303,30 @@ export async function getDocs(reference) {
     if (controle.falhaDeLeitura && reference.collection.includes(controle.falhaDeLeitura)) {
         throw erroFirestore('unavailable', `Leitura simulada indisponível em ${reference.collection}.`);
     }
+    if (controle.retencaoDeLeitura && reference.collection.includes(controle.retencaoDeLeitura)) {
+        const resultado = await new Promise(resolve => leiturasRetidas.push({ colecao: reference.collection, resolve }));
+        if (resultado === 'falha') throw erroFirestore('unavailable', `Leitura retida falhou em ${reference.collection}.`);
+        if (resultado === 'vazio') return { docs: [], empty: true };
+    }
     return querySnapshot(reference.collection);
 }
 
-export function onSnapshot(reference, onNext) {
+export function onSnapshot(reference, onNext, onError) {
     const name = reference.collection;
     if (!listeners.has(name)) listeners.set(name, new Set());
     listeners.get(name).add(onNext);
+    if (onError) {
+        if (!callbacksDeErro.has(name)) callbacksDeErro.set(name, new Set());
+        callbacksDeErro.get(name).add(onError);
+        ultimoCallbackDeErroPorColecao.set(name, onError);
+    }
     contarAssinatura(name, 'subscribes');
     ultimoCallbackPorColecao.set(name, onNext);
     onNext(querySnapshot(name));
     return () => {
         contarAssinatura(name, 'unsubscribes');
         listeners.get(name)?.delete(onNext);
+        if (onError) callbacksDeErro.get(name)?.delete(onError);
     };
 }
 
