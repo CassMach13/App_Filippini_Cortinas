@@ -274,6 +274,18 @@ test('cadeia financeira inválida bloqueia antes de qualquer gravação, mesmo c
     assert.equal(await contarDocumentos(), 0);
 });
 
+test('orçamento estruturalmente inválido, mesmo sem pagamentos, bloqueia antes de qualquer gravação', async () => {
+    const backup = montarBackup();
+    // ORC-10 não tem pagamentos; um orçamento em negociação não pode carregar snapshot de pedido.
+    backup.orcamentosSalvos['ORC-10'].pedido = { versaoSnapshot: 2 };
+
+    const { codigo, erro } = rodar(salvarBackup(backup), '--project', PROJETO, '--apply');
+    assert.equal(codigo, 1);
+    assert.match(erro, /orçamento ORC-10 não pode ser restaurado \(orcamento-com-snapshot\)/);
+    assert.match(erro, /Nenhuma alteração foi feita/);
+    assert.equal(await contarDocumentos(), 0);
+});
+
 test('--project é obrigatório: sem ele nada é lido nem gravado', async () => {
     const { codigo, erro } = rodar(salvarBackup(montarBackup()), '--apply');
     assert.equal(codigo, 1);

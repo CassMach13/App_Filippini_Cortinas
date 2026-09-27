@@ -22,7 +22,7 @@ import { initializeApp, deleteApp } from 'firebase-admin/app';
 import { getFirestore } from 'firebase-admin/firestore';
 
 import { obterDataCivilAtual } from '../date-domain.js';
-import { valoresIguais } from '../order-domain.js';
+import { avaliarRestauracaoOrcamento, valoresIguais } from '../order-domain.js';
 import { prepararPagamentosParaBackup } from '../payments-domain.js';
 
 const COLECOES_CATALOGO = ['precos', 'fornecedores', 'categorias', 'unidadesDeMedida'];
@@ -105,6 +105,12 @@ export function montarDocumentosDoBackup(backup, { hoje = obterDataCivilAtual() 
             throw new ErroRestauracao(`orcamentosSalvos["${chave}"]: firestoreId diferente da chave.`);
         }
         const { firestoreId: _artefato, ...dados } = registro;
+        // Mesmo contrato que as Rules aplicam à criação de orçamento/pedido (o Admin SDK não passa por
+        // elas): vale para todos os orçamentos, com ou sem pagamentos.
+        const avaliacao = avaliarRestauracaoOrcamento(null, dados);
+        if (!avaliacao.gravar) {
+            throw new ErroRestauracao(`orçamento ${chave} não pode ser restaurado (${avaliacao.motivo}).`);
+        }
         orcamentosLimpos[chave] = dados;
         adicionar(`orcamentos/${chave}`, dados, null);
     }
