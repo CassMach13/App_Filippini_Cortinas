@@ -142,9 +142,19 @@ export function montarDocumentosDoBackup(backup, { hoje = obterDataCivilAtual() 
     };
 }
 
-function classificar(snapshot, dados) {
+// Versões anteriores do app chegaram a gravar `firestoreId` no próprio documento do orçamento. Quando
+// ele é igual ao ID do documento, é redundante e sai só para comparar; diferente do ID, continua
+// contando como divergência. Vale apenas para orcamentos/{id}.
+function dadosDoDestinoParaComparar(caminho, dados) {
+    const [colecao, id, ...resto] = caminho.split('/');
+    if (colecao !== 'orcamentos' || resto.length > 0 || dados.firestoreId !== id) return dados;
+    const { firestoreId: _redundante, ...semFirestoreId } = dados;
+    return semFirestoreId;
+}
+
+function classificar(snapshot, documento) {
     if (!snapshot.exists) return 'CREATE';
-    return valoresIguais(snapshot.data(), dados) ? 'SKIP' : 'CONFLICT';
+    return valoresIguais(dadosDoDestinoParaComparar(documento.caminho, snapshot.data()), documento.dados) ? 'SKIP' : 'CONFLICT';
 }
 
 export async function classificarDocumentos(db, documentos) {
@@ -153,7 +163,7 @@ export async function classificarDocumentos(db, documentos) {
     for (let inicio = 0; inicio < referencias.length; inicio += 300) {
         snapshots.push(...await db.getAll(...referencias.slice(inicio, inicio + 300)));
     }
-    return documentos.map((documento, indice) => ({ ...documento, acao: classificar(snapshots[indice], documento.dados) }));
+    return documentos.map((documento, indice) => ({ ...documento, acao: classificar(snapshots[indice], documento) }));
 }
 
 // Grava só o que está ausente. Catálogos e orçamentos vêm antes dos pagamentos, para que o pai já exista.
@@ -178,7 +188,7 @@ export async function aplicarRestauracao(db, classificados) {
             const snapshots = await transacao.getAll(...referencias);
             let criados = 0;
             documentosDoGrupo.forEach((documento, indice) => {
-                const acao = classificar(snapshots[indice], documento.dados);
+                const acao = classificar(snapshots[indice], documento);
                 if (acao === 'CONFLICT') throw new ErroRestauracao(`Conflito surgiu durante a gravação: ${documento.caminho}. Nada deste pagamento (${grupo}) foi gravado.`);
                 if (acao === 'CREATE') {
                     transacao.create(referencias[indice], documento.dados);

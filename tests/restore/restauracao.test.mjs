@@ -245,6 +245,24 @@ test('execução interrompida pode ser retomada: o que falta vira CREATE, o rest
     assert.equal(await contarDocumentos(), TOTAL_DOCUMENTOS);
 });
 
+test('firestoreId persistido igual ao ID do documento é redundante (SKIP); diferente continua CONFLICT', async () => {
+    const backup = montarBackup();
+    const { firestoreId: _artefato, ...orc10 } = backup.orcamentosSalvos['ORC-10'];
+    const { firestoreId: _outro, ...orc11 } = backup.orcamentosSalvos['ORC-11'];
+    // Como versões anteriores do app gravavam: firestoreId dentro do próprio documento.
+    await db.doc('orcamentos/ORC-10').create({ ...orc10, firestoreId: 'ORC-10' });
+    await db.doc('orcamentos/ORC-11').create({ ...orc11, firestoreId: 'ORC-99' });
+    const arquivo = salvarBackup(backup);
+
+    const { codigo, saida } = rodar(arquivo, '--project', PROJETO);
+    assert.equal(codigo, 2, saida);
+    assert.match(saida, /SKIP: 1/);
+    assert.match(saida, /CONFLICT: 1/);
+    assert.match(saida, /orcamentos\/ORC-11/);
+    assert.doesNotMatch(saida, /orcamentos\/ORC-10/);
+    assert.equal(await contarDocumentos(), 2, 'dry-run não grava');
+});
+
 test('documento existente divergente é CONFLICT e bloqueia o --apply inteiro', async () => {
     await db.doc('precos/produto-1').create({ codigo: 'P1', descricao: 'Trilho', precoCompra: 999, markup: 2, status: 'Ativo' });
     const arquivo = salvarBackup(montarBackup());
